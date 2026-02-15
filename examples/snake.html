@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Snake - woj</title>
+    <style>
+        body {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            margin: 0;
+            background: #1a1a2e;
+            font-family: 'Courier New', monospace;
+            color: #eee;
+        }
+        canvas {
+            border: 4px solid #4a4a6a;
+            background: #16213e;
+        }
+        h1 {
+            color: #00ff88;
+            margin-bottom: 10px;
+        }
+        #score {
+            font-size: 24px;
+            margin: 10px 0;
+            color: #00ff88;
+        }
+        #instructions {
+            color: #888;
+            margin-top: 10px;
+        }
+        #game-over {
+            display: none;
+            font-size: 32px;
+            color: #ff4444;
+            margin-top: 20px;
+        }
+        #loading {
+            font-size: 18px;
+            color: #888;
+        }
+    </style>
+</head>
+<body>
+    <h1>SNAKE</h1>
+    <div id="score">Score: 0</div>
+    <canvas id="game" width="400" height="300"></canvas>
+    <div id="instructions">Arrow keys or WASD to move | Space to restart</div>
+    <div id="game-over">GAME OVER - Press Space</div>
+    <div id="loading">Loading...</div>
+
+    <script>
+        const CELL_SIZE = 20;
+        const GRID_WIDTH = 20;
+        const GRID_HEIGHT = 15;
+
+        let wasmInstance = null;
+        let gameLoop = null;
+
+        async function loadWasm() {
+            try {
+                const response = await fetch('snake.wasm');
+                const bytes = await response.arrayBuffer();
+                const { instance } = await WebAssembly.instantiate(bytes);
+                wasmInstance = instance.exports;
+                document.getElementById('loading').style.display = 'none';
+                startGame();
+            } catch (e) {
+                document.getElementById('loading').textContent =
+                    'Error loading WASM. Make sure snake.wasm exists.';
+                console.error(e);
+            }
+        }
+
+        function startGame() {
+            // Seed RNG with current time
+            wasmInstance['seed-random'](Date.now() % 65536);
+            wasmInstance['init-game']();
+
+            document.getElementById('game-over').style.display = 'none';
+            document.getElementById('score').textContent = 'Score: 0';
+
+            if (gameLoop) clearInterval(gameLoop);
+            gameLoop = setInterval(gameTick, 120);
+        }
+
+        function gameTick() {
+            wasmInstance.tick();
+            render();
+
+            const score = wasmInstance['get-score']();
+            document.getElementById('score').textContent = `Score: ${score}`;
+
+            if (wasmInstance['is-game-over']()) {
+                clearInterval(gameLoop);
+                gameLoop = null;
+                document.getElementById('game-over').style.display = 'block';
+            }
+        }
+
+        function render() {
+            const canvas = document.getElementById('game');
+            const ctx = canvas.getContext('2d');
+
+            // Clear
+            ctx.fillStyle = '#16213e';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // Draw grid lines (subtle)
+            ctx.strokeStyle = '#1a2744';
+            ctx.lineWidth = 1;
+            for (let x = 0; x <= GRID_WIDTH; x++) {
+                ctx.beginPath();
+                ctx.moveTo(x * CELL_SIZE, 0);
+                ctx.lineTo(x * CELL_SIZE, canvas.height);
+                ctx.stroke();
+            }
+            for (let y = 0; y <= GRID_HEIGHT; y++) {
+                ctx.beginPath();
+                ctx.moveTo(0, y * CELL_SIZE);
+                ctx.lineTo(canvas.width, y * CELL_SIZE);
+                ctx.stroke();
+            }
+
+            // Draw food
+            const foodX = wasmInstance['get-food-x']();
+            const foodY = wasmInstance['get-food-y']();
+            ctx.fillStyle = '#ff4444';
+            ctx.beginPath();
+            ctx.arc(
+                foodX * CELL_SIZE + CELL_SIZE / 2,
+                foodY * CELL_SIZE + CELL_SIZE / 2,
+                CELL_SIZE / 2 - 2,
+                0, Math.PI * 2
+            );
+            ctx.fill();
+
+            // Draw snake
+            const snakeLength = wasmInstance['get-snake-length']();
+            for (let i = 0; i < snakeLength; i++) {
+                const x = wasmInstance['get-snake-x'](i);
+                const y = wasmInstance['get-snake-y'](i);
+
+                // Head is brighter
+                if (i === 0) {
+                    ctx.fillStyle = '#00ff88';
+                } else {
+                    // Gradient fade for body
+                    const fade = Math.max(0.4, 1 - i * 0.02);
+                    const g = Math.floor(220 * fade);
+                    const b = Math.floor(136 * fade);
+                    ctx.fillStyle = `rgb(0, ${g}, ${b})`;
+                }
+
+                // Rounded rectangles for snake segments
+                const padding = 1;
+                const radius = 4;
+                const sx = x * CELL_SIZE + padding;
+                const sy = y * CELL_SIZE + padding;
+                const sw = CELL_SIZE - padding * 2;
+                const sh = CELL_SIZE - padding * 2;
+
+                ctx.beginPath();
+                ctx.roundRect(sx, sy, sw, sh, radius);
+                ctx.fill();
+            }
+        }
+
+        // Keyboard controls
+        document.addEventListener('keydown', (e) => {
+            if (!wasmInstance) return;
+
+            switch (e.key) {
+                case 'ArrowUp':
+                case 'w':
+                case 'W':
+                    wasmInstance['set-direction'](0);
+                    e.preventDefault();
+                    break;
+                case 'ArrowRight':
+                case 'd':
+                case 'D':
+                    wasmInstance['set-direction'](1);
+                    e.preventDefault();
+                    break;
+                case 'ArrowDown':
+                case 's':
+                case 'S':
+                    wasmInstance['set-direction'](2);
+                    e.preventDefault();
+                    break;
+                case 'ArrowLeft':
+                case 'a':
+                case 'A':
+                    wasmInstance['set-direction'](3);
+                    e.preventDefault();
+                    break;
+                case ' ':
+                    if (wasmInstance['is-game-over']()) {
+                        startGame();
+                    }
+                    e.preventDefault();
+                    break;
+            }
+        });
+
+        loadWasm();
+    </script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+# Clojure
+.cpcache/
+target/
+*.jar
+
+# Generated output
+output.wat
+output.wasm
+*.wasm
+
+# Editor
+.nrepl-port
+.lsp/
+
+# Claude Code local settings
+.claude/settings.local.json

@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>woj Playground</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      background: #0d1117;
+      color: #c9d1d9;
+      min-height: 100vh;
+      padding: 2rem 1.5rem;
+    }
+    header { max-width: 960px; margin: 0 auto 1.5rem; }
+    h1 { font-size: 1.8rem; color: #58a6ff; margin-bottom: 0.3rem; }
+    .subtitle { color: #8b949e; font-size: 0.9rem; }
+    #status {
+      max-width: 960px; margin: 0 auto 1.5rem;
+      padding: 0.6rem 1rem; border-radius: 6px; font-size: 0.85rem;
+    }
+    #status.loading { background: #161b22; color: #8b949e; }
+    #status.success { background: #0d2818; color: #3fb950; border: 1px solid #1b4332; }
+    #status.fail { background: #2d1115; color: #f85149; border: 1px solid #4a1c24; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+      gap: 1.2rem;
+      max-width: 960px;
+      margin: 0 auto;
+    }
+    .card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 10px;
+      padding: 1.2rem;
+      opacity: 0;
+      transform: translateY(12px);
+      transition: opacity 0.5s, transform 0.5s, border-color 0.3s;
+    }
+    .card.loaded { opacity: 1; transform: translateY(0); }
+    .card:hover { border-color: #58a6ff44; }
+    .tag {
+      font-size: 0.7rem; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.08em; margin-bottom: 0.6rem; color: #8b949e;
+    }
+    .tag span {
+      display: inline-block; padding: 2px 8px;
+      border-radius: 10px; font-size: 0.65rem;
+    }
+    .code {
+      font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+      font-size: 0.78rem; line-height: 1.55;
+      background: #0d1117; border: 1px solid #21262d;
+      border-radius: 6px; padding: 0.65rem 0.8rem;
+      margin-bottom: 0.8rem; white-space: pre; overflow-x: auto;
+      color: #c9d1d9;
+    }
+    .code .kw { color: #ff7b72; }
+    .code .fn { color: #d2a8ff; }
+    .code .str { color: #a5d6ff; }
+    .code .num { color: #79c0ff; }
+    .code .cm { color: #484f58; font-style: italic; }
+    .code .key { color: #7ee787; }
+    .controls { margin-bottom: 0.8rem; }
+    .slider-row {
+      display: flex; align-items: center; gap: 0.6rem;
+      margin-bottom: 0.4rem;
+    }
+    .slider-row label {
+      font-size: 0.8rem; color: #8b949e; min-width: 50px;
+    }
+    .slider-row input[type="range"] {
+      -webkit-appearance: none; flex: 1; height: 4px;
+      background: #21262d; border-radius: 2px; outline: none;
+    }
+    .slider-row input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none; width: 16px; height: 16px;
+      border-radius: 50%; background: #58a6ff; cursor: pointer;
+      transition: transform 0.15s;
+    }
+    .slider-row input[type="range"]::-webkit-slider-thumb:hover {
+      transform: scale(1.2);
+    }
+    .slider-row .val {
+      font-family: 'SF Mono', monospace; font-size: 0.85rem;
+      color: #e6edf3; min-width: 30px; text-align: right;
+    }
+    .pills { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+    .pill {
+      background: #21262d; border: 1px solid #30363d; color: #8b949e;
+      padding: 4px 12px; border-radius: 14px; cursor: pointer;
+      font-size: 0.78rem; font-family: inherit; transition: all 0.2s;
+    }
+    .pill:hover { border-color: #58a6ff; color: #c9d1d9; }
+    .pill.active { background: #1f3a5f; border-color: #58a6ff; color: #58a6ff; }
+    canvas {
+      width: 100%; height: 110px;
+      border-radius: 6px; margin-bottom: 0.6rem;
+      display: block;
+    }
+    .results { display: flex; gap: 1.2rem; flex-wrap: wrap; }
+    .result-item { display: flex; align-items: baseline; gap: 0.4rem; }
+    .result-label { font-size: 0.75rem; color: #8b949e; }
+    .result-value {
+      font-family: 'SF Mono', monospace; font-size: 1.1rem;
+      font-weight: 600; color: #58a6ff;
+      transition: color 0.3s, text-shadow 0.3s;
+    }
+    .result-value.glow { color: #79c0ff; text-shadow: 0 0 8px #58a6ff44; }
+    footer {
+      max-width: 960px; margin: 2rem auto 0;
+      padding-top: 1rem; border-top: 1px solid #21262d;
+      font-size: 0.8rem; color: #484f58;
+      display: flex; justify-content: space-between;
+    }
+    footer .count { color: #8b949e; }
+    /* Collatz accent */
+    .card.collatz .result-value { color: #f0883e; }
+    .card.collatz input[type="range"]::-webkit-slider-thumb { background: #f0883e; }
+    /* Protocol accent */
+    .card.protocol .result-value { color: #3fb950; }
+    .card.protocol input[type="range"]::-webkit-slider-thumb { background: #3fb950; }
+    /* Team accent */
+    .card.team .result-value { color: #bc8cff; }
+    .card.team input[type="range"]::-webkit-slider-thumb { background: #bc8cff; }
+    /* String accent */
+    .card.string .result-value { color: #e3b341; }
+    .pill.active.string-pill { background: #3d2e00; border-color: #e3b341; color: #e3b341; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>woj Playground</h1>
+    <p class="subtitle">Clojure compiled to WebAssembly GC &mdash; interactive demos running natively in your browser</p>
+  </header>
+  <div id="status" class="status loading">Loading WebAssembly module...</div>
+
+  <div class="grid">
+    <!-- 1. Fibonacci / Lazy Sequences -->
+    <div class="card" id="card-fib">
+      <div class="tag">Lazy Sequences</div>
+      <div class="code"><span class="kw">defn</span> fibs-from [a b]
+  (<span class="fn">lazy-seq</span>
+    (<span class="fn">cons</span> a (fibs-from b (+ a b))))
+
+(<span class="fn">reduce</span> + <span class="num">0</span> (<span class="fn">take</span> n (<span class="fn">fibs</span>)))</div>
+      <div class="controls">
+        <div class="slider-row">
+          <label>Count</label>
+          <input type="range" id="fib-slider" min="1" max="25" value="12">
+          <span class="val" id="fib-val">12</span>
+        </div>
+      </div>
+      <canvas id="fib-canvas" width="600" height="220"></canvas>
+      <div class="results">
+        <div class="result-item">
+          <span class="result-label">Last:</span>
+          <span class="result-value" id="fib-nth">...</span>
+        </div>
+        <div class="result-item">
+          <span class="result-label">Sum:</span>
+          <span class="result-value" id="fib-sum">...</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 2. Pipeline / Threading -->
+    <div class="card" id="card-sq">
+      <div class="tag">Thread-Last Pipeline</div>
+      <div class="code">(<span class="kw">-&gt;&gt;</span> (<span class="fn">range</span>)
+     (<span class="fn">drop</span> <span class="num">1</span>)
+     (<span class="fn">take</span> n)
+     (<span class="fn">reduce</span>
+       (<span class="kw">fn</span> [a x] (+ a (* x x))) <span class="num">0</span>))</div>
+      <div class="controls">
+        <div class="slider-row">
+          <label>Count</label>
+          <input type="range" id="sq-slider" min="1" max="15" value="8">
+          <span class="val" id="sq-val">8</span>
+        </div>
+      </div>
+      <canvas id="sq-canvas" width="600" height="220"></canvas>
+      <div class="results">
+        <div class="result-item">
+          <span class="result-label">Sum of squares:</span>
+          <span class="result-value" id="sq-result">...</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 3. Protocols -->
+    <div class="card protocol" id="card-rect">
+      <div class="tag">Protocols</div>
+      <div class="code">(<span class="kw">defprotocol</span> IArea
+  (area [shape]))
+
+(<span class="kw">extend-type</span> Vector IArea
+  (area [s] (* (<span class="fn">nth</span> s <span class="num">0</span>) (<span class="fn">nth</span> s <span class="num">1</span>))))</div>
+      <div class="controls">
+        <div class="slider-row">
+          <label>Width</label>
+          <input type="range" id="rect-w" min="1" max="20" value="8">
+          <span class="val" id="rect-w-val">8</span>
+        </div>
+        <div class="slider-row">
+          <label>Height</label>
+          <input type="range" id="rect-h" min="1" max="15" value="6">
+          <span class="val" id="rect-h-val">6</span>
+        </div>
+      </div>
+      <canvas id="rect-canvas" width="600" height="220"></canvas>
+      <div class="results">
+        <div class="result-item">
+          <span class="result-label">Area:</span>
+          <span class="result-value" id="rect-area">...</span>
+        </div>
+        <div class="result-item">
+          <span class="result-label">Perimeter:</span>
+          <span class="result-value" id="rect-perim">...</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 4. Collatz / Loop-Recur -->
+    <div class="card collatz" id="card-col">
+      <div class="tag">Loop / Recur</div>
+      <div class="code">(<span class="kw">defn</span> collatz-len [start]
+  (<span class="kw">loop</span> [n start steps <span class="num">0</span>]
+    (<span class="kw">if</span> (&lt;= n <span class="num">1</span>) steps
+      (<span class="kw">recur</span> (collatz-next n)
+             (+ steps <span class="num">1</span>)))))</div>
+      <div class="controls">
+        <div class="slider-row">
+          <label>Start</label>
+          <input type="range" id="col-slider" min="2" max="200" value="27">
+          <span class="val" id="col-val">27</span>
+        </div>
+      </div>
+      <canvas id="col-canvas" width="600" height="220"></canvas>
+      <div class="results">
+        <div class="result-item">
+          <span class="result-label">Steps:</span>
+          <span class="result-value" id="col-steps">...</span>
+        </div>
+        <div class="result-item">
+          <span class="result-label">Peak:</span>
+          <span class="result-value" id="col-peak">...</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 5. Destructuring / Maps -->
+    <div class="card team" id="card-team">
+      <div class="tag">Maps &amp; Destructuring</div>
+      <div class="code">(<span class="kw">fn</span> [acc person]
+  (<span class="kw">let</span> [{<span class="key">:keys</span> [age]} person]
+    (+ acc age)))
+
+<span class="cm">;; ages: 25, 30, 35, 40, ...</span></div>
+      <div class="controls">
+        <div class="slider-row">
+          <label>Team</label>
+          <input type="range" id="team-slider" min="1" max="8" value="5">
+          <span class="val" id="team-val">5</span>
+        </div>
+      </div>
+      <canvas id="team-canvas" width="600" height="220"></canvas>
+      <div class="results">
+        <div class="result-item">
+          <span class="result-label">Total age:</span>
+          <span class="result-value" id="team-total">...</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 6. Strings -->
+    <div class="card string" id="card-str">
+      <div class="tag">Strings</div>
+      <div class="code">(<span class="kw">defn</span> greet [s]
+  (<span class="fn">str</span> <span class="str">"Hello, "</span> s <span class="str">"!"</span>))
+
+(<span class="fn">count</span> (greet <span class="str">"World"</span>)) <span class="cm">; 13</span></div>
+      <div class="controls">
+        <div class="pills" id="name-pills"></div>
+      </div>
+      <canvas id="str-canvas" width="600" height="220"></canvas>
+      <div class="results">
+        <div class="result-item">
+          <span class="result-label">Length:</span>
+          <span class="result-value" id="str-len">...</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <footer>
+    <span>woj &mdash; Clojure to WebAssembly GC compiler</span>
+    <span class="count" id="call-count-wrap">WASM calls: <strong id="call-count">0</strong></span>
+  </footer>
+
+  <script>
+    let w = null;
+    let calls = 0;
+
+    function wc(name, ...args) {
+      if (!w) return null;
+      try {
+        calls++;
+        document.getElementById('call-count').textContent = calls;
+        return w[name](...args);
+      } catch (e) {
+        console.error(name, args, e);
+        return null;
+      }
+    }
+
+    function glow(el) {
+      el.classList.add('glow');
+      setTimeout(() => el.classList.remove('glow'), 350);
+    }
+
+    function setVal(id, v) {
+      const el = document.getElementById(id);
+      if (v !== null && v !== undefined) {
+        el.textContent = v.toLocaleString();
+        glow(el);
+      }
+    }
+
+    // === Drawing helpers ===
+
+    function clear(ctx, c) {
+      ctx.fillStyle = '#0d1117';
+      ctx.fillRect(0, 0, c.width, c.height);
+    }
+
+    function drawBars(canvasId, values, color1, color2) {
+      const c = document.getElementById(canvasId);
+      const ctx = c.getContext('2d');
+      clear(ctx, c);
+      if (!values.length) return;
+      const max = Math.max(...values, 1);
+      const pad = 16;
+      const barW = (c.width - pad * 2) / values.length;
+      const maxH = c.height - pad * 2;
+      values.forEach((v, i) => {
+        const h = Math.max(2, (v / max) * maxH);
+        const x = pad + i * barW;
+        const y = c.height - pad - h;
+        const t = values.length > 1 ? i / (values.length - 1) : 0;
+        ctx.fillStyle = lerpColor(color1, color2, t);
+        ctx.beginPath();
+        ctx.roundRect(x + 1, y, Math.max(1, barW - 2), h, 2);
+        ctx.fill();
+      });
+    }
+
+    function lerpColor(a, b, t) {
+      const [r1,g1,b1] = hexToRgb(a);
+      const [r2,g2,b2] = hexToRgb(b);
+      const r = Math.round(r1 + (r2-r1)*t);
+      const g = Math.round(g1 + (g2-g1)*t);
+      const bl = Math.round(b1 + (b2-b1)*t);
+      return `rgb(${r},${g},${bl})`;
+    }
+
+    function hexToRgb(hex) {
+      const n = parseInt(hex.slice(1), 16);
+      return [(n>>16)&255, (n>>8)&255, n&255];
+    }
+
+    // === Card updaters ===
+
+    function updateFib() {
+      const n = parseInt(document.getElementById('fib-slider').value);
+      document.getElementById('fib-val').textContent = n;
+      const vals = [];
+      for (let i = 0; i < n; i++) vals.push(wc('fib-at', i));
+      drawBars('fib-canvas', vals, '#1f6feb', '#58a6ff');
+      setVal('fib-nth', vals[vals.length - 1]);
+      setVal('fib-sum', wc('fib-sum', n));
+    }
+
+    function updateSq() {
+      const n = parseInt(document.getElementById('sq-slider').value);
+      document.getElementById('sq-val').textContent = n;
+      const vals = [];
+      for (let i = 1; i <= n; i++) vals.push(i * i);
+      drawBars('sq-canvas', vals, '#6e40c9', '#bc8cff');
+      setVal('sq-result', wc('sum-squares', n));
+    }
+
+    function updateRect() {
+      const rw = parseInt(document.getElementById('rect-w').value);
+      const rh = parseInt(document.getElementById('rect-h').value);
+      document.getElementById('rect-w-val').textContent = rw;
+      document.getElementById('rect-h-val').textContent = rh;
+
+      const c = document.getElementById('rect-canvas');
+      const ctx = c.getContext('2d');
+      clear(ctx, c);
+
+      const maxDim = Math.max(rw, rh);
+      const scale = Math.min((c.width - 80) / maxDim, (c.height - 50) / maxDim);
+      const w = rw * scale, h = rh * scale;
+      const x = (c.width - w) / 2, y = (c.height - h) / 2;
+
+      // Grid lines inside
+      ctx.strokeStyle = '#3fb95022';
+      ctx.lineWidth = 1;
+      for (let gx = 0; gx <= rw; gx++) {
+        const lx = x + gx * scale;
+        ctx.beginPath(); ctx.moveTo(lx, y); ctx.lineTo(lx, y + h); ctx.stroke();
+      }
+      for (let gy = 0; gy <= rh; gy++) {
+        const ly = y + gy * scale;
+        ctx.beginPath(); ctx.moveTo(x, ly); ctx.lineTo(x + w, ly); ctx.stroke();
+      }
+
+      // Rectangle fill and border
+      ctx.fillStyle = '#3fb95015';
+      ctx.fillRect(x, y, w, h);
+      ctx.strokeStyle = '#3fb950';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(x, y, w, h);
+
+      // Dimension labels
+      ctx.fillStyle = '#8b949e';
+      ctx.font = '13px SF Mono, Consolas, monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(rw, x + w / 2, y + h + 18);
+      ctx.save();
+      ctx.translate(x - 12, y + h / 2);
+      ctx.rotate(-Math.PI / 2);
+      ctx.fillText(rh, 0, 0);
+      ctx.restore();
+
+      setVal('rect-area', wc('get-area', rw, rh));
+      setVal('rect-perim', wc('get-perimeter', rw, rh));
+    }
+
+    function updateCollatz() {
+      const start = parseInt(document.getElementById('col-slider').value);
+      document.getElementById('col-val').textContent = start;
+
+      const len = wc('collatz-len', start);
+      const vals = [];
+      let peak = 0;
+      for (let i = 0; i <= len; i++) {
+        const v = wc('collatz-at', start, i);
+        vals.push(v);
+        if (v > peak) peak = v;
+      }
+
+      // Draw line chart
+      const c = document.getElementById('col-canvas');
+      const ctx = c.getContext('2d');
+      clear(ctx, c);
+
+      if (vals.length > 1) {
+        const pad = 16;
+        const maxV = Math.max(...vals, 1);
+        const stepX = (c.width - pad * 2) / (vals.length - 1);
+        const maxH = c.height - pad * 2;
+
+        // Fill area under line
+        ctx.beginPath();
+        ctx.moveTo(pad, c.height - pad);
+        vals.forEach((v, i) => {
+          ctx.lineTo(pad + i * stepX, c.height - pad - (v / maxV) * maxH);
+        });
+        ctx.lineTo(pad + (vals.length - 1) * stepX, c.height - pad);
+        ctx.closePath();
+        ctx.fillStyle = '#f0883e12';
+        ctx.fill();
+
+        // Line
+        ctx.beginPath();
+        vals.forEach((v, i) => {
+          const x = pad + i * stepX;
+          const y = c.height - pad - (v / maxV) * maxH;
+          if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        });
+        ctx.strokeStyle = '#f0883e';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+      }
+
+      setVal('col-steps', len);
+      setVal('col-peak', peak);
+    }
+
+    function updateTeam() {
+      const n = parseInt(document.getElementById('team-slider').value);
+      document.getElementById('team-val').textContent = n;
+
+      const c = document.getElementById('team-canvas');
+      const ctx = c.getContext('2d');
+      clear(ctx, c);
+
+      const spacing = c.width / (n + 1);
+      const cy = c.height / 2;
+
+      for (let i = 0; i < n; i++) {
+        const x = spacing * (i + 1);
+        const age = 25 + i * 5;
+        const radius = 16;
+
+        // Circle
+        const hue = 260 + i * 12;
+        ctx.beginPath();
+        ctx.arc(x, cy - 8, radius, 0, Math.PI * 2);
+        ctx.fillStyle = `hsl(${hue}, 50%, 55%)`;
+        ctx.fill();
+
+        // Age label
+        ctx.fillStyle = '#c9d1d9';
+        ctx.font = '12px SF Mono, Consolas, monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(age, x, cy + 22);
+      }
+
+      setVal('team-total', wc('team-total', n));
+    }
+
+    const NAMES = ['World', 'woj', 'WebAssembly', 'Clojure'];
+    let activeNameId = 0;
+
+    function initPills() {
+      const container = document.getElementById('name-pills');
+      NAMES.forEach((name, i) => {
+        const btn = document.createElement('button');
+        btn.className = 'pill' + (i === 0 ? ' active string-pill' : '');
+        btn.textContent = name;
+        btn.onclick = () => {
+          container.querySelectorAll('.pill').forEach(p => p.classList.remove('active', 'string-pill'));
+          btn.classList.add('active', 'string-pill');
+          activeNameId = i;
+          updateStr();
+        };
+        container.appendChild(btn);
+      });
+    }
+
+    function updateStr() {
+      const greeting = 'Hello, ' + NAMES[activeNameId] + '!';
+      const c = document.getElementById('str-canvas');
+      const ctx = c.getContext('2d');
+      clear(ctx, c);
+
+      const charW = Math.min(28, (c.width - 32) / greeting.length);
+      const startX = (c.width - charW * greeting.length) / 2;
+      const y = c.height / 2 - 16;
+
+      for (let i = 0; i < greeting.length; i++) {
+        const x = startX + i * charW;
+        const hue = 35 + i * 6;
+        ctx.fillStyle = `hsl(${hue}, 70%, 45%)`;
+        ctx.beginPath();
+        ctx.roundRect(x + 1, y, charW - 2, 30, 3);
+        ctx.fill();
+
+        ctx.fillStyle = '#fff';
+        ctx.font = `${Math.min(15, charW - 4)}px SF Mono, Consolas, monospace`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(greeting[i], x + charW / 2, y + 15);
+      }
+
+      setVal('str-len', wc('greeting-len', activeNameId));
+    }
+
+    // === Init ===
+
+    initPills();
+
+    async function init() {
+      const status = document.getElementById('status');
+      try {
+        const response = await fetch('showcase.wasm');
+        const bytes = await response.arrayBuffer();
+        const { instance } = await WebAssembly.instantiate(bytes);
+        w = instance.exports;
+
+        status.className = 'status success';
+        status.textContent = 'WebAssembly GC loaded \u2014 drag the sliders to explore';
+
+        // Bind events
+        document.getElementById('fib-slider').addEventListener('input', updateFib);
+        document.getElementById('sq-slider').addEventListener('input', updateSq);
+        document.getElementById('rect-w').addEventListener('input', updateRect);
+        document.getElementById('rect-h').addEventListener('input', updateRect);
+        document.getElementById('col-slider').addEventListener('input', updateCollatz);
+        document.getElementById('team-slider').addEventListener('input', updateTeam);
+
+        // Stagger reveal cards
+        document.querySelectorAll('.card').forEach((card, i) => {
+          setTimeout(() => card.classList.add('loaded'), i * 80);
+        });
+
+        // Initial render (after cards visible)
+        setTimeout(() => {
+          updateFib(); updateSq(); updateRect();
+          updateCollatz(); updateTeam(); updateStr();
+        }, 500);
+
+      } catch (e) {
+        status.className = 'status fail';
+        status.textContent = 'Failed to load: ' + e.message + '. Requires WasmGC (Chrome 119+, Firefox 120+).';
+        console.error(e);
+        // Still show cards
+        document.querySelectorAll('.card').forEach(c => c.classList.add('loaded'));
+      }
+    }
+
+    init();
+  </script>
+</body>
+</html>

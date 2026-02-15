@@ -1,0 +1,12 @@
+{:paths ["src" "test"]
+ :deps {org.clojure/tools.reader {:mvn/version "1.5.0"}}
+ :aliases
+ {:run {:main-opts ["-m" "woj.main"]}
+  :test {:main-opts ["-m" "woj.core-test"]}
+  :repl {:extra-deps {nrepl/nrepl {:mvn/version "1.3.0"}}
+         :main-opts ["-m" "woj.repl"]}
+  :nrepl {:extra-deps {nrepl/nrepl {:mvn/version "1.3.0"}}
+          :main-opts ["-m" "woj.nrepl"]}
+  :bench {:extra-deps {criterium/criterium {:mvn/version "0.4.6"}}
+          :extra-paths ["benchmarks/clj"]
+          :main-opts ["-m" "bench"]}}}

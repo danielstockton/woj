@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Game of Life — woj</title>
+  <style>
+    body {
+      margin: 0; background: #0d1117;
+      display: flex; flex-direction: column; align-items: center;
+      justify-content: center; min-height: 100vh;
+      font-family: 'SF Mono', 'Consolas', monospace; color: #8b949e;
+    }
+    h1 { color: #58a6ff; font-size: 1.2rem; margin: 0 0 0.4rem; }
+    .hud { display: flex; gap: 1.5rem; font-size: 0.8rem; margin-bottom: 0.6rem; }
+    .hud strong { color: #58a6ff; }
+    #st { color: #3fb950; }
+    canvas {
+      image-rendering: pixelated; image-rendering: crisp-edges;
+      width: min(800px, 95vw); aspect-ratio: 80/60; cursor: crosshair;
+      border: 1px solid #21262d; border-radius: 4px;
+    }
+    .keys {
+      font-size: 0.65rem; color: #484f58; margin-top: 0.6rem;
+      text-align: center; line-height: 1.8;
+    }
+    kbd {
+      background: #161b22; padding: 1px 5px; border-radius: 3px;
+      border: 1px solid #30363d; color: #8b949e;
+    }
+  </style>
+</head>
+<body>
+  <h1>Conway's Game of Life</h1>
+  <div class="hud">
+    <span>Gen <strong id="gen">0</strong></span>
+    <span>Pop <strong id="pop">0</strong></span>
+    <span id="st">Paused</span>
+  </div>
+  <canvas id="c" width="80" height="60"></canvas>
+  <div class="keys">
+    <kbd>Space</kbd> play/pause
+    <kbd>N</kbd> step
+    <kbd>R</kbd> random
+    <kbd>C</kbd> clear
+    <kbd>D</kbd> demo
+    <kbd>G</kbd> glider
+    <kbd>P</kbd> pulsar
+    <kbd>U</kbd> gun
+    <kbd>X</kbd> r-pentomino
+    · click/drag to draw
+  </div>
+  <script>
+    let w;
+    async function boot() {
+      const {instance} = await WebAssembly.instantiate(
+        await (await fetch('life.wasm')).arrayBuffer());
+      w = instance.exports;
+      w['seed-rng'](Date.now() % 65536);
+      w.init();
+      w['load-demo']();
+      const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+      const W = 80, H = 60, img = ctx.createImageData(W, H);
+
+      // Mouse: click toggles, drag paints
+      let draw = 0, lx = -1, ly = -1;
+      function pos(e) {
+        const r = cv.getBoundingClientRect();
+        return [Math.floor((e.clientX-r.left)/r.width*W),
+                Math.floor((e.clientY-r.top)/r.height*H)];
+      }
+      cv.onmousedown = (e) => {
+        const [x,y] = pos(e);
+        draw = w['is-alive-at'](x,y) ? 2 : 1;
+        w[draw===1?'set-alive':'set-dead'](x,y);
+        lx=x; ly=y;
+      };
+      cv.onmousemove = (e) => {
+        if (!draw) return;
+        const [x,y] = pos(e);
+        if (x!==lx||y!==ly) { w[draw===1?'set-alive':'set-dead'](x,y); lx=x; ly=y; }
+      };
+      document.onmouseup = () => draw=0;
+
+      // Keyboard
+      document.onkeydown = (e) => {
+        const k = e.key;
+        if (k===' ') { w['toggle-pause'](); e.preventDefault(); }
+        else if (k==='n') w.step();
+        else if (k==='r') w.randomize();
+        else if (k==='c') w['clear-grid']();
+        else if (k==='d') w['load-demo']();
+        else if (k==='g') w['add-glider']();
+        else if (k==='p') w['add-pulsar']();
+        else if (k==='u') w['add-gun']();
+        else if (k==='x') w['add-rpentomino']();
+      };
+
+      // Render loop: tick + blit framebuffer from woj
+      let last = 0;
+      (function frame(t) {
+        if (t-last>100) { w.tick(); last=t; }
+        for (let i=0; i<W*H; i++) {
+          const c = w['get-pixel'](i);
+          img.data[i*4]=(c>>16)&255; img.data[i*4+1]=(c>>8)&255;
+          img.data[i*4+2]=c&255; img.data[i*4+3]=255;
+        }
+        ctx.putImageData(img, 0, 0);
+        document.getElementById('gen').textContent = w['get-generation']();
+        document.getElementById('pop').textContent = w['get-population']();
+        document.getElementById('st').textContent = w['is-paused']() ? 'Paused' : 'Running';
+        requestAnimationFrame(frame);
+      })(0);
+    }
+    boot();
+  </script>
+</body>
+</html>
