@@ -1,5 +1,8 @@
 # woj
 
+> [!WARNING]
+> This project was built with AI assistance, as a personal experiment in compiler development and agentic coding. It is not intended for production use or anything serious.
+
 A Clojure dialect that compiles directly to WebAssembly GC.
 
 ## Status
