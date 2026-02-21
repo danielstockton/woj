@@ -56,7 +56,7 @@
 
 (defmacro when-first [[binding coll] & body]
   (let [s (gensym "s__")]
-    `(~'let [~s ~coll]
+    `(~'let [~s (~'seq ~coll)]
             (~'when ~s
                     (~'let [~binding (~'first ~s)]
                            ~@body)))))
@@ -342,14 +342,14 @@
     (cons (first a) (concat-list (rest a) b))))
 
 (defn last [coll]
-  (if (nil? (rest coll))
-    (first coll)
-    (last (rest coll))))
+  (if (seq (rest coll))
+    (last (rest coll))
+    (first coll)))
 
 (defn butlast [coll]
-  (if (nil? (rest coll))
-    nil
-    (cons (first coll) (butlast (rest coll)))))
+  (if (seq (rest coll))
+    (cons (first coll) (butlast (rest coll)))
+    nil))
 
 ;; Predicates
 (defn even? [n]
@@ -384,18 +384,23 @@
 
 ;; reverse: reverse a list
 (defn reverse [coll]
-  (loop [acc nil curr coll]
-    (if (nil? curr)
-      acc
-      (recur (cons (first curr) acc) (rest curr)))))
+  (loop [acc nil curr (seq coll)]
+    (if curr
+      (recur (cons (first curr) acc) (seq (rest curr)))
+      acc)))
 
 ;; concat: concatenate multiple sequences
-(defn concat [a b]
-  (lazy-seq
-    (let [s (seq a)]
-      (if (nil? s)
-        (seq b)
-        (cons (first s) (concat (rest s) b))))))
+(defn concat
+  ([] nil)
+  ([a] (lazy-seq (seq a)))
+  ([a b]
+   (lazy-seq
+     (let [s (seq a)]
+       (if (nil? s)
+         (seq b)
+         (cons (first s) (concat (rest s) b))))))
+  ([a b & more]
+   (concat a (concat b (reduce concat more)))))
 
 ;; take-while: take elements while predicate is true
 (defn take-while-seq [pred coll]
@@ -443,9 +448,9 @@
 (defn interpose-seq [sep coll]
   (if (nil? coll)
     nil
-    (if (nil? (rest coll))
-      (list (first coll))
-      (cons (first coll) (cons sep (interpose-seq sep (rest coll)))))))
+    (if (seq (rest coll))
+      (cons (first coll) (cons sep (interpose-seq sep (rest coll))))
+      (list (first coll)))))
 
 (defn interpose
   ([sep] (fn [rf]
@@ -470,14 +475,14 @@
     (let [result (pred (first coll))]
       (if result
         result
-        (some pred (rest coll))))))
+        (some pred (seq (rest coll)))))))
 
 ;; every?: returns true if (pred x) is truthy for all x in coll
 (defn every? [pred coll]
   (if (nil? coll)
     true
     (if (pred (first coll))
-      (every? pred (rest coll))
+      (every? pred (seq (rest coll)))
       false)))
 
 ;; not-every?: returns true if (pred x) is falsy for some x in coll
@@ -531,22 +536,23 @@
               (do (swap! seen (fn [s] (set-conj s input)))
                   (rf result input)))))))
   ([coll]
-   (loop [seen nil curr coll acc nil]
-     (if (nil? curr)
-       (reverse acc)
+   (loop [seen nil curr (seq coll) acc nil]
+     (if curr
        (let [x (first curr)]
          (if (some (fn [y] (= x y)) seen)
-          (recur seen (rest curr) acc)
-          (recur (cons x seen) (rest curr) (cons x acc))))))))
+          (recur seen (seq (rest curr)) acc)
+          (recur (cons x seen) (seq (rest curr)) (cons x acc))))
+       (reverse acc)))))
 
 ;; partition: partition collection into groups of n
 (defn partition-seq [n coll]
-  (if (nil? coll)
-    nil
-    (let [chunk (take n coll)]
-      (if (= (length chunk) n)
-        (cons chunk (partition-seq n (drop n coll)))
-        nil))))
+  (let [s (seq coll)]
+    (if (nil? s)
+      nil
+      (let [chunk (take n s)]
+        (if (= (count chunk) n)
+          (cons chunk (partition-seq n (drop n s)))
+          nil)))))
 
 (defn partition [n coll]
   (partition-seq n coll))
@@ -637,18 +643,35 @@
 ;; ============================================
 
 ;; merge: merge maps (later maps override earlier)
-(defn merge [m1 m2]
+(defn merge
+  ([] nil)
+  ([m] m)
+  ([m1 m2]
+   (if (nil? m2)
+     m1
+     (if (nil? m1)
+       m2
+       (let [ks (keys m2)]
+         (loop [result m1 remaining ks]
+           (if (nil? remaining)
+             result
+             (let [k (first remaining)]
+               (recur (assoc result k (get m2 k))
+                      (rest remaining)))))))))
+  ([m1 m2 & more]
+   (reduce merge (merge m1 m2) more)))
+
+;; merge-with: merge maps using f to combine values for duplicate keys
+(defn merge-with [f m1 m2]
   (if (nil? m2)
     m1
     (if (nil? m1)
       m2
-      (let [ks (keys m2)]
-        (loop [result m1 remaining ks]
-          (if (nil? remaining)
-            result
-            (let [k (first remaining)]
-              (recur (assoc result k (get m2 k))
-                     (rest remaining)))))))))
+      (reduce-kv (fn [m k v]
+                   (if (contains? m k)
+                     (assoc m k (f (get m k) v))
+                     (assoc m k v)))
+                 m1 m2))))
 
 ;; find: returns [key value] pair if key exists, nil otherwise
 (defn find [m k]
@@ -667,16 +690,28 @@
           (recur result (rest remaining)))))))
 
 ;; get-in: get nested value
-(defn get-in [m ks]
-  (if (nil? ks)
-    m
-    (get-in (get m (first ks)) (rest ks))))
+(defn get-in
+  ([m ks] (get-in m ks nil))
+  ([m ks not-found]
+   (if (nil? ks)
+     m
+     (let [s (seq ks)]
+       (if (nil? s)
+         m
+         (loop [m m remaining s]
+           (let [k (first remaining)
+                 nxt (next remaining)]
+             (if (nil? nxt)
+               ;; Last key: use 3-arg get with not-found
+               (get m k not-found)
+               ;; Intermediate key: get and continue
+               (recur (get m k) nxt)))))))))
 
 ;; assoc-in: assoc at nested path
 (defn assoc-in [m ks v]
-  (if (nil? (rest ks))
-    (assoc m (first ks) v)
-    (assoc m (first ks) (assoc-in (get m (first ks)) (rest ks) v))))
+  (if (next ks)
+    (assoc m (first ks) (assoc-in (get m (first ks)) (next ks) v))
+    (assoc m (first ks) v)))
 
 ;; update: apply function to value at key
 (defn update [m k f]
@@ -684,9 +719,9 @@
 
 ;; update-in: apply function to nested value
 (defn update-in [m ks f]
-  (if (nil? (rest ks))
-    (update m (first ks) f)
-    (assoc m (first ks) (update-in (get m (first ks)) (rest ks) f))))
+  (if (next ks)
+    (assoc m (first ks) (update-in (get m (first ks)) (next ks) f))
+    (update m (first ks) f)))
 
 ;; ============================================
 ;; Set Operations (Phase 3)
@@ -761,26 +796,54 @@
 ;; constantly: returns a function that always returns the same value
 ;; Note: currently returns 1-arity fn, ignores any arguments
 (defn constantly [x]
-  (fn [_] x))
+  (fn
+    ([] x)
+    ([a] x)
+    ([a b] x)
+    ([a b c] x)))
 
-;; comp: compose two functions (right to left)
-;; (comp f g) returns a function that applies g then f
-(defn comp [f g]
-  (fn [x] (f (g x))))
+;; comp: compose functions (right to left)
+(defn comp
+  ([] identity)
+  ([f] f)
+  ([f g] (fn [x] (f (g x))))
+  ([f g & more]
+   (reduce comp (cons f (cons g more)))))
 
-;; partial: partially apply a function with one argument
-;; (partial f x) returns a fn that calls (f x arg)
-(defn partial [f x]
-  (fn [y] (f x y)))
+;; partial: partially apply a function
+;; Returns a multi-arity closure that captures the partial args.
+(defn partial
+  ([f] f)
+  ([f a] (fn
+           ([] (f a))
+           ([b] (f a b))
+           ([b c] (f a b c))
+           ([b c d] (f a b c d))))
+  ([f a b] (fn
+             ([] (f a b))
+             ([c] (f a b c))
+             ([c d] (f a b c d))))
+  ([f a b c] (fn
+               ([] (f a b c))
+               ([d] (f a b c d)))))
 
 ;; complement: returns a function that negates the result
 (defn complement [f]
-  (fn [x] (not (f x))))
+  (fn
+    ([x] (not (f x)))
+    ([x y] (not (f x y)))))
 
 ;; juxt: returns a function that returns a vector of results
-;; (juxt f g) returns a fn that returns [(f x) (g x)]
-(defn juxt [f g]
-  (fn [x] (vector (f x) (g x))))
+(defn juxt
+  ([f] (fn
+         ([x] [(f x)])
+         ([x y] [(f x) (f y)])))
+  ([f g] (fn
+           ([x] [(f x) (g x)])
+           ([x y] [(f x y) (g x y)])))
+  ([f g h] (fn
+             ([x] [(f x) (g x) (h x)])
+             ([x y] [(f x y) (g x y) (h x y)]))))
 
 ;; ============================================
 ;; Additional Functions for clojure-test-suite
@@ -890,7 +953,10 @@
 ;; volatile!: stub using atoms (same semantics for single-threaded wasm)
 (defn volatile! [x] (atom x))
 (defn vreset! [v newval] (reset! v newval))
-(defn vswap! [v f] (swap! v f))
+(defn vswap!
+  ([v f] (swap! v f))
+  ([v f x] (reset! v (f @v x)))
+  ([v f x y] (reset! v (f @v x y))))
 
 ;; sorted?: stub (always false since we don't have sorted collections)
 (defn sorted? [coll] false)
@@ -898,23 +964,51 @@
 ;; any?: check if anything is passed (always true for any value)
 (defn any? [x] true)
 
-;; mod and rem
-(defn mod [n d]
-  (let [r (- n (* d (/ n d)))]
-    (if (neg? r)
-      (+ r d)
-      r)))
-
+;; rem: remainder (truncated division toward zero)
 (defn rem [n d]
-  (- n (* d (/ n d))))
+  (let [q (if (and (integer? n) (integer? d))
+            (/ n d)
+            (to-int (/ n d)))]
+    (- n (* q d))))
+
+;; mod: modulus (floored division)
+(defn mod [n d]
+  (let [r (rem n d)]
+    (if (or (zero? r) (if (pos? d) (pos? r) (neg? r)))
+      r
+      (+ r d))))
 
 ;; abs: absolute value
 (defn abs [n]
   (if (neg? n) (- 0 n) n))
 
-;; min/max: simple 2-arity versions
-(defn min [a b] (if (< a b) a b))
-(defn max [a b] (if (> a b) a b))
+;; min/max: variadic
+(defn min
+  ([a] a)
+  ([a b] (if (< a b) a b))
+  ([a b & more] (reduce min (min a b) more)))
+(defn max
+  ([a] a)
+  ([a b] (if (> a b) a b))
+  ([a b & more] (reduce max (max a b) more)))
+
+;; Variadic arithmetic: these shadow the 2-arity builtins when used as values
+;; Direct calls like (+ 1 2) still use the fast builtin path via the analyzer
+;; But (apply + [1 2 3]) or (reduce + coll) use these multi-arity definitions
+(defn +
+  ([] 0)
+  ([x] x)
+  ([x y] (+ x y))
+  ([x y & more] (reduce + (+ x y) more)))
+(defn -
+  ([x] (- 0 x))
+  ([x y] (- x y))
+  ([x y & more] (reduce - (- x y) more)))
+(defn *
+  ([] 1)
+  ([x] x)
+  ([x y] (* x y))
+  ([x y & more] (reduce * (* x y) more)))
 
 ;; sort: insertion sort with optional comparator
 (defn sort-with-cmp [cmp coll]
@@ -971,29 +1065,146 @@
 ;; key: get key from map entry (pair)
 (defn key [entry] (first entry))
 
-;; derive/underive/ancestors/descendants/parents/isa?: stub multimethods
-(defn derive [h tag parent] h)
-(defn underive [h tag parent] h)
-(defn ancestors [h tag] nil)
-(defn descendants [h tag] nil)
-(defn parents [h tag] nil)
-(defn isa? [h child parent] false)
+;; Hierarchy system: derive/underive/ancestors/descendants/parents/isa?
+;; A hierarchy is a map with :parents, :ancestors, :descendants keys.
+;; Each maps a tag to a set of related tags.
 
-;; make-hierarchy: stub
-(defn make-hierarchy [] {})
+(defn make-hierarchy []
+  {:parents {} :ancestors {} :descendants {}})
+
+;; Global hierarchy for 2-arg derive/isa?/etc.
+(def global-hierarchy (atom (make-hierarchy)))
+
+(defn- hierarchy-derive [h tag parent]
+  (if (= tag parent)
+    (throw (ex-info "Cannot derive tag from itself" {:tag tag}))
+    (let [cur-parents (get (get h :parents) tag #{})
+          cur-ancestors (get (get h :ancestors) tag #{})]
+      ;; If already derived, return unchanged
+      (if (contains? cur-parents parent)
+        h
+        (let [;; Check for cycle: parent is descendant of tag
+              _ (if (contains? (get (get h :ancestors) parent #{}) tag)
+                  (throw (ex-info "Cyclic derivation" {:tag tag :parent parent}))
+                  nil)
+              ;; Compute new ancestors for tag: parent + parent's ancestors
+              parent-ancestors (get (get h :ancestors) parent #{})
+              new-ancestors (set-conj (union cur-ancestors parent-ancestors) parent)
+              ;; Update parents
+              new-parents-map (assoc (get h :parents) tag (set-conj cur-parents parent))
+              ;; Update ancestors for tag and all its descendants
+              tag-descendants (set-conj (get (get h :descendants) tag #{}) tag)
+              ;; For each descendant of tag (including tag itself), add new ancestors
+              new-ancestors-map (reduce
+                                  (fn [am desc]
+                                    (let [desc-anc (get am desc #{})]
+                                      (assoc am desc (union desc-anc new-ancestors))))
+                                  (get h :ancestors)
+                                  tag-descendants)
+              ;; Update descendants: parent and all parent's ancestors gain tag and tag's descendants
+              new-parent-set (set-conj parent-ancestors parent)
+              new-descendants-map (reduce
+                                    (fn [dm anc]
+                                      (let [anc-desc (get dm anc #{})]
+                                        (assoc dm anc (union anc-desc tag-descendants))))
+                                    (get h :descendants)
+                                    new-parent-set)]
+          {:parents new-parents-map
+           :ancestors new-ancestors-map
+           :descendants new-descendants-map})))))
+
+(defn derive
+  ([tag parent]
+   (swap! global-hierarchy (fn [h] (hierarchy-derive h tag parent)))
+   nil)
+  ([h tag parent]
+   (hierarchy-derive h tag parent)))
+
+(defn parents
+  ([tag] (parents (deref global-hierarchy) tag))
+  ([h tag]
+   (let [p (get (get h :parents) tag)]
+     (if (or (nil? p) (empty? p)) nil p))))
+
+(defn ancestors
+  ([tag] (ancestors (deref global-hierarchy) tag))
+  ([h tag]
+   (let [a (get (get h :ancestors) tag)]
+     (if (or (nil? a) (empty? a)) nil a))))
+
+(defn descendants
+  ([tag] (descendants (deref global-hierarchy) tag))
+  ([h tag]
+   (let [d (get (get h :descendants) tag)]
+     (if (or (nil? d) (empty? d)) nil d))))
+
+(defn isa?
+  ([child parent]
+   (isa? (deref global-hierarchy) child parent))
+  ([h child parent]
+   (or (= child parent)
+       (contains? (get (get h :ancestors) child #{}) parent))))
+
+(defn- underive-add-parents [all-parents h2 tk]
+  (let [ps (get all-parents tk)]
+    (if (nil? ps)
+      h2
+      (reduce (fn [h3 p]
+                (hierarchy-derive h3 tk p))
+              h2 ps))))
+
+(defn underive
+  ([tag parent]
+   (swap! global-hierarchy (fn [h] (underive h tag parent)))
+   nil)
+  ([h tag parent]
+   (let [cur-parents (get (get h :parents) tag #{})
+         new-parents (disj cur-parents parent)
+         all-parents (assoc (get h :parents) tag new-parents)
+         base (make-hierarchy)]
+     (reduce (fn [h2 tk] (underive-add-parents all-parents h2 tk))
+             base (keys all-parents)))))
+
+;; mm-find-isa: find the best matching method via isa? hierarchy lookup
+;; Returns the method function or nil if no match found
+(defn- mm-is-preferred [prefer x y]
+  (let [prefs (get prefer x)]
+    (if (nil? prefs)
+      false
+      (contains? prefs y))))
+
+(defn mm-find-isa [methods dv h prefer]
+  (let [ks (keys methods)]
+    (loop [remaining ks best nil best-key nil]
+      (if (nil? remaining)
+        best
+        (let [k (first remaining)]
+          (if (and (not (= k :default)) (isa? h dv k))
+            (if (nil? best)
+              (recur (rest remaining) (get methods k) k)
+              ;; Ambiguity: check preferences
+              (if (mm-is-preferred prefer k best-key)
+                (recur (rest remaining) (get methods k) k)
+                (if (mm-is-preferred prefer best-key k)
+                  (recur (rest remaining) best best-key)
+                  ;; Check if one is more specific (k isa? best-key or vice versa)
+                  (if (isa? h k best-key)
+                    (recur (rest remaining) (get methods k) k)
+                    (if (isa? h best-key k)
+                      (recur (rest remaining) best best-key)
+                      ;; True ambiguity - just pick one (could throw)
+                      (recur (rest remaining) best best-key))))))
+            (recur (rest remaining) best best-key)))))))
 
 ;; take-last: take last n items
 (defn take-last [n coll]
   (let [len (count (seq coll))]
     (drop (max 0 (- len n)) coll)))
 
-;; drop-last: drop last n items (2-arity version)
-(defn drop-last [n coll]
-  (take (max 0 (- (count (seq coll)) n)) coll))
-
-;; drop-last-1: drop last 1 item
-(defn drop-last-1 [coll]
-  (drop-last 1 coll))
+;; drop-last: drop last n items
+(defn drop-last
+  ([coll] (drop-last 1 coll))
+  ([n coll] (take (max 0 (- (count (seq coll)) n)) coll)))
 
 ;; shuffle: stub (just returns the input - no randomness)
 (defn shuffle [coll] (vec coll))
@@ -1064,11 +1275,13 @@
   (into [] (filter pred coll)))
 
 ;; subvec: get subvector (simple implementation)
-(defn subvec [v start end]
-  (loop [result [] i start]
-    (if (>= i end)
-      result
-      (recur (conj result (nth v i)) (inc i)))))
+(defn subvec
+  ([v start] (subvec v start (count v)))
+  ([v start end]
+   (loop [result [] i start]
+     (if (>= i end)
+       result
+       (recur (conj result (nth v i)) (inc i))))))
 
 ;; cycle: infinite lazy repetition of a sequence
 (defn cycle [coll]
@@ -1102,10 +1315,15 @@
 
 ;; str: convert values to strings and concatenate
 ;; Real function so it can be passed to apply, map, etc.
+(defn str1-or-pr [x]
+  (if (or (coll? x) (seq? x) (lazy-seq? x))
+    (pr-str1 x)
+    (str1 x)))
+
 (defn str
   ([] "")
-  ([x] (str1 x))
-  ([x & more] (reduce (fn [acc v] (str-concat acc (str1 v))) (str1 x) more)))
+  ([x] (str1-or-pr x))
+  ([x & more] (reduce (fn [acc v] (str-concat acc (str1-or-pr v))) (str1-or-pr x) more)))
 
 ;; symbol: create symbol from string/keyword/symbol (builtin)
 ;; symbol and symbol2 are builtins - no need for function definitions
@@ -1149,11 +1367,24 @@
 ;; rseq: reverse sequence (stub using reverse)
 (defn rseq [coll] (reverse (seq coll)))
 
-;; take-nth: take every nth item
-(defn take-nth [n coll]
-  (if (nil? coll)
-    nil
-    (cons (first coll) (take-nth n (drop n coll)))))
+;; take-nth: take every nth item, or return transducer
+(defn take-nth
+  ([n]
+   (fn [rf]
+     (let [ia (atom 1)]
+       (fn
+         ([] (rf))
+         ([result] (rf result))
+         ([result input]
+          (let [i (deref ia)]
+            (reset! ia (inc i))
+            (if (zero? (rem i n))
+              (rf result input)
+              result)))))))
+  ([n coll]
+   (lazy-seq
+     (when-let [s (seq coll)]
+       (cons (first s) (take-nth n (drop n s)))))))
 
 ;; compare is now a builtin (native WASM $compare function)
 
@@ -1185,7 +1416,7 @@
 ;; realized?: check if lazy-seq or delay has been realized
 (defn realized? [x]
   (if (lazy-seq? x)
-    (not (nil? (deref (atom x))))
+    (lazy-seq-realized? x)
     true))
 
 ;; numerator/denominator: ratio stubs
@@ -1198,8 +1429,8 @@
 ;; byte/short/int/long/float/double: coercion
 (defn byte [x] x)
 (defn short [x] x)
-(defn int [x] x)
-(defn long [x] x)
+(defn int [x] (to-int x))
+(defn long [x] (to-int x))
 (defn float [x] (to-float x))
 (defn double [x] (to-float x))
 
@@ -1219,14 +1450,45 @@
 (defn var? [x] false)
 
 ;; some-fn: returns a fn that returns first truthy result
-(defn some-fn [f g]
-  (fn [x]
-    (or (f x) (g x))))
+(defn some-fn
+  ([f]
+   (fn
+     ([x] (f x))
+     ([x y] (or (f x) (f y)))
+     ([x y z] (or (f x) (f y) (f z)))))
+  ([f g]
+   (fn
+     ([x] (or (f x) (g x)))
+     ([x y] (or (f x) (f y) (g x) (g y)))
+     ([x y z] (or (f x) (f y) (f z) (g x) (g y) (g z)))))
+  ([f g h]
+   (fn
+     ([x] (or (f x) (g x) (h x)))
+     ([x y] (or (f x) (f y) (g x) (g y) (h x) (h y)))
+     ([x y z] (or (f x) (f y) (f z) (g x) (g y) (g z) (h x) (h y) (h z)))))
+  ([f g h i]
+   (fn
+     ([x] (or (f x) (g x) (h x) (i x)))
+     ([x y] (or (f x) (f y) (g x) (g y) (h x) (h y) (i x) (i y)))
+     ([x y z] (or (f x) (f y) (f z) (g x) (g y) (g z) (h x) (h y) (h z) (i x) (i y) (i z))))))
 
 ;; every-pred: returns a fn that returns true if all preds are truthy
-(defn every-pred [f g]
-  (fn [x]
-    (and (f x) (g x))))
+(defn every-pred
+  ([f]
+   (fn
+     ([x] (and (f x) true))
+     ([x y] (and (f x) (f y)))
+     ([x y z] (and (f x) (f y) (f z)))))
+  ([f g]
+   (fn
+     ([x] (and (f x) (g x)))
+     ([x y] (and (f x) (f y) (g x) (g y)))
+     ([x y z] (and (f x) (f y) (f z) (g x) (g y) (g z)))))
+  ([f g h]
+   (fn
+     ([x] (and (f x) (g x) (h x)))
+     ([x y] (and (f x) (f y) (g x) (g y) (h x) (h y)))
+     ([x y z] (and (f x) (f y) (f z) (g x) (g y) (g z) (h x) (h y) (h z))))))
 
 ;; promise/deliver: stubs
 (defn promise [] (atom nil))
@@ -1261,7 +1523,10 @@
 (defn pr [x] nil)
 (defn prn [x] nil)
 (defn print-str [x] nil)
-(defn println-str [x] nil)
+(defn println-str
+  ([] "\n")
+  ([x] (str (pr-str1 x) "\n"))
+  ([x & more] (str (reduce (fn [acc v] (str-concat acc (str-concat " " (pr-str1 v)))) (pr-str1 x) more) "\n")))
 (defn pr-str
   ([] "")
   ([x] (pr-str1 x))
@@ -1425,7 +1690,7 @@
              (when ~remaining
                (let [~binding (first ~remaining)]
                  (doseq ~(vec rest-bindings) ~@body)
-                 (recur (rest ~remaining))))))))))
+                 (recur (next ~remaining))))))))))
 
 ;; for: list comprehension (supports multiple bindings, :let, :when, :while)
 (defmacro for [bindings body]
@@ -1537,8 +1802,11 @@
 
 ;; pop! is now a builtin
 
-;; quot: integer division
-(defn quot [n d] (/ n d))
+;; quot: truncated integer division (truncates toward zero)
+(defn quot [n d]
+  (if (and (integer? n) (integer? d))
+    (/ n d)
+    (int (/ n d))))
 
 ;; repeatedly: defined above with lazy-seq
 
@@ -1632,7 +1900,9 @@
 (defn keyword-fn [x] x)  ;; Can't shadow keyword literal
 
 ;; intern: stub
-(defn intern [ns name] nil)
+(defn intern
+  ([ns name] nil)
+  ([ns name val] nil))
 
 ;; inc'/dec': promoted arithmetic (same as inc/dec in woj)
 (defn inc' [n] (inc n))
@@ -1644,14 +1914,27 @@
 ;; format: stub
 (defn format [fmt & args] nil)
 
-;; fnil: function that replaces nil args
-(defn fnil [f default]
-  (fn [x]
-    (f (if (nil? x) default x))))
+;; fnil: function that replaces nil args with defaults
+(defn fnil
+  ([f d1]
+   (fn
+     ([x] (f (if (nil? x) d1 x)))
+     ([x y] (f (if (nil? x) d1 x) y))
+     ([x y z] (f (if (nil? x) d1 x) y z))))
+  ([f d1 d2]
+   (fn
+     ([x y] (f (if (nil? x) d1 x) (if (nil? y) d2 y)))
+     ([x y z] (f (if (nil? x) d1 x) (if (nil? y) d2 y) z))))
+  ([f d1 d2 d3]
+   (fn
+     ([x y z] (f (if (nil? x) d1 x) (if (nil? y) d2 y) (if (nil? z) d3 z)))
+     ([x y z w] (f (if (nil? x) d1 x) (if (nil? y) d2 y) (if (nil? z) d3 z) w)))))
 
 
 ;; random-sample/rand-nth: randomness stubs
-(defn random-sample [prob coll] coll)
+(defn random-sample
+  ([prob] (filter (fn [_] (pos? prob))))
+  ([prob coll] (filter (fn [_] (pos? prob)) coll)))
 (defn rand-nth [coll] (first coll))
 
 ;; full-width-checker-neg: test helper
@@ -1699,7 +1982,22 @@
 
 ;; assert: stub (just evaluate expression)
 (defmacro assert [expr & msg]
-  expr)
+  (let [msg-expr (if (seq msg)
+                   (first msg)
+                   (str "Assert failed: " (pr-str expr)))]
+    `(~'when (~'not ~expr)
+       (~'throw (~'ex-info ~msg-expr {})))))
+
+;; doto: evaluate expr, then call forms with expr as first arg, return expr
+(defmacro doto [expr & forms]
+  (let [g (gensym "doto__")]
+    `(~'let [~g ~expr]
+       ~@(map (fn [f]
+                (if (seq? f)
+                  (concat (list (first f) g) (rest f))
+                  (list f g)))
+              forms)
+       ~g)))
 
 ;; alength: array length (stub)
 (defn alength [arr] (count arr))
@@ -1750,7 +2048,9 @@
 (defn agent-error [a] nil)
 
 ;; rand/rand-int: basic stubs
-(defn rand [] 0.5)
+(defn rand
+  ([] 0.5)
+  ([n] (* 0.5 (to-float n))))
 
 ;; random-uuid: stub
 (defn random-uuid [] nil)
@@ -1779,6 +2079,13 @@
 ;; Note: only supports 1-arity since woj doesn't have varargs
 (defn list [x] (cons x nil))
 
+;; list*: creates a list with items prepended to a sequence
+(defn list*
+  ([coll] (seq coll))
+  ([a coll] (cons a (seq coll)))
+  ([a b & more]
+   (cons a (cons b (apply list* more)))))
+
 ;; keyword is a builtin that creates/looks up keywords from strings
 
 ;; split: string split stub
@@ -1805,8 +2112,11 @@
 ;; satisfies? stub
 (defn satisfies? [protocol x] false)
 
-;; == : numeric equality (same as = for woj)
-(defn == [a b] (= a b))
+;; == : numeric equality (cross-type coercion via f64)
+(defn == [a b]
+  (if (and (integer? a) (integer? b))
+    (= a b)
+    (= (to-float a) (to-float b))))
 
 ;; ============================================
 ;; Sorted Collections (Phase 11)

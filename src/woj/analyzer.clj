@@ -51,7 +51,7 @@
 ;; ============================================
 
 (def ^:dynamic *user-types* {})      ;; type-name -> {:tag N, :fields [...], :kind :deftype/:defrecord}
-(def ^:dynamic *next-type-tag* 18)   ;; built-in tags use 0-17 (0-14 core, 15-17 transient)
+(def ^:dynamic *next-type-tag* 20)   ;; built-in tags use 0-19 (0-14 core, 15-17 transient, 18 VectorSeq, 19 ArrayMap)
 
 ;; Type names used for extend-type
 ;; These map from Clojure-style type names to internal type tags
@@ -92,7 +92,7 @@
   {'inc 1, 'dec 1, 'not 1, 'neg? 1, 'pos? 1, 'zero? 1, 'NaN? 1,
    'first 1, 'rest 1, 'nil? 1, 'cons? 1, 'count 1, 'vector? 1, 'map? 1,
    ;; Type predicates
-   'list? 1, 'keyword? 1, 'keyword 1, 'number? 1, 'integer? 1, 'fn? 1,
+   'list? 1, 'keyword? 1, 'keyword 1, 'keyword2 2, 'number? 1, 'integer? 1, 'fn? 1,
    'coll? 1, 'sequential? 1, 'associative? 1, 'counted? 1, 'indexed? 1,
    'true? 1, 'false? 1, 'some? 1,
    'string? 1, 'symbol? 1, 'float? 1, 'symbol 1, 'symbol2 2, 'namespace 1,
@@ -110,9 +110,9 @@
    ;; Reduce functions
    'reduce 3, 'reduce-kv 3, 'reduced 1, 'reduced? 1,
    ;; String operations
-   'str1 1, 'str-concat 2, 'name 1, 'subs 3, 'string->mem! 2, 'pr-str1 1, 'char 1,
+   'str1 1, 'str-concat 2, 'name 1, 'subs 3, 'string->mem! 2, 'mem->string 2, 'pr-str1 1, 'char 1,
    ;; Float operations
-   'to-float 1, 'math-floor 1, 'math-ceil 1, 'math-sqrt 1, 'math-abs 1, 'math-round 1,
+   'to-float 1, 'to-int 1, 'math-floor 1, 'math-ceil 1, 'math-sqrt 1, 'math-abs 1, 'math-round 1,
    ;; Numeric
    'num 1,
    ;; Reflection stubs
@@ -121,7 +121,7 @@
    'and 2, 'or 2, 'cons 2, 'nth 2, 'conj 2, 'get 2, 'contains? 2,
    'dissoc 2, 'disj 2, 'set-conj 2,
    'assoc 3, 'assoc-map 3,
-   'empty-vector 0, 'empty-hash-map 0,
+   'empty-vector 0, 'empty-hash-map 0, 'make-array-map 2,
    ;; Bit operations
    'bit-and 2, 'bit-or 2, 'bit-xor 2, 'bit-not 1,
    'bit-shift-left 2, 'bit-shift-right 2, 'unsigned-bit-shift-right 2, 'bit-test 2,
@@ -277,6 +277,20 @@
     :instance?
     (free-vars (:val ast) bound-vars)
 
+    :try
+    (let [body-fv (free-vars (:body ast) bound-vars)
+          catch-fv (if-let [catch-clause (:catch ast)]
+                     (let [catch-bound (conj bound-vars (:binding catch-clause))]
+                       (free-vars (:body catch-clause) catch-bound))
+                     #{})
+          finally-fv (if-let [finally-clause (:finally ast)]
+                       (free-vars finally-clause bound-vars)
+                       #{})]
+      (into body-fv (into catch-fv finally-fv)))
+
+    :throw
+    (free-vars (:val ast) bound-vars)
+
     ;; Default - shouldn't happen
     #{}))
 
@@ -287,7 +301,9 @@
 (declare analyze)
 
 (defn analyze-const [form]
-  {:op :const :val form :type :int})
+  (if (and (>= form -1073741824) (<= form 1073741823))
+    {:op :const :val form :type :int :num-type :i32}
+    {:op :const :val form :type :int}))
 
 (defn analyze-bool [form]
   {:op :const :val (if form 1 0) :type :bool})
@@ -322,7 +338,8 @@
     (if-let [idx (and *capture-map* (get *capture-map* sym))]
       {:op :captured :name sym :index idx}
       (if-let [info (get *env* sym)]
-        {:op :local :name sym}
+        (cond-> {:op :local :name sym}
+          (:num-type info) (assoc :num-type (:num-type info)))
       ;; When in a namespace, try the prefixed version of the symbol first
         (let [ns-sym (when *ns-prefix* (symbol (str *ns-prefix* sym)))]
           (if-let [resolved (or (when (and ns-sym (contains? *globals* ns-sym)) ns-sym)
@@ -623,6 +640,41 @@
         body-forms (if (seq destructure-bindings)
                      (list (list* 'let (vec (apply concat destructure-bindings)) body-forms))
                      body-forms)
+        ;; Handle pre/post conditions: {:pre [...] :post [...]} as first body form
+        body-forms (let [first-form (first body-forms)]
+                     (if (and (map? first-form)
+                              (or (contains? first-form :pre) (contains? first-form :post)))
+                       (let [pre-conds (:pre first-form)
+                             post-conds (:post first-form)
+                             real-body (rest body-forms)
+                             ;; Pre-conditions: (when-not cond (throw (ex-info "Assert failed: ..." {})))
+                             pre-checks (when (seq pre-conds)
+                                          (map (fn [c]
+                                                 (list 'when-not c
+                                                       (list 'throw (list 'ex-info
+                                                                          (str "Assert failed: " (pr-str c))
+                                                                          {}))))
+                                               pre-conds))
+                             ;; Post-conditions: wrap body in let, check % against conditions
+                             body-with-post (if (seq post-conds)
+                                             (let [result-sym (woj-gensym "result__")]
+                                               (list (list* 'let [result-sym (cons 'do real-body)]
+                                                            (concat
+                                                             (map (fn [c]
+                                                                    ;; Replace % with result-sym in post-condition
+                                                                    (clojure.walk/postwalk
+                                                                     (fn [x] (if (= x '%) result-sym x))
+                                                                     (list 'when-not c
+                                                                           (list 'throw (list 'ex-info
+                                                                                              (str "Assert failed: " (pr-str c))
+                                                                                              {})))))
+                                                                  post-conds)
+                                                             (list result-sym)))))
+                                             real-body)]
+                         (if (seq pre-checks)
+                           (concat pre-checks body-with-post)
+                           body-with-post))
+                       body-forms))
         ;; Add params to env, and fn-name if present (for self-reference)
         param-env (cond-> (into {} (map (fn [p] [p {:kind :local}]) all-params))
                     fn-name (assoc fn-name {:kind :local}))
@@ -642,8 +694,10 @@
     (let [body-ast-pass1 (if (= 1 (count body-forms))
                            (analyze (first body-forms))
                            {:op :do :exprs (into [] (map analyze body-forms))})
-          ;; Compute free variables in body (excluding params)
-          fv (free-vars body-ast-pass1 (set all-params))
+          ;; Compute free variables in body (excluding params and fn-name for self-reference)
+          fv-exclude (cond-> (set all-params)
+                       fn-name (conj fn-name))
+          fv (free-vars body-ast-pass1 fv-exclude)
           ;; Filter to only locals available for capture (not globals)
           captures (vec (sort (filter #(contains? *enclosing-locals* %) fv)))
           is-closure (seq captures)]
@@ -769,7 +823,8 @@
               name (first pair)
               init (second pair)
               init-ast (analyze init)]
-          (set! *env* (assoc *env* name {:kind :local}))
+          (set! *env* (assoc *env* name (cond-> {:kind :local}
+                                                 (:num-type init-ast) (assoc :num-type (:num-type init-ast)))))
           (recur (rest pairs)
                  (conj analyzed-bindings {:name name :init init-ast})))))))
 
@@ -793,33 +848,63 @@
     (throw-error (str "loop requires a vector for its bindings, got " (type (second form))) form))
   (when (odd? (count (second form)))
     (throw-error "loop requires an even number of forms in binding vector" form))
-  (let [bindings (second form)
+  (let [raw-bindings (second form)
         body-forms (drop 2 form)
-        old-env *env*
-        old-loop-bindings *loop-bindings*]
-    (loop [pairs (partition 2 bindings)
-           analyzed-bindings []
-           binding-names []]
-      (if (empty? pairs)
-        (do
-          (set! *loop-bindings* binding-names)
-          (let [body-ast (if (= 1 (count body-forms))
-                           (analyze (first body-forms))
-                           {:op :do :exprs (into [] (map analyze body-forms))})
-                result {:op :loop
-                        :bindings analyzed-bindings
-                        :body body-ast}]
-            (set! *env* old-env)
-            (set! *loop-bindings* old-loop-bindings)
-            result))
-        (let [pair (first pairs)
-              name (first pair)
-              init (second pair)
-              init-ast (analyze init)]
-          (set! *env* (assoc *env* name {:kind :local}))
-          (recur (rest pairs)
-                 (conj analyzed-bindings {:name name :init init-ast})
-                 (conj binding-names name)))))))
+        pairs (partition 2 raw-bindings)
+        ;; Check if any binding uses destructuring
+        has-destructuring (some (fn [[pattern _]] (or (vector? pattern) (map? pattern))) pairs)]
+    (if has-destructuring
+      ;; Expand destructuring: replace complex patterns with temp symbols,
+      ;; and wrap body in a let that re-destructures on each iteration.
+      ;; (loop [[x & xs] coll, acc 0] body...)
+      ;; => (loop [tmp coll, acc 0] (let [[x & xs] tmp] body...))
+      (let [new-bindings (vec (mapcat
+                                (fn [[pattern init]]
+                                  (if (symbol? pattern)
+                                    [pattern init]
+                                    (let [tmp (woj-gensym "loop__")]
+                                      [tmp init])))
+                                pairs))
+            destr-bindings (vec (mapcat
+                                 (fn [[pattern _init]]
+                                   (if (symbol? pattern)
+                                     []
+                                     (let [;; Find the corresponding tmp symbol
+                                           idx (.indexOf (mapv first (partition 2 raw-bindings)) pattern)
+                                           tmp (nth (take-nth 2 new-bindings) idx)]
+                                       [pattern tmp])))
+                                 pairs))
+            new-body (if (seq destr-bindings)
+                       (list (list* 'let destr-bindings body-forms))
+                       body-forms)]
+        (analyze (list* 'loop new-bindings new-body)))
+      ;; No destructuring — original fast path
+      (let [old-env *env*
+            old-loop-bindings *loop-bindings*]
+        (loop [ps pairs
+               analyzed-bindings []
+               binding-names []]
+          (if (empty? ps)
+            (do
+              (set! *loop-bindings* binding-names)
+              (let [body-ast (if (= 1 (count body-forms))
+                               (analyze (first body-forms))
+                               {:op :do :exprs (into [] (map analyze body-forms))})
+                    result {:op :loop
+                            :bindings analyzed-bindings
+                            :body body-ast}]
+                (set! *env* old-env)
+                (set! *loop-bindings* old-loop-bindings)
+                result))
+            (let [pair (first ps)
+                  name (first pair)
+                  init (second pair)
+                  init-ast (analyze init)]
+              (set! *env* (assoc *env* name (cond-> {:kind :local}
+                                                     (:num-type init-ast) (assoc :num-type (:num-type init-ast)))))
+              (recur (rest ps)
+                     (conj analyzed-bindings {:name name :init init-ast})
+                     (conj binding-names name)))))))))
 
 (defn analyze-recur [form]
   (when-not *loop-bindings*
@@ -835,7 +920,15 @@
       form)))
 
 (defn analyze-do [form]
-  (let [exprs (remove nil? (rest form))]  ; filter nils from reader conditionals
+  (let [raw-exprs (vec (rest form))
+        n (count raw-exprs)
+        ;; Filter nils from reader conditionals in leading positions,
+        ;; but always preserve the last expression (explicit nil return)
+        exprs (if (= 0 n)
+                []
+                (let [leading (remove nil? (butlast raw-exprs))
+                      last-expr (nth raw-exprs (dec n))]
+                  (concat leading [last-expr])))]
     (if (empty? exprs)
       {:op :const :val 0 :type :nil}
       {:op :do :exprs (into [] (map analyze exprs))})))
@@ -1059,10 +1152,16 @@
         catch-clause (first (filter #(and (seq? %) (= 'catch (first %))) catch-finally))
         finally-clause (first (filter #(and (seq? %) (= 'finally (first %))) catch-finally))
         ;; Parse catch: (catch ExType e body...) or (catch :default e body...)
+        ;; Also handles elided exception type from reader conditionals: (catch e body...)
         catch-ast (when catch-clause
-                    (let [ex-type (nth catch-clause 1)
-                          binding (nth catch-clause 2)
-                          catch-body (drop 3 catch-clause)
+                    (let [;; Detect if exception type was elided by reader conditional:
+                          ;; Normal: (catch Type binding body...) — (nth 2) is a symbol
+                          ;; Elided: (catch binding body...) — (nth 2) is a list/form
+                          type-elided? (and (>= (count catch-clause) 3)
+                                           (not (symbol? (nth catch-clause 2))))
+                          ex-type (if type-elided? :default (nth catch-clause 1))
+                          binding (if type-elided? (nth catch-clause 1) (nth catch-clause 2))
+                          catch-body (drop (if type-elided? 2 3) catch-clause)
                           old-env *env*
                           _ (set! *env* (assoc *env* binding {:kind :local}))
                           body-ast (if (= (count catch-body) 1)
@@ -1249,26 +1348,35 @@
 
 (defn analyze-defprotocol
   "Analyze (defprotocol ProtocolName (method1 [this arg]) (method2 [this]))
-   Registers the protocol and its methods."
+   Registers the protocol and its methods.
+   Supports multi-arity methods: (method [this] [this x] [this x y])"
   [form]
   (let [protocol-name (second form)
         method-sigs (remove string? (drop 2 form))
         methods (mapv (fn [sig]
                         (let [method-name (first sig)
-                              ;; Skip docstrings in method sigs: (method [params] "doc")
-                              params (second sig)]
+                              ;; Collect all param vectors (skip docstrings)
+                              param-vecs (filter vector? (rest sig))
+                              arities (mapv (fn [params]
+                                              {:params params
+                                               :arity (count params)})
+                                            param-vecs)]
                           {:name method-name
-                           :params params
-                           :arity (count params)}))
+                           :arities arities
+                           ;; For backward compat, expose first arity as :params/:arity
+                           :params (:params (first arities))
+                           :arity (:arity (first arities))}))
                       method-sigs)]
     ;; Register the protocol
     (set! *protocols* (assoc *protocols* protocol-name {:methods methods}))
     ;; Register each method as a protocol method
-    (doseq [{:keys [name params arity]} methods]
+    (doseq [{:keys [name arities]} methods]
       (set! *protocol-methods* (assoc *protocol-methods* name
                                       {:protocol protocol-name
-                                       :params params
-                                       :arity arity})))
+                                       :arities (into {} (map (fn [a] [(:arity a) a]) arities))
+                                       ;; For backward compat
+                                       :params (:params (first arities))
+                                       :arity (:arity (first arities))})))
     ;; defprotocol produces no runtime code - methods are generated later
     {:op :defprotocol
      :name protocol-name
@@ -1350,7 +1458,8 @@
 
 (defn analyze-defrecord
   "Analyze (defrecord Name [field1 field2 ...] Protocol1 (method1 [this] body) ...)
-   Same as deftype but auto-generates ILookup -lookup impl for keyword field access."
+   Same as deftype but auto-generates ILookup -lookup impl for keyword field access,
+   and IAssociative -assoc impl so that (assoc record :key val) works."
   [form]
   ;; First, rewrite as deftype and analyze it
   (let [name-sym (second form)
@@ -1364,9 +1473,23 @@
                              fields)
         cond-form (concat ['cond] cond-clauses [:else nil])
         lookup-method (list '-lookup (vector this-sym key-sym) (apply list cond-form))
-        ;; Splice ILookup + lookup method into the inline impls
+        ;; Build the IAssociative -assoc method:
+        ;; Convert record to a hash-map of its fields, then assoc the new k/v
+        assoc-this (gensym "this__")
+        assoc-key (gensym "key__")
+        assoc-val (gensym "val__")
+        map-form (apply list 'hash-map
+                        (mapcat (fn [field]
+                                  [(keyword field)
+                                   (list (symbol (str ".-" field)) assoc-this)])
+                                fields))
+        assoc-body (list 'assoc map-form assoc-key assoc-val)
+        assoc-method (list '-assoc (vector assoc-this assoc-key assoc-val) assoc-body)
+        ;; Splice ILookup + IAssociative into the inline impls
         rest-forms (drop 3 form)
-        augmented-forms (concat rest-forms ['ILookup lookup-method])
+        augmented-forms (concat rest-forms
+                                ['ILookup lookup-method]
+                                ['IAssociative assoc-method])
         deftype-form (concat ['deftype name-sym fields] augmented-forms)
         result (analyze-deftype deftype-form)]
     ;; Update the type kind to :defrecord
@@ -1395,26 +1518,42 @@
                       ;; This is a protocol name
                       (recur (rest forms) f impls)
                       ;; This is a method impl: (method-name [params] body...)
+                      ;; or multi-arity: (method-name ([params1] body1...) ([params2] body2...))
                       (let [method-name (first f)
-                            params (second f)
-                            body-forms (drop 2 f)
                             ;; Verify this method belongs to current protocol
                             method-info (get *protocol-methods* method-name)
                             _ (when-not method-info
                                 (throw-error (str "Unknown protocol method: " method-name) form))
-                            ;; Create a fn AST for the implementation
-                            impl-ast (analyze (list* 'fn params body-forms))]
+                            ;; Detect multi-arity: second form is a list (not a vector)
+                            multi-arity? (and (seq? (second f)) (vector? (first (second f))))
+                            arity-forms (if multi-arity?
+                                          ;; Each remaining form is ([params] body...)
+                                          (rest f)
+                                          ;; Single arity: ([params] body...)
+                                          (list (rest f)))
+                            new-impls (mapv (fn [arity-form]
+                                             (let [params (first arity-form)
+                                                   body-forms (rest arity-form)
+                                                   impl-ast (analyze (list* 'fn params body-forms))]
+                                               {:type type-name
+                                                :type-tag type-tag
+                                                :protocol current-protocol
+                                                :method method-name
+                                                :params params
+                                                :impl impl-ast}))
+                                           arity-forms)]
                         (recur (rest forms)
                                current-protocol
-                               (conj impls {:type type-name
-                                            :type-tag type-tag
-                                            :protocol current-protocol
-                                            :method method-name
-                                            :params params
-                                            :impl impl-ast})))))))]
+                               (into impls new-impls)))))))]
     ;; Register implementations
-    (doseq [{:keys [type-tag method impl]} impls]
-      (set! *protocol-impls* (assoc *protocol-impls* [type-tag method] impl)))
+    (doseq [{:keys [type-tag method impl params]} impls]
+      (let [method-info (get *protocol-methods* method)
+            multi-arity? (and method-info (:arities method-info)
+                              (> (count (:arities method-info)) 1))
+            impl-key (if multi-arity?
+                       [type-tag method (count params)]
+                       [type-tag method])]
+        (set! *protocol-impls* (assoc *protocol-impls* impl-key impl))))
     {:op :extend-type
      :type type-name
      :type-tag type-tag
@@ -1459,15 +1598,23 @@
 
 (defn analyze-protocol-call
   "Analyze a call to a protocol method.
-   Returns an AST node for protocol dispatch."
+   Returns an AST node for protocol dispatch.
+   For multi-arity methods, validates against known arities."
   [method-name args form]
   (let [method-info (get *protocol-methods* method-name)]
     (when-not method-info
       (throw-error (str "Unknown protocol method: " method-name) form))
-    (let [expected-arity (:arity method-info)]
-      (when (not= (count args) expected-arity)
-        (throw-error (str "Protocol method " method-name " expects " expected-arity
-                          " args, got " (count args)) form)))
+    (let [call-arity (count args)
+          arities (:arities method-info)]
+      (if arities
+        ;; Multi-arity aware: check if this arity is valid
+        (when-not (contains? arities call-arity)
+          (throw-error (str "Protocol method " method-name " has no arity for "
+                            call-arity " args (valid: " (sort (keys arities)) ")") form))
+        ;; Legacy single-arity: exact match
+        (when (not= call-arity (:arity method-info))
+          (throw-error (str "Protocol method " method-name " expects " (:arity method-info)
+                            " args, got " call-arity) form))))
     {:op :protocol-call
      :method method-name
      :protocol (:protocol method-info)
@@ -1492,15 +1639,15 @@
     ;; Reduce operations
     'reduce 'reduce-kv 'reduced 'reduced?
     ;; Lazy sequence operations
-    'make-lazy-seq 'lazy-seq?
+    'make-lazy-seq 'lazy-seq? 'lazy-seq-realized?
     ;; String operations
-    'str1 'str-concat 'name 'subs 'string->mem! 'pr-str1 'char
+    'str1 'str-concat 'name 'subs 'string->mem! 'mem->string 'pr-str1 'char
     ;; Float operations
-    'to-float 'math-floor 'math-ceil 'math-sqrt 'math-abs 'math-round
+    'to-float 'to-int 'math-floor 'math-ceil 'math-sqrt 'math-abs 'math-round
     ;; Exception operations
     'ex-info 'ex-data 'ex-message 'ex-cause
     ;; Type predicates
-    'list? 'keyword? 'keyword 'number? 'integer? 'fn?
+    'list? 'keyword? 'keyword 'keyword2 'number? 'integer? 'fn?
     'coll? 'sequential? 'associative? 'counted? 'indexed?
     'true? 'false? 'some?
     'string? 'symbol? 'float? 'symbol 'symbol2 'namespace
@@ -1537,6 +1684,22 @@
                 (list 'assoc acc k v))
               m
               (partition 2 kvs)))))
+
+(def ^:private i32-propagating-ops
+  "Arithmetic ops where i32 inputs produce i32 outputs."
+  #{'+ '- '* '/ 'inc 'dec})
+
+(defn- annotate-num-type
+  "If a call AST represents an arithmetic op where all args are :num-type :i32,
+   annotate the result with :num-type :i32."
+  [call-ast]
+  (let [fn-name (when (= :builtin (get-in call-ast [:fn :op]))
+                  (get-in call-ast [:fn :name]))]
+    (if (and fn-name
+             (contains? i32-propagating-ops fn-name)
+             (every? #(= :i32 (:num-type %)) (:args call-ast)))
+      (assoc call-ast :num-type :i32)
+      call-ast)))
 
 (def ^:private variadic-arithmetic
   "Arithmetic ops that fold left over 2+ args, with identity values for 0-arity."
@@ -1596,9 +1759,67 @@
       (and (= fn-expr 'symbol) (= (count args) 2))
       {:op :call :fn {:op :builtin :name 'symbol2} :args (into [] (map analyze args))}
 
+      ;; Handle 2-arg keyword: (keyword ns name) → calls keyword2
+      (and (= fn-expr 'keyword) (= (count args) 2))
+      {:op :call :fn {:op :builtin :name 'keyword2} :args (into [] (map analyze args))}
+
+      ;; Handle and/or with 0 args: (and) → true, (or) → nil
+      (and (contains? #{'and 'or} fn-expr) (= (count args) 0))
+      (analyze (if (= fn-expr 'and) true nil))
+
+      ;; Handle and/or with 1 arg: (or x) → x, (and x) → x
+      (and (contains? #{'and 'or} fn-expr) (= (count args) 1))
+      (analyze (first args))
+
       ;; Handle variadic boolean expansion: (and a b c) → (and (and a b) c)
       (and (contains? #{'and 'or} fn-expr) (> (count args) 2))
       (analyze (reduce (fn [acc arg] (list fn-expr acc arg)) args))
+
+      ;; Handle comparison with 1 arg: (> x) → true, (< x) → true, etc. (Clojure behavior)
+      (and (contains? #{'< '> '<= '>= '= 'not=} fn-expr) (= (count args) 1))
+      (analyze true)
+
+      ;; Handle variadic comparison expansion: (< a b c) → (let [G1 b] (and (< a G1) (< G1 c)))
+      ;; Uses gensyms so intermediate values are only evaluated once.
+      (and (contains? #{'< '> '<= '>= '= 'not=} fn-expr) (> (count args) 2))
+      (let [arg-list (vec args)
+            ;; Generate gensyms for all intermediate args (not first or last)
+            syms (into [nil] (map (fn [_] (woj-gensym "cmp__")) (rest (butlast arg-list))))
+            ;; Build pairwise comparisons
+            pairs (map (fn [i]
+                         (let [left (if (zero? i) (nth arg-list i) (nth syms i))
+                               right-idx (inc i)
+                               right (if (< right-idx (dec (count arg-list)))
+                                       (nth syms right-idx)
+                                       (nth arg-list right-idx))]
+                           (list fn-expr left right)))
+                       (range (dec (count arg-list))))
+            ;; Combine with and
+            combined (reduce (fn [acc pair] (list 'and acc pair)) pairs)
+            ;; Wrap in let to bind gensyms to intermediate values
+            bindings (vec (mapcat (fn [i]
+                                   [(nth syms i) (nth arg-list i)])
+                                 (range 1 (dec (count arg-list)))))]
+        (if (seq bindings)
+          (analyze (list 'let bindings combined))
+          (analyze combined)))
+
+      ;; Handle 2-arg subs: (subs s start) → (subs s start (count s))
+      (and (= fn-expr 'subs) (= (count args) 2))
+      (let [s-sym (woj-gensym "subs__")]
+        (analyze (list 'let [s-sym (first args)]
+                       (list 'subs s-sym (second args) (list 'count s-sym)))))
+
+      ;; Handle 3-arg nth: (nth coll idx default) → bounds-checked with default
+      (and (= fn-expr 'nth) (= (count args) 3))
+      (let [c-sym (woj-gensym "nth_c__")
+            i-sym (woj-gensym "nth_i__")]
+        (analyze (list 'let [c-sym (first args)
+                             i-sym (second args)]
+                       (list 'if (list 'and (list '>= i-sym 0)
+                                       (list '< i-sym (list 'count c-sym)))
+                             (list 'nth c-sym i-sym)
+                             (nth args 2)))))
 
       ;; Handle variadic arithmetic expansion
       (and (contains? variadic-arithmetic fn-expr) (not= (count args) 2))
@@ -1627,7 +1848,8 @@
                      (symbol? fn-expr)
                      (analyze-symbol fn-expr)
                      :else (analyze fn-expr))]
-        {:op :call :fn fn-ast :args (into [] (map analyze args))}))))
+        (annotate-num-type
+          {:op :call :fn fn-ast :args (into [] (map analyze args))})))))
 
 (defn analyze-keyword [kw]
   "Analyze a keyword, interning it and assigning a unique ID."
@@ -1786,11 +2008,14 @@
                   (= op 'extend-type) (analyze-extend-type form)
                   (= op 'extend-protocol) (analyze-extend-protocol form)
                   (= op 'satisfies?) (analyze-satisfies? form)
-                  (= op 'instance?) (let [type-sym (second form)
-                                          val-form (nth form 2)]
-                                      {:op :instance?
-                                       :type type-sym
-                                       :val (analyze val-form)})
+                  (= op 'instance?) (if (< (count form) 3)
+                                      ;; Reader conditional may have eliminated the type arg
+                                      {:op :const :val 0 :type :bool}
+                                      (let [type-sym (second form)
+                                            val-form (nth form 2)]
+                                        {:op :instance?
+                                         :type type-sym
+                                         :val (analyze val-form)}))
 
                   ;; reify: (reify Protocol1 (method1 [this arg] body) ...)
                   ;; Expands to anonymous deftype with captured locals as fields
@@ -1852,11 +2077,15 @@
 
                   ;; defmulti: (defmulti name dispatch-fn)
                   ;; Expands to: (do (def name__methods (atom {}))
-                  ;;                 (defn name [a] ... dispatch ...))
+                  ;;                 (def name__hierarchy (atom (make-hierarchy)))
+                  ;;                 (def name__prefer (atom {}))
+                  ;;                 (defn name [a] ... dispatch with isa? ...))
                   (= op 'defmulti)
                   (let [mm-name (second form)
                         dispatch-expr (nth form 2)
                         methods-name (symbol (str mm-name "__methods"))
+                        hierarchy-name (symbol (str mm-name "__hierarchy"))
+                        prefer-name (symbol (str mm-name "__prefer"))
                         ;; Generate dispatch call
                         ;; For keywords, inline as (get a :key)
                         ;; For functions, call directly
@@ -1865,12 +2094,22 @@
                                         (list dispatch-expr 'a))
                         expanded (list 'do
                                    (list 'def methods-name (list 'atom {}))
+                                   (list 'def hierarchy-name (list 'atom (list 'make-hierarchy)))
+                                   (list 'def prefer-name (list 'atom {}))
                                    (list 'defn mm-name ['a]
                                      (list 'let ['dv dispatch-call
-                                                 'f (list 'get (list 'deref methods-name) 'dv)]
+                                                 'methods (list 'deref methods-name)
+                                                 'f (list 'get 'methods 'dv)]
                                        (list 'if (list 'nil? 'f)
-                                         (list 'let ['df (list 'get (list 'deref methods-name) :default)]
-                                           (list 'if (list 'nil? 'df) nil (list 'df 'a)))
+                                         ;; No exact match - try isa? hierarchy lookup
+                                         (list 'let ['found (list 'mm-find-isa
+                                                                  'methods 'dv
+                                                                  (list 'deref hierarchy-name)
+                                                                  (list 'deref prefer-name))]
+                                           (list 'if (list 'nil? 'found)
+                                             (list 'let ['df (list 'get 'methods :default)]
+                                               (list 'if (list 'nil? 'df) nil (list 'df 'a)))
+                                             (list 'found 'a)))
                                          (list 'f 'a)))))]
                     (analyze expanded))
 
@@ -1882,6 +2121,19 @@
                         fn-tail (drop 3 form)
                         methods-name (symbol (str mm-name "__methods"))
                         expanded `(swap! ~methods-name assoc ~dispatch-val (fn ~@fn-tail))]
+                    (analyze expanded))
+
+                  ;; prefer-method: (prefer-method mm-name dispatch-val-x dispatch-val-y)
+                  ;; Stores preference: when both x and y match, prefer x
+                  (= op 'prefer-method)
+                  (let [mm-name (second form)
+                        x (nth form 2)
+                        y (nth form 3)
+                        prefer-name (symbol (str mm-name "__prefer"))
+                        expanded (list 'swap! prefer-name
+                                       (list 'fn ['m]
+                                         (list 'assoc 'm x
+                                               (list 'set-conj (list 'get 'm x (list 'hash-set)) y))))]
                     (analyze expanded))
 
                   ;; letfn: (letfn [(f [x] body-f) (g [x] body-g)] body)
@@ -2019,7 +2271,7 @@
             *protocol-methods* {}
             *protocol-impls* {}
             *user-types* {}
-            *next-type-tag* 18
+            *next-type-tag* 19
             *ns-aliases* {}
             *loaded-namespaces* #{}
             *loading-namespaces* #{}

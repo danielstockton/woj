@@ -70,18 +70,49 @@
        (if (neg? i) nil (+ i from-index))))))
 
 (defn replace [s match replacement]
-  (str-replace s match replacement))
+  (if (regex? match)
+    ;; Regex replace: find each match and replace with replacement string
+    (let [pat (regex-pattern match)
+          len (count s)]
+      (loop [result "" pos 0]
+        (let [idx (re-find-index (re-pattern pat) (subs s pos len))]
+          (if (nil? idx)
+            (str result (subs s pos len))
+            (let [start (+ pos (nth idx 0))
+                  end (+ pos (nth idx 1))]
+              (recur (str result (subs s pos start) replacement) end))))))
+    (str-replace s match replacement)))
 
 (defn replace-first [s match replacement]
-  (let [idx (str-index-of s match)]
-    (if (neg? idx)
-      s
-      (let [before (subs s 0 idx)
-            after (subs s (+ idx (count match)) (count s))]
-        (str before replacement after)))))
+  (if (regex? match)
+    (let [idx (re-find-index match s)]
+      (if (nil? idx)
+        s
+        (let [before (subs s 0 (nth idx 0))
+              after (subs s (nth idx 1) (count s))]
+          (str before replacement after))))
+    (let [idx (str-index-of s match)]
+      (if (neg? idx)
+        s
+        (let [before (subs s 0 idx)
+              after (subs s (+ idx (count match)) (count s))]
+          (str before replacement after))))))
 
 (defn split [s re]
-  (vec (str-split s re)))
+  (if (regex? re)
+    ;; Regex split: find each match of the pattern and split around it
+    (let [pat (regex-pattern re)
+          len (count s)]
+      (loop [result [] pos 0]
+        (let [idx (re-find-index (re-pattern pat) (subs s pos len))]
+          (if (nil? idx)
+            (conj result (subs s pos len))
+            (let [start (+ pos (nth idx 0))
+                  end (+ pos (nth idx 1))
+                  ;; Guard against zero-length match causing infinite loop
+                  end (if (= start end) (inc end) end)]
+              (recur (conj result (subs s pos start)) end))))))
+    (vec (str-split s re))))
 
 (defn join
   ([coll]

@@ -251,6 +251,20 @@
         len (count s)]
     (re-seq-helper ast s 0 len)))
 
+;; --- Internal: find match with position info ---
+
+(defn- re-find-index-str [pattern-str s]
+  "Returns [start end] of the first match, or nil if no match."
+  (let [ast (re-parse pattern-str)
+        len (count s)]
+    (loop [pos 0]
+      (if (> pos len)
+        nil
+        (let [end (re-try-match-at ast s pos len)]
+          (if end
+            [pos end]
+            (recur (inc pos))))))))
+
 ;; --- Public API ---
 
 (defn re-find [re s]
@@ -261,3 +275,7 @@
 
 (defn re-seq [re s]
   (re-seq-str (regex-pattern re) s))
+
+(defn re-find-index [re s]
+  "Returns [start end] of the first match in s, or nil."
+  (re-find-index-str (regex-pattern re) s))

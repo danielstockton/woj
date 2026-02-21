@@ -119,7 +119,7 @@
       (= sym-str "nil") [nil end-pos]
       (= sym-str "true") [true end-pos]
       (= sym-str "false") [false end-pos]
-      :else [nil end-pos])))
+      :else [(symbol sym-str) end-pos])))
 
 (defn edn-read-vector [s pos]
   ;; pos points at [

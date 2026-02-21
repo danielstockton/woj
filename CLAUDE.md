@@ -13,8 +13,8 @@ Phase 12 complete - Namespace Require:
 - **Implicit boxing** - all values are `anyref` internally, integers auto-boxed via i31ref
 - **Cons lists** - `cons`, `first`, `rest` using WasmGC structs
 - **Persistent vectors** - 32-way branching trie with tail optimization
-- **Persistent hash maps** - simple array-based implementation with keyword and integer keys
-- **Persistent hash sets** - array-based with O(n) lookup
+- **Persistent hash maps** - HAMT (Hash Array Mapped Trie) with O(log32 n) lookup, bitmap-indexed nodes, collision handling
+- **Persistent hash sets** - HAMT-based with O(log32 n) lookup
 - **Keywords** - proper keyword type with interned IDs, usable as map keys
 - **Closures** - functions can capture variables from enclosing scope, enabling higher-order programming
 - **Recursive functions** - `defn` can call itself, enabling `map`, `filter`, `reduce` etc.
@@ -63,9 +63,11 @@ clj -M:test
 
 # Clojure compatibility test suite (individual test files)
 clj -M:run --path test/clojure-test-suite/test \
-  test/clojure-test-suite/test/clojure/core_test/<file>.cljc > /tmp/test.wat && \
-  wasmtime -W gc=y -W function-references=y -W exceptions=y --invoke run-tests /tmp/test.wat
+  test/clojure-test-suite/test/clojure/core_test/<file>.cljc > /tmp/test.wat 2>/dev/null && \
+  wasmtime -W gc=y -W function-references=y -W exceptions=y --invoke test-<name> /tmp/test.wat
+# Invoke the deftest function name (e.g., --invoke test-eq for eq.cljc)
 # Output: 0 = all tests pass, >0 = failure count
+# Note: run-tests is a no-op stub (always returns 0) — use the deftest name instead
 ```
 
 ### Full Pipeline (with WasmGC)
@@ -160,13 +162,33 @@ wasm-tools parse file.wat -o file.wasm
 - Multimethods for AST dispatch (emit)
 - Keep functions pure where possible
 
+## Common Pitfalls
+
+**WAT string assembly is fragile.** The runtime WAT is built via Clojure string concatenation across ~7300 lines of `emitter.clj`. Mismatched parentheses and type mismatches in the WAT are invisible until wasmtime runs. **Always test through wasmtime** after modifying emitter.clj — `clj -M:test` only checks Clojure-level compilation, not WAT validity.
+
+**`run-tests` is a no-op stub.** `lib/core.clj` defines `(defn run-tests [] 0)`. It always returns 0 (pass) regardless of test results. To run compat tests, invoke the `deftest` function name directly (e.g., `--invoke test-eq`), not `--invoke run-tests`.
+
+**Tree-shaker doesn't see external invocations.** The tree-shaker removes core.clj defs unreachable from user code. Functions invoked externally via wasmtime `--invoke` are not roots — they'll be shaken out if nothing in user code references them.
+
+**emitter.clj is a merge conflict magnet.** Nearly every feature/optimization touches this 7300+ line file. Avoid parallel edits to overlapping sections. Sequence dispatch sites (`$first`, `$rest`, `$seq`, `$truthy`, `$eq`, `$hash`) are especially high-traffic.
+
+**Test both unit tests AND runtime.** A common failure mode: `clj -M:test` passes but the generated WAT has validation errors (wrong types, unbalanced blocks, missing `unreachable` after diverging instructions). Always verify with:
+```bash
+echo '(defn smoke [] (+ 20 22))' > /tmp/s.clj
+clj -M:run /tmp/s.clj > /tmp/s.wat 2>/dev/null
+wasmtime -W gc=y -W function-references=y -W exceptions=y --invoke smoke /tmp/s.wat
+# Expected: 42
+```
+
+**Some compat test files have no usable entry point.** Tests like `nil_qmark`, `true_qmark`, `false_qmark`, `contains_qmark`, `empty_qmark` have no `deftest` and rely on `run-tests` (the no-op stub). They need `deftest` wrappers added. Other tests (`eq`, `cons`, `conj`, `assoc`, `dissoc`, `get`, `keys`, `vals`) have pre-existing `invoke3` cast failures from `are` macro calling 2-arity builtins through 3-arity reduce paths.
+
 ## Known Limitations
 - wabt 1.0.39 doesn't support WasmGC (use wasmtime directly with `-W gc=y -W function-references=y -W exceptions=y`)
 - Source locations in errors require metadata from reader (not available with standard read-string)
-- Hash maps use simple O(n) array-based lookup (works but not optimal for large maps)
 - Max 10-arity closures (can add more types if needed)
 - Captured values are copied at closure creation (immutable capture)
 - `deftype` supports inline protocol implementations; `defrecord` is stubbed as map constructor
+- `assoc!` on transient vector trie interior nodes still uses path-copying (tail mutations are in-place)
 
 ## Value Representation
 
@@ -178,8 +200,8 @@ All values are represented as `anyref` internally:
 - **Symbols** → `(ref $Symbol)` struct with interned ID, name string, and optional namespace (tag=4)
 - **Cons cells** → `(ref $Cons)` struct
 - **Vectors** → `(ref $Vector)` struct with trie
-- **HashMaps** → `(ref $HashMap)` struct with array (tag=0)
-- **HashSets** → `(ref $HashSet)` struct with array (tag=1)
+- **HashMaps** → `(ref $HashMap)` struct with HAMT root (tag=0); nodes are `$HAMTNode` (bitmap-indexed), `$HAMTEntry` (leaf), or `$HAMTCollision`
+- **HashSets** → `(ref $HashSet)` struct with HAMT root (tag=1)
 - **Atoms** → `(ref $Atom)` struct with mutable value field
 - **Strings** → `(ref $String)` struct with interned ID and `(ref $CharArray)` UTF-8 byte data
 - **Floats** → `(ref $Float)` struct with f64 value (tag=5)
@@ -189,6 +211,10 @@ All values are represented as `anyref` internally:
 - **ExceptionInfo** → `(ref $ExceptionInfo)` struct with message, data, and cause fields
 - **Regex** → `(ref $Regex)` struct with pattern string (tag=98)
 - **WithMeta** → `(ref $WithMeta)` transparent wrapper with inner value + metadata (tag=99)
+- **VectorSeq** → `(ref $VectorSeq)` lazy view over a vector with offset (tag=18); O(1) `first`/`rest` without allocating Cons cells
+- **TransientVector** → `(ref $TransientVector)` mutable vector for batch operations (tag=15)
+- **TransientHashMap** → `(ref $TransientHashMap)` mutable HAMT map (tag=16)
+- **TransientHashSet** → `(ref $TransientHashSet)` mutable HAMT set (tag=17)
 
 Exported functions automatically unbox return values to `i32` for wasmtime compatibility.
 
@@ -297,8 +323,13 @@ The `test/clojure/` directory contains tests imported from the official Clojure 
 - [x] `clojure.edn`: `read-string` (safe EDN parsing, implemented in `lib/edn.clj`)
 
 ### Tier 3 - Performance and completeness
-- [ ] HAMT-based hash maps (O(log32 n) instead of O(n) array-based)
-- [ ] Transient collections: `transient`/`persistent!`, `assoc!`, `conj!`, `disj!`
+- [x] HAMT-based hash maps (O(log32 n) with bitmap-indexed nodes, collision handling, transient support)
+- [x] Transient collections: `transient`/`persistent!`, `assoc!`, `conj!`, `disj!`, `pop!` (vectors, maps, sets)
+- [x] VectorSeq: lazy O(1) `first`/`rest` over vectors without allocating Cons cells
+- [x] Tree-shaking: unused core.clj definitions removed from output (95% size reduction for simple programs)
+- [x] Integer type propagation: unboxed `i32` arithmetic when types are statically known
+- [x] Protocol dispatch tables: O(1) array-indexed dispatch instead of O(N) if/else chains
+- [x] `br_on_cast_fail` optimization: eliminates redundant `ref.test`/`ref.cast` pairs throughout runtime
 - [x] Transducers: `transduce`, `into` with xf, `eduction`, `sequence`; `map`/`filter`/`take`/`drop`/`take-while`/`drop-while`/`keep`/`mapcat`/`remove`/`distinct`/`dedupe`/`partition-all`/`interpose` return transducers when called without collection
 - [x] Sorted collections: `sorted-map`, `sorted-set`, `sorted-map-by`, `sorted-set-by` (sorted-vector based with binary search, protocol dispatch for seq/count/get/assoc/conj)
 - [x] MapEntry: `key`/`val`/`find`/`select-keys` (map entries are 2-element vectors)

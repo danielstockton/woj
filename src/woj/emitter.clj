@@ -35,9 +35,18 @@
 ;; User-defined types from deftype/defrecord
 (def ^:dynamic *user-types* {})  ;; type-name -> {:tag N, :fields [...], :kind :deftype/:defrecord}
 
-;; Max type tag for dispatch table size (nil=0 through TransientHashSet=17, plus 1 for default)
+;; Max type tag for dispatch table size (nil=0 through VectorSeq=18, plus 1 for default)
 ;; Computed dynamically when user types are present
-(def max-type-tag 18)
+(def max-type-tag 20)
+
+(defn- compute-dispatch-table-size
+  "Compute size of dispatch tables from all known type tags.
+   Returns max-tag + 1 to accommodate array indices 0..max-tag."
+  []
+  (let [user-tags (map :tag (vals *user-types*))
+        impl-tags (map first (keys *protocol-impls*))
+        all-tags (concat [max-type-tag] user-tags impl-tags)]
+    (inc (apply max all-tags))))
 
 ;; ============================================
 ;; Emitter
@@ -84,7 +93,8 @@
     :if (concat (collect-locals (:test ast))
                 (collect-locals (:then ast))
                 (collect-locals (:else ast)))
-    :call (mapcat collect-locals (:args ast))
+    :call (concat (collect-locals (:fn ast))
+                  (mapcat collect-locals (:args ast)))
     :protocol-call (mapcat collect-locals (:args ast))
     :recur (mapcat collect-locals (:args ast))
     :do (mapcat collect-locals (:exprs ast))
@@ -192,7 +202,7 @@
    - body: body AST node
    - captures: vector of captured variable symbols
    - has-recur: if true, wrap body in loop for tail-position recur"
-  [name params body captures & {:keys [has-recur]}]
+  [name params body captures & {:keys [has-recur self-name]}]
   (let [munged (if (string? name) name (munge-name name))
         fn-name (str "$" munged)
         arity (count params)
@@ -207,6 +217,16 @@
                                     *closure-env-param* "$__env"]
                             (collect-locals body)))
                 params)
+        ;; Add self-name local if present (for named fn self-reference)
+        self-local (when self-name
+                     (str "(local $" (munge-name self-name) " anyref)"))
+        all-locals (if self-local (cons self-local locals) locals)
+        ;; Generate self-reference initialization code
+        self-init (when self-name
+                    (str "(local.set $" (munge-name self-name)
+                         " (struct.new $Closure" arity
+                         " (i32.const 11) (ref.func " fn-name
+                         ") (local.get $__env)))\n    "))
         body-code (binding [*capture-indices* capture-map
                             *closure-env-param* "$__env"]
                     (emit-body-with-recur body params has-recur))
@@ -214,8 +234,8 @@
         func-type (str "$ClosureFunc" arity)
         fn-def (str "(func " fn-name " (type " func-type ") "
                     env-decl " " (str-join " " param-decls) " (result anyref)"
-                    (if (seq locals) (str "\n    " (str-join "\n    " locals)) "")
-                    "\n    " body-code ")")]
+                    (if (seq all-locals) (str "\n    " (str-join "\n    " all-locals)) "")
+                    "\n    " (or self-init "") body-code ")")]
     (add-function! fn-def)
     ;; Track this closure function for elem declaration
     (set! *closure-funcs* (conj *closure-funcs* fn-name))
@@ -237,7 +257,7 @@
 (def vector-builtins #{'nth 'count 'conj 'vector? 'empty-vector})
 
 ;; Map builtins
-(def map-builtins #{'get 'contains? 'map? 'empty-hash-map 'assoc-map 'dissoc 'keys 'vals})
+(def map-builtins #{'get 'contains? 'map? 'empty-hash-map 'assoc-map 'dissoc 'keys 'vals 'make-array-map})
 
 ;; Set builtins
 (def set-builtins #{'set? 'empty-hash-set 'set-conj 'disj})
@@ -255,13 +275,13 @@
 (def reduce-builtins #{'reduce 'reduce-kv 'reduced 'reduced?})
 
 ;; Lazy sequence builtins
-(def lazy-seq-builtins #{'make-lazy-seq 'lazy-seq?})
+(def lazy-seq-builtins #{'make-lazy-seq 'lazy-seq? 'lazy-seq-realized?})
 
 ;; String builtins
-(def string-builtins #{'str1 'str-concat 'name 'subs 'string->mem! 'pr-str1 'char})
+(def string-builtins #{'str1 'str-concat 'name 'subs 'string->mem! 'mem->string 'pr-str1 'char})
 
 ;; Float operation builtins
-(def float-op-builtins #{'to-float 'math-floor 'math-ceil 'math-sqrt 'math-abs 'math-round})
+(def float-op-builtins #{'to-float 'to-int 'math-floor 'math-ceil 'math-sqrt 'math-abs 'math-round})
 
 ;; Exception builtins
 (def exception-builtins #{'ex-info 'ex-data 'ex-message 'ex-cause})
@@ -312,11 +332,96 @@
        " (then (global.get $__true))"
        " (else (global.get $__false)))"))
 
+;; Emit raw i32 value from an AST node known to have :num-type :i32
+;; This avoids box/unbox overhead for typed integer operations.
+;; Defined before emit-comparison-as-i32 which uses it.
+(defn- emit-i32-raw [ast]
+  (cond
+    ;; Integer constant: just the raw i32
+    (and (= (:op ast) :const) (= (:type ast) :int))
+    (str "(i32.const " (:val ast) ")")
+
+    ;; Typed arithmetic call: emit the i32 operation directly (no boxing)
+    (and (= (:op ast) :call) (= :i32 (:num-type ast)))
+    (let [fn-name (get-in ast [:fn :name])
+          args (:args ast)]
+      (case fn-name
+        (+ - * /)
+        (let [wasm-op (case fn-name + "i32.add" - "i32.sub" * "i32.mul" / "i32.div_s")
+              a (emit-i32-raw (first args))
+              b (emit-i32-raw (second args))]
+          (str "(" wasm-op " " a " " b ")"))
+        inc (str "(i32.add " (emit-i32-raw (first args)) " (i32.const 1))")
+        dec (str "(i32.sub " (emit-i32-raw (first args)) " (i32.const 1))")
+        ;; fallback: emit normally and unbox
+        (emit-unbox (emit ast))))
+
+    ;; Local with known i32 type: unbox from i31ref
+    (and (= (:op ast) :local) (= :i32 (:num-type ast)))
+    (str "(i31.get_s (ref.cast (ref i31) (local.get $" (munge-name (:name ast)) ")))")
+
+    ;; Fallback: emit normally and unbox
+    :else
+    (emit-unbox (emit ast))))
+
+;; Emit a comparison call directly as i32, skipping $Boolean boxing/unboxing
+(defn- emit-comparison-as-i32 [ast]
+  (let [fn-name (get-in ast [:fn :name])
+        args (:args ast)]
+    (case fn-name
+      ;; = and not= use $eq which already returns i32
+      = (if (every? #(= :i32 (:num-type %)) args)
+          ;; Optimized: direct i32 equality
+          (str "(i32.eq " (emit-i32-raw (first args)) " " (emit-i32-raw (second args)) ")")
+          (str "(call $eq " (emit (first args)) " " (emit (second args)) ")"))
+      not= (if (every? #(= :i32 (:num-type %)) args)
+             (str "(i32.ne " (emit-i32-raw (first args)) " " (emit-i32-raw (second args)) ")")
+             (str "(i32.eqz (call $eq " (emit (first args)) " " (emit (second args)) "))"))
+      ;; All others return $Boolean - extract the val field directly
+      (< > <= >=)
+      (if (every? #(= :i32 (:num-type %)) args)
+        ;; Optimized: direct i32 comparison
+        (let [wasm-op (case fn-name < "i32.lt_s" > "i32.gt_s" <= "i32.le_s" >= "i32.ge_s")]
+          (str "(" wasm-op " " (emit-i32-raw (first args)) " " (emit-i32-raw (second args)) ")"))
+        (let [a (emit (first args))
+              b (emit (second args))]
+          (str "(struct.get $Boolean $val (ref.cast (ref $Boolean) (call $cmp_"
+               (case fn-name < "lt" > "gt" <= "le" >= "ge")
+               " " a " " b ")))")))
+      neg?
+      (if (= :i32 (:num-type (first args)))
+        (str "(i32.lt_s " (emit-i32-raw (first args)) " (i32.const 0))")
+        (str "(struct.get $Boolean $val (ref.cast (ref $Boolean) (call $cmp_lt "
+             (emit (first args)) " (ref.i31 (i32.const 0)))))"))
+      pos?
+      (if (= :i32 (:num-type (first args)))
+        (str "(i32.gt_s " (emit-i32-raw (first args)) " (i32.const 0))")
+        (str "(struct.get $Boolean $val (ref.cast (ref $Boolean) (call $cmp_gt "
+             (emit (first args)) " (ref.i31 (i32.const 0)))))"))
+      zero?
+      (if (= :i32 (:num-type (first args)))
+        (str "(i32.eqz " (emit-i32-raw (first args)) ")")
+        (str "(struct.get $Boolean $val (ref.cast (ref $Boolean) (call $zero_QMARK_ "
+             (emit (first args)) ")))"))
+      NaN?
+      (str "(struct.get $Boolean $val (ref.cast (ref $Boolean) (call $is_nan "
+           (emit (first args)) ")))")
+      ;; Fallback - shouldn't happen but just in case
+      (str "(call $truthy " (emit ast) ")"))))
+
+;; Check if an AST node is a call to a comparison builtin
+(defn- comparison-call? [ast]
+  (and (= (:op ast) :call)
+       (= (get-in ast [:fn :op]) :builtin)
+       (contains? comparison-builtins (get-in ast [:fn :name]))))
+
 ;; Emit code that evaluates to i32 (for conditionals)
-;; Uses $truthy for polymorphic truthiness check
+;; Optimizes comparison builtins to skip $truthy dispatch
 (defn- emit-as-i32 [ast]
   "Emit code and check truthiness for conditionals that need i32"
-  (str "(call $truthy " (emit ast) ")"))
+  (if (comparison-call? ast)
+    (emit-comparison-as-i32 ast)
+    (str "(call $truthy " (emit ast) ")")))
 
 (defn emit [{:keys [op] :as ast}]
   (cond
@@ -369,21 +474,25 @@
     (let [fn-ast (:fn ast)
           fn-name (when (#{:builtin :global :fn-global} (:op fn-ast)) (:name fn-ast))]
       (cond
-        ;; Arithmetic: unbox args, compute, rebox result
+        ;; Arithmetic: use inline i32 ops when types are known, else call runtime
         (contains? arithmetic-builtins fn-name)
-        (let [args (:args ast)]
-          (case fn-name
-            (+ - * /)
-            (let [op-name (case fn-name + "$add" - "$sub" * "$mul" / "$div")
-                  a (emit (first args))
-                  b (emit (second args))]
-              (str "(call " op-name " " a " " b ")"))
-            inc
-            (let [a (emit (first args))]
-              (str "(call $inc " a ")"))
-            dec
-            (let [a (emit (first args))]
-              (str "(call $dec " a ")"))))
+        (if (= :i32 (:num-type ast))
+          ;; Optimized path: all args are known i32, emit raw i32 ops and box result
+          (emit-box (emit-i32-raw ast))
+          ;; Generic path: call polymorphic runtime functions
+          (let [args (:args ast)]
+            (case fn-name
+              (+ - * /)
+              (let [op-name (case fn-name + "$add" - "$sub" * "$mul" / "$div")
+                    a (emit (first args))
+                    b (emit (second args))]
+                (str "(call " op-name " " a " " b ")"))
+              inc
+              (let [a (emit (first args))]
+                (str "(call $inc " a ")"))
+              dec
+              (let [a (emit (first args))]
+                (str "(call $dec " a ")")))))
 
 ;; Comparisons: compare, return $Boolean
         (contains? comparison-builtins fn-name)
@@ -396,19 +505,31 @@
                 = (emit-bool (str "(call $eq " a " " b ")"))
                 not= (emit-bool (str "(i32.eqz (call $eq " a " " b "))"))))
             (< > <= >=)
-            (let [a (emit (first args))
-                  b (emit (second args))]
-              ;; Use polymorphic comparison that handles int and float
-              (str "(call $cmp_" (case fn-name < "lt" > "gt" <= "le" >= "ge") " " a " " b ")"))
+            (if (every? #(= :i32 (:num-type %)) args)
+              ;; Optimized: both args are known i32, use direct comparison
+              (let [wasm-op (case fn-name < "i32.lt_s" > "i32.gt_s" <= "i32.le_s" >= "i32.ge_s")
+                    a (emit-i32-raw (first args))
+                    b (emit-i32-raw (second args))]
+                (emit-bool (str "(" wasm-op " " a " " b ")")))
+              ;; Generic: polymorphic comparison
+              (let [a (emit (first args))
+                    b (emit (second args))]
+                (str "(call $cmp_" (case fn-name < "lt" > "gt" <= "le" >= "ge") " " a " " b ")")))
             neg?
-            (let [a (emit (first args))]
-              (str "(call $cmp_lt " a " (ref.i31 (i32.const 0)))"))
+            (let [a (first args)]
+              (if (= :i32 (:num-type a))
+                (emit-bool (str "(i32.lt_s " (emit-i32-raw a) " (i32.const 0))"))
+                (str "(call $cmp_lt " (emit a) " (ref.i31 (i32.const 0)))")))
             pos?
-            (let [a (emit (first args))]
-              (str "(call $cmp_gt " a " (ref.i31 (i32.const 0)))"))
+            (let [a (first args)]
+              (if (= :i32 (:num-type a))
+                (emit-bool (str "(i32.gt_s " (emit-i32-raw a) " (i32.const 0))"))
+                (str "(call $cmp_gt " (emit a) " (ref.i31 (i32.const 0)))")))
             zero?
-            (let [a (emit (first args))]
-              (str "(call $zero_QMARK_ " a ")"))
+            (let [a (first args)]
+              (if (= :i32 (:num-type a))
+                (emit-bool (str "(i32.eqz " (emit-i32-raw a) ")"))
+                (str "(call $zero_QMARK_ " (emit a) ")")))
             NaN?
             ;; NaN? - call the $is_nan helper function
             (str "(call $is_nan " (emit (first args)) ")")))
@@ -508,7 +629,10 @@
               (str "(call $make_lazy_seq " thunk ")"))
             lazy-seq?
             (let [val (emit (first args))]
-              (str "(call $lazy_seq_QMARK_ " val ")"))))
+              (str "(call $lazy_seq_QMARK_ " val ")"))
+            lazy-seq-realized?
+            (let [val (emit (first args))]
+              (str "(call $lazy_seq_realized_QMARK_ " val ")"))))
 
         ;; String operations
         (contains? string-builtins fn-name)
@@ -533,6 +657,10 @@
             (let [s (emit (first args))
                   offset (emit-unbox (emit (second args)))]
               (emit-box (str "(call $string__GT_mem_BANG_ " s " " offset ")")))
+            mem->string
+            (let [offset (emit-unbox (emit (first args)))
+                  len (emit-unbox (emit (second args)))]
+              (str "(call $mem__GT_string " offset " " len ")"))
             pr-str1
             (let [val (emit (first args))]
               (str "(call $pr_str1 " val ")"))
@@ -547,6 +675,12 @@
             to-float
             (let [val (emit (first args))]
               (str "(struct.new $Float (i32.const 5) (call $to_f64 " val "))"))
+            to-int
+            (let [val (emit (first args))]
+              ;; If already i31ref (integer), return as-is; otherwise truncate f64 toward zero
+              (str "(if (result anyref) (ref.test (ref i31) " val ")"
+                   " (then " val ")"
+                   " (else (ref.i31 (i32.trunc_sat_f64_s (f64.trunc (call $to_f64 " val "))))))"))
             math-floor
             (let [val (emit (first args))]
               (str "(struct.new $Float (i32.const 5) (f64.floor (call $to_f64 " val ")))"))
@@ -788,6 +922,10 @@
                   k (emit (second args))
                   v (emit (nth args 2))]
               (str "(call $hash_map_assoc " m " " k " " v ")"))
+            make-array-map
+            (let [arr (emit (first args))
+                  cnt (emit (second args))]
+              (str "(call $make_array_map " arr " " (emit-unbox cnt) ")"))
             dissoc
             (let [m (emit (first args))
                   k (emit (second args))]
@@ -1013,48 +1151,146 @@
            "\n        (br " loop-label ")"))
 
     (= op :fn)
-    (let [counter *fn-counter*
-          _ (set! *fn-counter* (inc *fn-counter*))
-          is-closure (:is-closure ast)
-          captures (:captures ast)
-          params (:params ast)
-          arity (count params)]
-      (if is-closure
-        ;; Emit closure: create env array, create closure struct
-        (let [fn-name (emit-closure-function (str "closure" (inc counter)) params (:body ast) captures
-                                             :has-recur (:has-recur ast))
-              closure-type (str "$Closure" arity)
-              ;; Build environment array with captured values
+    (let [arities (:arities ast)
+          multi-arity? (and arities (> (count arities) 1))]
+      (if multi-arity?
+        ;; Multi-arity anonymous fn: emit as MultiClosure with dispatch function
+        (let [counter *fn-counter*
+              _ (set! *fn-counter* (inc *fn-counter*))
+              base-name (str "anon_multi" (inc counter))
+              captures (or (:captures ast) [])
+              is-closure (seq captures)
+              ;; Emit each arity as a closure function
+              arity-fn-names (mapv (fn [arity-info]
+                                    (let [suffix (if (:variadic? arity-info)
+                                                   "_variadic"
+                                                   (str "_arity" (:arity arity-info)))
+                                          fn-name (str base-name suffix)
+                                          params (if (:variadic? arity-info)
+                                                   (conj (:params arity-info) (:rest-param arity-info))
+                                                   (:params arity-info))]
+                                      {:wasm-name (emit-closure-function fn-name params (:body arity-info) captures
+                                                                         :has-recur (:has-recur arity-info))
+                                       :arity (:arity arity-info)
+                                       :variadic? (:variadic? arity-info)
+                                       :param-count (count params)}))
+                                  arities)
+              ;; Build dispatch function
+              fixed-fns (filter (complement :variadic?) arity-fn-names)
+              variadic-fn (first (filter :variadic? arity-fn-names))
+              dispatch-name (str "$" base-name "_dispatch")
+              ;; Generate destructure code for N args from cons list
+              gen-destructure (fn [n]
+                                (if (zero? n)
+                                  ["" "" " (local.get $__env)"]
+                                  (let [locals (apply str (for [i (range n)]
+                                                            (str "(local $a" i " anyref) ")))
+                                        destruct (apply str
+                                                        (for [i (range n)]
+                                                          (str "(local.set $a" i " (call $first (local.get $args)))\n      "
+                                                               (when (< i (dec n))
+                                                                 (str "(local.set $args (call $rest (local.get $args)))\n      ")))))
+                                        refs (str " (local.get $__env)" (apply str (for [i (range n)] (str " (local.get $a" i ")"))))]
+                                    [locals destruct refs])))
+              gen-variadic-destructure (fn []
+                                         (let [va (:arity variadic-fn)
+                                               n-required va]
+                                           (if (zero? n-required)
+                                             ["" "" " (local.get $__env) (local.get $args)"]
+                                             (let [locals (apply str (for [i (range n-required)]
+                                                                      (str "(local $a" i " anyref) ")))
+                                                   destruct (apply str
+                                                                   (for [i (range n-required)]
+                                                                     (str "(local.set $a" i " (call $first (local.get $args)))\n      "
+                                                                          "(local.set $args (call $rest (local.get $args)))\n      ")))
+                                                   refs (str " (local.get $__env)"
+                                                             (apply str (for [i (range n-required)] (str " (local.get $a" i ")")))
+                                                             " (local.get $args)")]
+                                               [locals destruct refs]))))
+              ;; Build dispatch body
+              else-case (if variadic-fn
+                          (let [[_ v-destruct v-refs] (gen-variadic-destructure)]
+                            (str v-destruct "(call " (:wasm-name variadic-fn) v-refs ")"))
+                          "(unreachable)")
+              dispatch-body (reduce
+                             (fn [else-code fn-info]
+                               (let [[_ f-destruct f-refs] (gen-destructure (:arity fn-info))]
+                                 (str "(if (result anyref) (i32.eq (local.get $argc) (i32.const " (:arity fn-info) "))\n      (then\n      "
+                                      f-destruct
+                                      "(call " (:wasm-name fn-info) f-refs "))\n      "
+                                      "(else " else-code "))")))
+                             else-case
+                             (reverse (sort-by :arity fixed-fns)))
+              max-args (max (if (seq fixed-fns) (apply max (map :arity fixed-fns)) 0)
+                            (if variadic-fn (:arity variadic-fn) 0))
+              all-locals (apply str (for [i (range max-args)] (str "(local $a" i " anyref) ")))
+              func-def (str "(func " dispatch-name " (type $MultiClosureDispatch) "
+                            "(param $__env anyref) (param $argc i32) (param $args anyref) (result anyref)\n    "
+                            all-locals "\n    "
+                            dispatch-body ")")
+              _ (add-function! func-def)
+              _ (set! *closure-funcs* (conj *closure-funcs* dispatch-name))
+              ;; Build environment array
               env-size (count captures)
               env-init (if (empty? captures)
                          "(call $array_new (i32.const 0))"
-                         ;; Generate code to access each captured variable
-                         ;; They might be locals or captured from our own env
                          (let [env-sets (map-indexed
                                          (fn [i sym]
-                                           (let [;; Check if this sym is in our capture-indices (we captured it)
-                                                 ;; or it's a local parameter
-                                                 value-code (if (and *capture-indices* (contains? *capture-indices* sym))
-                                                              ;; Access from our environment
+                                           (let [value-code (if (and *capture-indices* (contains? *capture-indices* sym))
                                                               (str "(call $array_get (local.get " *closure-env-param* ") (i32.const " (get *capture-indices* sym) "))")
-                                                              ;; Access as local
                                                               (str "(local.get $" (munge-name sym) ")"))]
                                              (str "(call $array_set (local.get $__tmp_env) (i32.const " i ") " value-code ")")))
                                          captures)]
-                           ;; We need a local to hold the env array during construction
-                           ;; But we're in expression context... use a nested block
                            (str "(block (result anyref)\n        "
                                 "(local.set $__tmp_env (call $array_new (i32.const " env-size ")))\n        "
                                 (str-join "\n        " env-sets) "\n        "
                                 "(local.get $__tmp_env))")))]
-          (str "(struct.new " closure-type " (i32.const 11) (ref.func " fn-name ") " env-init ")"))
-        ;; Not a closure: emit plain function reference
-        ;; But since it's used as a value, we need to wrap it in a Closure struct
-        ;; Use emit-closure-function so it has the right type signature
-        (let [fn-name (emit-closure-function (str "fn" (inc counter)) params (:body ast) []
-                                             :has-recur (:has-recur ast))]
-          ;; Create a closure struct with empty environment
-          (str "(struct.new $Closure" arity " (i32.const 11) (ref.func " fn-name ") (call $array_new (i32.const 0)))"))))
+          ;; MultiClosure: type_id=11, env, dispatch
+          (str "(struct.new $MultiClosure (i32.const 11) " env-init " (ref.func " dispatch-name "))"))
+        ;; Single-arity fn (original code path)
+        (let [counter *fn-counter*
+              _ (set! *fn-counter* (inc *fn-counter*))
+              is-closure (:is-closure ast)
+              captures (:captures ast)
+              params (:params ast)
+              arity (count params)
+          self-name (:fn-name ast)]
+          (if is-closure
+            ;; Emit closure: create env array, create closure struct
+            (let [fn-name (emit-closure-function (str "closure" (inc counter)) params (:body ast) captures
+                                                 :has-recur (:has-recur ast) :self-name self-name)
+                  closure-type (str "$Closure" arity)
+                  ;; Build environment array with captured values
+                  env-size (count captures)
+                  env-init (if (empty? captures)
+                             "(call $array_new (i32.const 0))"
+                             ;; Generate code to access each captured variable
+                             ;; They might be locals or captured from our own env
+                             (let [env-sets (map-indexed
+                                             (fn [i sym]
+                                               (let [;; Check if this sym is in our capture-indices (we captured it)
+                                                     ;; or it's a local parameter
+                                                     value-code (if (and *capture-indices* (contains? *capture-indices* sym))
+                                                                  ;; Access from our environment
+                                                                  (str "(call $array_get (local.get " *closure-env-param* ") (i32.const " (get *capture-indices* sym) "))")
+                                                                  ;; Access as local
+                                                                  (str "(local.get $" (munge-name sym) ")"))]
+                                                 (str "(call $array_set (local.get $__tmp_env) (i32.const " i ") " value-code ")")))
+                                             captures)]
+                               ;; We need a local to hold the env array during construction
+                               ;; But we're in expression context... use a nested block
+                               (str "(block (result anyref)\n        "
+                                    "(local.set $__tmp_env (call $array_new (i32.const " env-size ")))\n        "
+                                    (str-join "\n        " env-sets) "\n        "
+                                    "(local.get $__tmp_env))")))]
+              (str "(struct.new " closure-type " (i32.const 11) (ref.func " fn-name ") " env-init ")"))
+            ;; Not a closure: emit plain function reference
+            ;; But since it's used as a value, we need to wrap it in a Closure struct
+            ;; Use emit-closure-function so it has the right type signature
+            (let [fn-name (emit-closure-function (str "fn" (inc counter)) params (:body ast) []
+                                                 :has-recur (:has-recur ast) :self-name self-name)]
+              ;; Create a closure struct with empty environment
+              (str "(struct.new $Closure" arity " (i32.const 11) (ref.func " fn-name ") (call $array_new (i32.const 0)))"))))))
 
     (= op :do)
     (let [exprs (:exprs ast)
@@ -1139,12 +1375,15 @@
                       arity-suffix (if (:variadic? arity-info)
                                      "_variadic"
                                      (str "_arity" (:arity arity-info)))
-                      full-name (str (name (:name ast)) arity-suffix)
+                      ;; Munge the base name first, then append suffix
+                      ;; This ensures operators like + and - get properly munged
+                      munged-base (munge-name (:name ast))
+                      full-name (str munged-base arity-suffix)
                       ;; For variadic arity, include rest-param in params
                       params (if (:variadic? arity-info)
                                (conj (:params arity-info) (:rest-param arity-info))
                                (:params arity-info))]
-                  (emit-function (symbol full-name) params (:body arity-info) full-name
+                  (emit-function full-name params (:body arity-info) full-name
                                  :has-recur (:has-recur arity-info))))
               ;; Single arity: use old behavior
               (let [arity-info (first arities)
@@ -1170,10 +1409,13 @@
     (do
       ;; Store protocol info for later use
       (set! *protocols* (assoc *protocols* (:name ast) {:methods (:methods ast)}))
-      ;; Register each method
-      (doseq [{:keys [name arity]} (:methods ast)]
+      ;; Register each method (with multi-arity support)
+      (doseq [{:keys [name arity arities]} (:methods ast)]
         (set! *protocol-methods* (assoc *protocol-methods* name
-                                        {:protocol (:name ast) :arity arity})))
+                                        {:protocol (:name ast)
+                                         :arity arity
+                                         :arities (when arities
+                                                    (into {} (map (fn [a] [(:arity a) a]) arities)))})))
       ;; defprotocol produces no runtime code in itself
       "(ref.null none)")
 
@@ -1183,13 +1425,19 @@
           impls (:impls ast)]
       ;; For each implementation, emit a closure function and register it
       (doseq [{:keys [method impl params]} impls]
-        (let [fn-name (str "__proto_" (munge-name method) "_" type-tag)
-              ;; Create a closure for the impl
-              arity (count params)]
+        (let [method-info (get *protocol-methods* method)
+              multi-arity? (and method-info (:arities method-info) (> (count (:arities method-info)) 1))
+              arity (count params)
+              fn-name (if multi-arity?
+                        (str "__proto_" (munge-name method) "_arity_" arity "_" type-tag)
+                        (str "__proto_" (munge-name method) "_" type-tag))
+              impl-key (if multi-arity?
+                         [type-tag method arity]
+                         [type-tag method])]
           ;; Emit the impl as a closure function
           (emit-closure-function fn-name params (:body impl) (or (:captures impl) []))
           ;; Register the impl
-          (set! *protocol-impls* (assoc *protocol-impls* [type-tag method] fn-name))))
+          (set! *protocol-impls* (assoc *protocol-impls* impl-key fn-name))))
       ;; extend-type produces no runtime code
       "(ref.null none)")
 
@@ -1207,7 +1455,12 @@
           arity (count args)
           ;; First arg is always 'this' - the dispatch target
           munged-method (munge-name method)
-          dispatch-fn (str "$__dispatch_" munged-method)]
+          ;; Use arity-specific dispatch fn if method has multiple arities
+          method-info (get *protocol-methods* method)
+          multi-arity? (and method-info (:arities method-info) (> (count (:arities method-info)) 1))
+          dispatch-fn (if multi-arity?
+                        (str "$__dispatch_" munged-method "_arity_" arity)
+                        (str "$__dispatch_" munged-method))]
       ;; Generate call to dispatch function
       ;; The dispatch function takes the target as first arg and dispatches based on type
       (str "(call " dispatch-fn " " (str-join " " (map emit args)) ")"))
@@ -1241,12 +1494,19 @@
         ;; Non-exported alias (deftype constructors return structs, not i32)
         (add-function! (str "(func $" constructor-munged " " param-decls " (result anyref)\n"
                             "    (call $" constructor-munged "_internal " field-args "))")))
-      ;; Emit protocol impls (same as extend-type)
+      ;; Emit protocol impls (same as extend-type, with multi-arity support)
       (doseq [{:keys [method impl params]} impls]
-        (let [fn-name (str "__proto_" (munge-name method) "_" tag)
-              arity (count params)]
+        (let [method-info (get *protocol-methods* method)
+              multi-arity? (and method-info (:arities method-info) (> (count (:arities method-info)) 1))
+              arity (count params)
+              fn-name (if multi-arity?
+                        (str "__proto_" (munge-name method) "_arity_" arity "_" tag)
+                        (str "__proto_" (munge-name method) "_" tag))
+              impl-key (if multi-arity?
+                         [tag method arity]
+                         [tag method])]
           (emit-closure-function fn-name params (:body impl) (or (:captures impl) []))
-          (set! *protocol-impls* (assoc *protocol-impls* [tag method] fn-name))))
+          (set! *protocol-impls* (assoc *protocol-impls* impl-key fn-name))))
       ;; deftype produces no runtime code
       "(ref.null none)")
 
@@ -1270,7 +1530,7 @@
           (Cons List ISeq) (str "(call $bool (ref.test (ref $Cons) " val-code "))")
           (Vector PersistentVector) (str "(call $bool (ref.test (ref $Vector) " val-code "))")
           ;; HashMap/HashSet both have (i32,i32,anyref) — collide structurally, use type_tag
-          (HashMap PersistentHashMap) (str "(call $bool (i32.eq (call $type_tag " val-code ") (i32.const 8)))")
+          (HashMap PersistentHashMap) (str "(call $bool (i32.or (i32.eq (call $type_tag " val-code ") (i32.const 8)) (i32.eq (call $type_tag " val-code ") (i32.const 19))))")
           (HashSet PersistentHashSet) (str "(call $bool (i32.eq (call $type_tag " val-code ") (i32.const 9)))")
           Atom (str "(call $bool (ref.test (ref $Atom) " val-code "))")
           Boolean (str "(call $bool (i32.eq (call $type_tag " val-code ") (i32.const 14)))")
@@ -1462,36 +1722,42 @@
 ;; ============================================
 
 (defn generate-dispatch-function
-  "Generate a WAT dispatch function for a protocol method.
-   The function looks up the impl based on type tag and invokes it.
-   Returns the function definition string."
+  "Generate a WAT dispatch function for a protocol method using table-based O(1) dispatch.
+   Returns {:func-def :table-global-decl :table-init-code}.
+   For multi-arity, method-name includes arity suffix (e.g., bar_arity_2)."
   [method-name arity impls]
   (let [munged (munge-name method-name)
         fn-name (str "$__dispatch_" munged)
+        table-global (str "$__dispatch_table_" munged)
+        table-size (compute-dispatch-table-size)
         ;; Generate param list: arg0 is 'this', the rest are other args
         param-decls (str-join " " (for [i (range arity)]
                                     (str "(param $arg" i " anyref)")))
-        ;; Generate dispatch logic using nested if/else on type tag
-        ;; The first arg ($arg0) is the dispatch target
-        dispatch-code
-        (let [;; Sort impls by type tag for consistent ordering
-              sorted-impls (sort-by first impls)
-              ;; Build nested if/else for each impl
-              else-case "(unreachable)"  ;; Default: no impl - crash
-              cases (reduce
-                     (fn [else [[type-tag method] impl-fn-name]]
-                       (let [invoke-code (str "(call $invoke" arity
-                                              " (global.get $__proto_" (munge-name method) "_" type-tag "_closure)"
-                                              " " (str-join " " (for [i (range arity)]
-                                                                  (str "(local.get $arg" i ")"))) ")")]
-                         (str "(if (result anyref) (i32.eq (call $type_tag (local.get $arg0)) (i32.const " type-tag "))\n"
-                              "          (then " invoke-code ")\n"
-                              "          (else " else "))")))
-                     else-case
-                     (reverse sorted-impls))]
-          cases)]
-    (str "(func " fn-name " " param-decls " (result anyref)\n"
-         "    " dispatch-code ")")))
+        arg-list (str-join " " (for [i (range arity)]
+                                 (str "(local.get $arg" i ")")))
+        ;; Table init: create array then populate entries with impl closures
+        init-create (str "(global.set " table-global
+                         " (array.new $AnyArray (ref.null none) (i32.const " table-size ")))")
+        init-entries (for [[[type-tag _method] _impl-fn-name] impls]
+                       (str "(array.set $AnyArray"
+                            " (ref.cast (ref $AnyArray) (global.get " table-global "))"
+                            " (i32.const " type-tag ")"
+                            " (global.get $__proto_" munged "_" type-tag "_closure))"))]
+    {:func-def (str "(func " fn-name " " param-decls " (result anyref)\n"
+                    "    (local $tag i32)\n"
+                    "    (local $impl anyref)\n"
+                    "    (local.set $tag (call $type_tag (local.get $arg0)))\n"
+                    "    (if (i32.or (i32.lt_s (local.get $tag) (i32.const 0))\n"
+                    "                (i32.ge_s (local.get $tag) (i32.const " table-size ")))\n"
+                    "      (then (unreachable)))\n"
+                    "    (local.set $impl (array.get $AnyArray\n"
+                    "      (ref.cast (ref $AnyArray) (global.get " table-global "))\n"
+                    "      (local.get $tag)))\n"
+                    "    (if (result anyref) (ref.is_null (local.get $impl))\n"
+                    "      (then (unreachable))\n"
+                    "      (else (call $invoke" arity " (local.get $impl) " arg-list "))))")
+     :table-global-decl (str "(global " table-global " (mut anyref) (ref.null none))")
+     :table-init-code (vec (cons init-create init-entries))}))
 
 (defn generate-satisfies-function
   "Generate a WAT function to check if a value satisfies a protocol.
@@ -1520,18 +1786,24 @@
                                (first comparisons)
                                (rest comparisons))))]
     (str "(func " fn-name " (param $val anyref) (result anyref)\n"
-         "    (ref.i31 " check-code "))")))
+         "    (call $bool " check-code "))")))
 
 (defn generate-protocol-impl-closures
   "Generate globals to hold closures for each protocol impl.
-   Returns a list of {:global-decl :init-code} maps."
+   Returns a list of {:global-decl :init-code} maps.
+   Keys can be [type-tag method] or [type-tag method arity] for multi-arity."
   [impls]
-  (for [[[type-tag method] impl-fn-name] impls]
-    (let [munged-method (munge-name method)
-          global-name (str "$__proto_" munged-method "_" type-tag "_closure")
-          ;; Look up the arity from *protocol-methods*
+  (for [[impl-key impl-fn-name] impls]
+    (let [type-tag (nth impl-key 0)
+          method (nth impl-key 1)
+          explicit-arity (when (= 3 (count impl-key)) (nth impl-key 2))
           method-info (get *protocol-methods* method)
-          arity (or (:arity method-info) 1)]
+          multi-arity? (and method-info (:arities method-info) (> (count (:arities method-info)) 1))
+          munged-method (munge-name method)
+          arity (or explicit-arity (:arity method-info) 1)
+          global-name (if multi-arity?
+                        (str "$__proto_" munged-method "_arity_" arity "_" type-tag "_closure")
+                        (str "$__proto_" munged-method "_" type-tag "_closure"))]
       {:global-decl (str "(global " global-name " (mut anyref) (ref.null none))")
        :global-name global-name
        :func-name (str "$" impl-fn-name)
@@ -1556,7 +1828,7 @@
   ;; Tag assignments: nil=0 i31=1 Keyword=2 String=3 Symbol=4 Float=5
   ;; Cons=6 Vector=7 HashMap=8 HashSet=9 Atom=10 Closure=11 LazySeq=12
   ;; Reduced=13 Boolean=14 TransientVector=15 TransientHashMap=16
-  ;; TransientHashSet=17 ExceptionInfo=100 User-types=18+
+  ;; TransientHashSet=17 VectorSeq=18 ArrayMap=19 ExceptionInfo=100 User-types=20+
 
   ;; Base type for all tagged structs
   (type $Tagged (sub (struct (field $__type_id i32))))
@@ -1651,6 +1923,13 @@
     (field $__pad i32)               ;; Padding for structural distinction from Cons
     (field $thunk (mut anyref))      ;; 0-arity closure (null when realized)
     (field $realized (mut anyref))))) ;; cached result (nil or Cons/seq)
+
+  ;; VectorSeq: lazy view over a vector from a given offset
+  ;; Tag = 18. O(1) first/rest without allocating Cons cells.
+  (type $VectorSeq (sub $Tagged (struct
+    (field $__type_id i32)
+    (field $vec anyref)              ;; The underlying Vector
+    (field $offset i32))))           ;; Current index into the vector
 
   ;; ExceptionInfo: structured exception data (like Clojure's ex-info)
   (type $ExceptionInfo (sub $Tagged (struct
@@ -1782,138 +2061,146 @@
   (func $first (param $coll anyref) (result anyref)
     (local $count i32)
     (local $arr anyref)
+    (local $vs (ref null $VectorSeq))
     ;; Unwrap WithMeta
     (local.set $coll (call $unwrap_meta (local.get $coll)))
     ;; nil -> nil
-    (if (result anyref) (ref.is_null (local.get $coll))
-      (then (ref.null none))
-      (else
-        ;; LazySeq - realize and recurse
-        (if (result anyref) (ref.test (ref $LazySeq) (local.get $coll))
-          (then (call $first (call $lazy_seq_realize (local.get $coll))))
-          (else
-            ;; Cons cell
-            (if (result anyref) (ref.test (ref $Cons) (local.get $coll))
-          (then (struct.get $Cons $first (ref.cast (ref $Cons) (local.get $coll))))
-          (else
-            ;; Vector
-            (if (result anyref) (ref.test (ref $Vector) (local.get $coll))
-              (then
-                (local.set $count (call $vector_count (local.get $coll)))
-                (if (result anyref) (i32.le_s (local.get $count) (i32.const 0))
-                  (then (ref.null none))
-                  (else (call $vector_nth (local.get $coll) (i32.const 0)))))
-              (else
-                ;; HashMap - delegate to seq, take first
-                (if (result anyref) (i32.eq (call $type_tag (local.get $coll)) (i32.const 8))
-                  (then
-                    (local.set $count (struct.get $HashMap $count (ref.cast (ref $HashMap) (local.get $coll))))
-                    (if (result anyref) (i32.le_s (local.get $count) (i32.const 0))
-                      (then (ref.null none))
-                      (else (call $first (call $seq (local.get $coll))))))
-                  (else
-                    ;; HashSet - delegate to seq, take first
-                    (if (result anyref) (i32.eq (call $type_tag (local.get $coll)) (i32.const 9))
-                      (then
-                        (local.set $count (struct.get $HashSet $count (ref.cast (ref $HashSet) (local.get $coll))))
-                        (if (result anyref) (i32.le_s (local.get $count) (i32.const 0))
-                          (then (ref.null none))
-                          (else (call $first (call $seq (local.get $coll))))))
-                      (else
-                        ;; String - return first char as 1-char string
-                        (if (result anyref) (ref.test (ref $String) (local.get $coll))
-                          (then
-                            (if (result anyref) (i32.le_s (call $str_len (local.get $coll)) (i32.const 0))
-                              (then (ref.null none))
-                              (else (call $char_at_as_str (local.get $coll) (i32.const 0)))))
-                          (else
-                            ;; Protocol fallback: seq then first
-                            (if (result anyref) (i31.get_s (ref.cast (ref i31) (call $__satisfies_ISeqable (local.get $coll))))
-                              (then (call $first (call $__dispatch__seq (local.get $coll))))
-                              (else (ref.null none))))))))))))))))))
+    (if (ref.is_null (local.get $coll))
+      (then (return (ref.null none))))
+    ;; LazySeq - realize and recurse
+    (block $not_lazy (result anyref)
+      (br_on_cast_fail $not_lazy anyref (ref $LazySeq) (local.get $coll))
+      (return (call $first (call $lazy_seq_realize (local.get $coll)))))
+    (drop)
+    ;; VectorSeq - O(1) indexed access
+    (block $not_vseq (result anyref)
+      (local.set $vs (br_on_cast_fail $not_vseq anyref (ref $VectorSeq) (local.get $coll)))
+      (return (call $vector_nth
+        (struct.get $VectorSeq $vec (local.get $vs))
+        (struct.get $VectorSeq $offset (local.get $vs)))))
+    (drop)
+    ;; Cons cell
+    (block $not_cons (result anyref)
+      (return (struct.get $Cons $first
+        (br_on_cast_fail $not_cons anyref (ref $Cons) (local.get $coll)))))
+    (drop)
+    ;; Vector
+    (block $not_vec (result anyref)
+      (br_on_cast_fail $not_vec anyref (ref $Vector) (local.get $coll))
+      (local.set $count (call $vector_count (local.get $coll)))
+      (if (i32.le_s (local.get $count) (i32.const 0))
+        (then (return (ref.null none))))
+      (return (call $vector_nth (local.get $coll) (i32.const 0))))
+    (drop)
+    ;; HashMap (tag=8)
+    (if (i32.eq (call $type_tag (local.get $coll)) (i32.const 8))
+      (then
+        (local.set $count (struct.get $HashMap $count (ref.cast (ref $HashMap) (local.get $coll))))
+        (if (i32.le_s (local.get $count) (i32.const 0))
+          (then (return (ref.null none))))
+        (return (call $first (call $seq (local.get $coll))))))
+    ;; HashSet (tag=9)
+    (if (i32.eq (call $type_tag (local.get $coll)) (i32.const 9))
+      (then
+        (local.set $count (struct.get $HashSet $count (ref.cast (ref $HashSet) (local.get $coll))))
+        (if (i32.le_s (local.get $count) (i32.const 0))
+          (then (return (ref.null none))))
+        (return (call $first (call $seq (local.get $coll))))))
+    ;; String - return first char as 1-char string
+    (block $not_str (result anyref)
+      (br_on_cast_fail $not_str anyref (ref $String) (local.get $coll))
+      (if (i32.le_s (call $str_len (local.get $coll)) (i32.const 0))
+        (then (return (ref.null none))))
+      (return (call $char_at_as_str (local.get $coll) (i32.const 0))))
+    (drop)
+    ;; Protocol fallback: seq then first
+    (if (call $truthy (call $__satisfies_ISeqable (local.get $coll)))
+      (then (return (call $first (call $__dispatch__seq (local.get $coll))))))
+    (ref.null none))
 
   ;; rest: get the rest of a collection (polymorphic)
-  ;; Works on: Cons, Vector, HashMap, HashSet, LazySeq
-  ;; Returns a seq (cons list) for non-Cons types
+  ;; Works on: Cons, Vector, HashMap, HashSet, LazySeq, VectorSeq
+  ;; Returns a seq for non-Cons types
   (func $rest (param $coll anyref) (result anyref)
     (local $count i32)
     (local $i i32)
     (local $arr anyref)
     (local $result anyref)
+    (local $vs (ref null $VectorSeq))
     ;; Unwrap WithMeta
     (local.set $coll (call $unwrap_meta (local.get $coll)))
     ;; nil -> empty list (nil)
-    (if (result anyref) (ref.is_null (local.get $coll))
-      (then (ref.null none))
-      (else
-        ;; LazySeq - realize and recurse
-        (if (result anyref) (ref.test (ref $LazySeq) (local.get $coll))
-          (then (call $rest (call $lazy_seq_realize (local.get $coll))))
-          (else
-            ;; Cons cell
-            (if (result anyref) (ref.test (ref $Cons) (local.get $coll))
-          (then (struct.get $Cons $rest (ref.cast (ref $Cons) (local.get $coll))))
-          (else
-            ;; Vector - return rest as cons list
-            (if (result anyref) (ref.test (ref $Vector) (local.get $coll))
-              (then
-                (local.set $count (call $vector_count (local.get $coll)))
-                (if (result anyref) (i32.le_s (local.get $count) (i32.const 1))
-                  (then (ref.null none))
-                  (else
-                    ;; Build cons list from index 1 to end
-                    (local.set $result (ref.null none))
-                    (local.set $i (i32.sub (local.get $count) (i32.const 1)))
-                    (block $done
-                      (loop $loop
-                        (br_if $done (i32.lt_s (local.get $i) (i32.const 1)))
-                        (local.set $result (call $cons
-                          (call $vector_nth (local.get $coll) (local.get $i))
-                          (local.get $result)))
-                        (local.set $i (i32.sub (local.get $i) (i32.const 1)))
-                        (br $loop)))
-                    (local.get $result))))
-              (else
-                ;; HashMap - delegate to seq, take rest
-                (if (result anyref) (i32.eq (call $type_tag (local.get $coll)) (i32.const 8))
-                  (then
-                    (local.set $count (struct.get $HashMap $count (ref.cast (ref $HashMap) (local.get $coll))))
-                    (if (result anyref) (i32.le_s (local.get $count) (i32.const 1))
-                      (then (ref.null none))
-                      (else (call $rest (call $seq (local.get $coll))))))
-                  (else
-                    ;; HashSet - delegate to seq, take rest
-                    (if (result anyref) (i32.eq (call $type_tag (local.get $coll)) (i32.const 9))
-                      (then
-                        (local.set $count (struct.get $HashSet $count (ref.cast (ref $HashSet) (local.get $coll))))
-                        (if (result anyref) (i32.le_s (local.get $count) (i32.const 1))
-                          (then (ref.null none))
-                          (else (call $rest (call $seq (local.get $coll))))))
-                      (else
-                        ;; String - return rest as seq of codepoint strings
-                        (if (result anyref) (ref.test (ref $String) (local.get $coll))
-                          (then
-                            (local.set $count (call $str_codepoint_count (local.get $coll)))
-                            (if (result anyref) (i32.le_s (local.get $count) (i32.const 1))
-                              (then (ref.null none))
-                              (else
-                                ;; Build cons list of codepoint strings from end to start
-                                (local.set $result (ref.null none))
-                                (local.set $i (i32.sub (local.get $count) (i32.const 1)))
-                                (block $done4
-                                  (loop $loop4
-                                    (br_if $done4 (i32.lt_s (local.get $i) (i32.const 1)))
-                                    (local.set $result (call $cons
-                                      (call $char_at_as_str (local.get $coll) (local.get $i))
-                                      (local.get $result)))
-                                    (local.set $i (i32.sub (local.get $i) (i32.const 1)))
-                                    (br $loop4)))
-                                (local.get $result))))
-                          (else
-                            ;; Protocol fallback: seq then rest
-                            (if (result anyref) (i31.get_s (ref.cast (ref i31) (call $__satisfies_ISeqable (local.get $coll))))
-                              (then (call $rest (call $__dispatch__seq (local.get $coll))))
-                              (else (ref.null none))))))))))))))))))
+    (if (ref.is_null (local.get $coll))
+      (then (return (ref.null none))))
+    ;; LazySeq - realize and recurse
+    (block $not_lazy (result anyref)
+      (br_on_cast_fail $not_lazy anyref (ref $LazySeq) (local.get $coll))
+      (return (call $rest (call $lazy_seq_realize (local.get $coll)))))
+    (drop)
+    ;; VectorSeq - O(1) rest via offset increment
+    (block $not_vseq (result anyref)
+      (local.set $vs (br_on_cast_fail $not_vseq anyref (ref $VectorSeq) (local.get $coll)))
+      (local.set $i (i32.add
+        (struct.get $VectorSeq $offset (local.get $vs))
+        (i32.const 1)))
+      (if (result anyref) (i32.ge_s (local.get $i)
+        (call $vector_count (struct.get $VectorSeq $vec (local.get $vs))))
+        (then (ref.null none))
+        (else (struct.new $VectorSeq (i32.const 18)
+          (struct.get $VectorSeq $vec (local.get $vs))
+          (local.get $i))))
+      (return))
+    (drop)
+    ;; Cons cell
+    (block $not_cons (result anyref)
+      (return (struct.get $Cons $rest
+        (br_on_cast_fail $not_cons anyref (ref $Cons) (local.get $coll)))))
+    (drop)
+    ;; Vector - return VectorSeq from index 1
+    (block $not_vec (result anyref)
+      (br_on_cast_fail $not_vec anyref (ref $Vector) (local.get $coll))
+      (local.set $count (call $vector_count (local.get $coll)))
+      (if (i32.le_s (local.get $count) (i32.const 1))
+        (then (return (ref.null none))))
+      (return (struct.new $VectorSeq (i32.const 18) (local.get $coll) (i32.const 1))))
+    (drop)
+    ;; HashMap (tag=8)
+    (if (i32.eq (call $type_tag (local.get $coll)) (i32.const 8))
+      (then
+        (local.set $count (struct.get $HashMap $count (ref.cast (ref $HashMap) (local.get $coll))))
+        (if (i32.le_s (local.get $count) (i32.const 1))
+          (then (return (ref.null none))))
+        (return (call $rest (call $seq (local.get $coll))))))
+    ;; HashSet (tag=9)
+    (if (i32.eq (call $type_tag (local.get $coll)) (i32.const 9))
+      (then
+        (local.set $count (struct.get $HashSet $count (ref.cast (ref $HashSet) (local.get $coll))))
+        (if (i32.le_s (local.get $count) (i32.const 1))
+          (then (return (ref.null none))))
+        (return (call $rest (call $seq (local.get $coll))))))
+    ;; String - return rest as seq of codepoint strings
+    (block $not_str (result anyref)
+      (br_on_cast_fail $not_str anyref (ref $String) (local.get $coll))
+      (local.set $count (call $str_codepoint_count (local.get $coll)))
+      (if (i32.le_s (local.get $count) (i32.const 1))
+        (then (return (ref.null none))))
+      ;; Build cons list of codepoint strings from end to start
+      (local.set $result (ref.null none))
+      (local.set $i (i32.sub (local.get $count) (i32.const 1)))
+      (block $done4
+        (loop $loop4
+          (br_if $done4 (i32.lt_s (local.get $i) (i32.const 1)))
+          (local.set $result (call $cons
+            (call $char_at_as_str (local.get $coll) (local.get $i))
+            (local.get $result)))
+          (local.set $i (i32.sub (local.get $i) (i32.const 1)))
+          (br $loop4)))
+      (return (local.get $result)))
+    (drop)
+    ;; Protocol fallback: seq then rest
+    (if (call $truthy (call $__satisfies_ISeqable (local.get $coll)))
+      (then (return (call $rest (call $__dispatch__seq (local.get $coll))))))
+    (ref.null none))
 
   ;; nil?: check if value is nil (null reference) - returns $Boolean
   (func $nil_QMARK_ (param $val anyref) (result anyref)
@@ -1947,8 +2234,16 @@
             (local.set $current (struct.get $Cons $rest (ref.cast (ref $Cons) (local.get $current))))
             (br $loop))
           (else
-            ;; Non-cons, non-lazy, non-null - count as 1 and stop
-            (local.set $count (i32.add (local.get $count) (i32.const 1)))))))
+            ;; VectorSeq - add remaining count in O(1)
+            (if (ref.test (ref $VectorSeq) (local.get $current))
+              (then
+                (local.set $count (i32.add (local.get $count)
+                  (i32.sub
+                    (call $vector_count (struct.get $VectorSeq $vec (ref.cast (ref $VectorSeq) (local.get $current))))
+                    (struct.get $VectorSeq $offset (ref.cast (ref $VectorSeq) (local.get $current)))))))
+              (else
+                ;; Non-cons, non-lazy, non-VectorSeq, non-null - count as 1 and stop
+                (local.set $count (i32.add (local.get $count) (i32.const 1)))))))))
     (local.get $count))
 
   ;; list-sum: sum all integers in a list (assumes i31ref elements, returns i32)
@@ -1979,7 +2274,7 @@
     (if (result i32) (ref.is_null (local.get $val))
       (then (i32.const 0))
       (else
-        ;; Check if it's a Boolean
+        ;; Check if it's a Boolean (tag=14)
         (if (result i32) (i32.eq (call $type_tag (local.get $val)) (i32.const 14))
           (then
             ;; It's a Boolean - return the val field (0=false, 1=true)
@@ -1991,37 +2286,47 @@
   ;; unbox_i32: convert anyref to i32 for export wrappers
   ;; Boolean -> 0/1, i31ref -> integer value, null -> 0, other -> 1
   (func $unbox_i32 (param $val anyref) (result i32)
-    (if (result i32) (ref.is_null (local.get $val))
-      (then (i32.const 0))
-      (else (if (result i32) (i32.eq (call $type_tag (local.get $val)) (i32.const 14))
-        (then (struct.get $Boolean $val (ref.cast (ref $Boolean) (local.get $val))))
-        (else (if (result i32) (ref.test (ref i31) (local.get $val))
-          (then (i31.get_s (ref.cast (ref i31) (local.get $val))))
-          (else (i32.const 1))))))))
+    (if (ref.is_null (local.get $val))
+      (then (return (i32.const 0))))
+    ;; Boolean (tag=14)
+    (if (i32.eq (call $type_tag (local.get $val)) (i32.const 14))
+      (then (return (struct.get $Boolean $val (ref.cast (ref $Boolean) (local.get $val))))))
+    ;; i31ref (integer)
+    (block $not_i31 (result anyref)
+      (return (i31.get_s
+        (br_on_cast_fail $not_i31 anyref (ref i31) (local.get $val)))))
+    (drop)
+    (i32.const 1))
 
   ;; unbox_f64: convert anyref to f64 for export wrappers
   ;; Float -> f64 value, i31ref -> convert to f64, other -> 0.0
   (func $unbox_f64 (param $val anyref) (result f64)
-    (if (result f64) (ref.test (ref $Float) (local.get $val))
-      (then (struct.get $Float $val (ref.cast (ref $Float) (local.get $val))))
-      (else (if (result f64) (ref.test (ref i31) (local.get $val))
-        (then (f64.convert_i32_s (i31.get_s (ref.cast (ref i31) (local.get $val)))))
-        (else (f64.const 0))))))
+    (block $not_float (result anyref)
+      (return (struct.get $Float $val
+        (br_on_cast_fail $not_float anyref (ref $Float) (local.get $val)))))
+    (drop)
+    (block $not_i31 (result anyref)
+      (return (f64.convert_i32_s (i31.get_s
+        (br_on_cast_fail $not_i31 anyref (ref i31) (local.get $val))))))
+    (drop)
+    (f64.const 0))
 
   ;; is_nan: check if value is a NaN float - returns $Boolean
   ;; NaN is the only value where x != x
   (func $is_nan (param $val anyref) (result anyref)
-    (if (result anyref) (ref.test (ref $Float) (local.get $val))
-      (then
-        ;; It's a float - check if NaN using (x != x)
-        (if (result anyref) (f64.ne
-          (struct.get $Float $val (ref.cast (ref $Float) (local.get $val)))
-          (struct.get $Float $val (ref.cast (ref $Float) (local.get $val))))
-          (then (global.get $__true))
-          (else (global.get $__false))))
-      (else
-        ;; Not a float - not NaN
-        (global.get $__false))))
+    (local $fv (ref null $Float))
+    (block $not_float (result anyref)
+      (local.set $fv (br_on_cast_fail $not_float anyref (ref $Float) (local.get $val)))
+      ;; It's a float - check if NaN using (x != x)
+      (if (result anyref) (f64.ne
+        (struct.get $Float $val (local.get $fv))
+        (struct.get $Float $val (local.get $fv)))
+        (then (global.get $__true))
+        (else (global.get $__false)))
+      (return))
+    (drop)
+    ;; Not a float - not NaN
+    (global.get $__false))
 
   ;; ==========================================
   ;; Array Operations
@@ -2084,48 +2389,41 @@
   ;; - other -> default hash
   (func $hash (param $val anyref) (result i32)
     ;; null -> 0
-    (if (result i32) (ref.is_null (local.get $val))
-      (then (i32.const 0))
-      (else
-        ;; i31ref (integer/boolean)?
-        (if (result i32) (ref.test (ref i31) (local.get $val))
-          (then (call $hash_int (i31.get_s (ref.cast (ref i31) (local.get $val)))))
-          (else
-            ;; Keyword?
-            (if (result i32) (i32.eq (call $type_tag (local.get $val)) (i32.const 2))
-              (then
-                ;; Use keyword id with some mixing
-                (call $hash_int (i32.add
-                  (struct.get $Keyword $id (ref.cast (ref $Keyword) (local.get $val)))
-                  (i32.const 0x9e3779b9))))
-              (else
-                ;; String?
-                (if (result i32) (ref.test (ref $String) (local.get $val))
-                  (then
-                    ;; Always use content-based hash for strings
-                    ;; (ID-based hash would give different results for equal
-                    ;;  strings with different interned IDs, e.g., literals vs
-                    ;;  runtime-created strings from nth/subs)
-                    (call $str_hash (local.get $val)))
-                  (else
-                    ;; Symbol? Hash by name content (+ namespace)
-                    (if (result i32) (i32.eq (call $type_tag (local.get $val)) (i32.const 4))
-                      (then
-                        (call $sym_hash (local.get $val)))
-                      (else
-                        ;; Float?
-                        (if (result i32) (ref.test (ref $Float) (local.get $val))
-                          (then
-                            ;; Reinterpret f64 bits via linear memory for proper hashing
-                            (f64.store (i32.const 0) (struct.get $Float $val (ref.cast (ref $Float) (local.get $val))))
-                            (call $hash_int (i32.xor (i32.load (i32.const 0)) (i32.load (i32.const 4)))))
-                          (else
-                            ;; Vector?
-                            (if (result i32) (ref.test (ref $Vector) (local.get $val))
-                              (then (call $hash_vector (local.get $val)))
-                              (else
-                                ;; User-defined types
-                                __USER_TYPE_HASH__)))))))))))))))
+    (if (ref.is_null (local.get $val))
+      (then (return (i32.const 0))))
+    ;; i31ref (integer/boolean)?
+    (block $not_i31 (result anyref)
+      (return (call $hash_int (i31.get_s
+        (br_on_cast_fail $not_i31 anyref (ref i31) (local.get $val))))))
+    (drop)
+    ;; Keyword (tag=2)
+    (if (i32.eq (call $type_tag (local.get $val)) (i32.const 2))
+      (then (return (call $hash_int (i32.add
+        (struct.get $Keyword $id (ref.cast (ref $Keyword) (local.get $val)))
+        (i32.const 0x9e3779b9))))))
+    ;; String?
+    (block $not_str (result anyref)
+      (br_on_cast_fail $not_str anyref (ref $String) (local.get $val))
+      ;; Always use content-based hash for strings
+      (return (call $str_hash (local.get $val))))
+    (drop)
+    ;; Symbol?
+    (block $not_sym (result anyref)
+      (br_on_cast_fail $not_sym anyref (ref $Symbol) (local.get $val))
+      (return (call $sym_hash (local.get $val))))
+    (drop)
+    ;; Float?
+    (block $not_float (result anyref)
+      (br_on_cast_fail $not_float anyref (ref $Float) (local.get $val))
+      ;; Reinterpret f64 bits via linear memory for proper hashing
+      (f64.store (i32.const 0) (struct.get $Float $val (ref.cast (ref $Float) (local.get $val))))
+      (return (call $hash_int (i32.xor (i32.load (i32.const 0)) (i32.load (i32.const 4))))))
+    (drop)
+    ;; Vector (tag=7)
+    (if (i32.eq (call $type_tag (local.get $val)) (i32.const 7))
+      (then (return (call $hash_vector (local.get $val)))))
+    ;; User-defined types
+    __USER_TYPE_HASH__)
 
   ;; hash_vector: ordered hash-combine over vector elements
   ;; Uses Clojure's hash-ordered-coll algorithm: seed=1, h = 31*h + hash(elem)
@@ -2204,19 +2502,20 @@
                                 (struct.get $Float $val (ref.cast (ref $Float) (local.get $a)))
                                 (struct.get $Float $val (ref.cast (ref $Float) (local.get $b)))))
                               (else
-                                ;; Both Cons?
-                                (if (result i32) (i32.and (ref.test (ref $Cons) (local.get $a))
-                                                          (ref.test (ref $Cons) (local.get $b)))
-                                  (then (call $cons_eq (local.get $a) (local.get $b)))
+                                ;; Both seq-like (Cons, VectorSeq, or LazySeq)?
+                                (if (result i32) (i32.and
+                                    (i32.or (i32.or (ref.test (ref $Cons) (local.get $a)) (ref.test (ref $VectorSeq) (local.get $a))) (ref.test (ref $LazySeq) (local.get $a)))
+                                    (i32.or (i32.or (ref.test (ref $Cons) (local.get $b)) (ref.test (ref $VectorSeq) (local.get $b))) (ref.test (ref $LazySeq) (local.get $b))))
+                                  (then (call $seq_eq (local.get $a) (local.get $b)))
                                   (else
                                     ;; Both Vector?
                                     (if (result i32) (i32.and (ref.test (ref $Vector) (local.get $a))
                                                               (ref.test (ref $Vector) (local.get $b)))
                                       (then (call $vector_eq (local.get $a) (local.get $b)))
                                       (else
-                                        ;; Both HashMap?
-                                        (if (result i32) (i32.and (i32.eq (call $type_tag (local.get $a)) (i32.const 8))
-                                                                  (i32.eq (call $type_tag (local.get $b)) (i32.const 8)))
+                                        ;; Both map-like (HashMap or ArrayMap)?
+                                        (if (result i32) (i32.and (i32.or (i32.eq (call $type_tag (local.get $a)) (i32.const 8)) (i32.eq (call $type_tag (local.get $a)) (i32.const 19)))
+                                                                  (i32.or (i32.eq (call $type_tag (local.get $b)) (i32.const 8)) (i32.eq (call $type_tag (local.get $b)) (i32.const 19))))
                                           (then (call $hashmap_eq (local.get $a) (local.get $b)))
                                           (else
                                             ;; Both HashSet?
@@ -2225,6 +2524,30 @@
                                               (then (call $hashset_eq (local.get $a) (local.get $b)))
                                               (else
                                                 __USER_TYPE_EQ__)))))))))))))))))))))))))
+
+  ;; seq_eq: general sequence equality using first/rest (handles Cons, VectorSeq, mixed)
+  (func $seq_eq (param $a anyref) (param $b anyref) (result i32)
+    (block $neq (result i32)
+      (loop $loop (result i32)
+        ;; Both nil -> equal
+        (if (i32.and (ref.is_null (local.get $a)) (ref.is_null (local.get $b)))
+          (then (return (i32.const 1))))
+        ;; One nil -> not equal
+        (if (i32.or (ref.is_null (local.get $a)) (ref.is_null (local.get $b)))
+          (then (return (i32.const 0))))
+        ;; Compare first elements
+        (br_if $neq (i32.const 0) (i32.eqz (call $eq
+          (call $first (local.get $a))
+          (call $first (local.get $b)))))
+        ;; Advance both
+        (local.set $a (call $rest (local.get $a)))
+        (local.set $b (call $rest (local.get $b)))
+        ;; Normalize: nil means empty
+        (if (ref.is_null (local.get $a))
+          (then) (else (local.set $a (call $seq (local.get $a)))))
+        (if (ref.is_null (local.get $b))
+          (then) (else (local.set $b (call $seq (local.get $b)))))
+        (br $loop))))
 
   ;; cons_eq: structural equality for cons lists
   (func $cons_eq (param $a anyref) (param $b anyref) (result i32)
@@ -2271,9 +2594,10 @@
               (br $loop)))
           (i32.const 1)))))
 
-  ;; hashmap_eq: structural equality for hash maps (HAMT-backed)
+  ;; hashmap_eq: structural equality for hash maps (HashMap or ArrayMap)
   (func $hashmap_eq (param $a anyref) (param $b anyref) (result i32)
-    (local $keys anyref)
+    (local $entries anyref)
+    (local $entry anyref)
     (local $key anyref)
     (local $val_a anyref)
     (local $val_b anyref)
@@ -2282,19 +2606,20 @@
         (struct.get $HashMap $count (ref.cast (ref $HashMap) (local.get $b))))
       (then (i32.const 0))
       (else
-        (local.set $keys (call $hamt_keys
-          (struct.get $HashMap $array (ref.cast (ref $HashMap) (local.get $a)))
-          (ref.null none)))
+        ;; Use seq to iterate entries of A (works for both HashMap and ArrayMap)
+        (local.set $entries (call $seq (local.get $a)))
         (block $neq (result i32)
           (block $done
             (loop $loop
-              (br_if $done (ref.is_null (local.get $keys)))
-              (local.set $key (struct.get $Cons $first (ref.cast (ref $Cons) (local.get $keys))))
-              (local.set $val_a (call $hash_map_get_sentinel (local.get $a) (local.get $key)))
+              (br_if $done (ref.is_null (local.get $entries)))
+              ;; Each entry is a [k v] vector
+              (local.set $entry (struct.get $Cons $first (ref.cast (ref $Cons) (local.get $entries))))
+              (local.set $key (call $vector_nth (local.get $entry) (i32.const 0)))
+              (local.set $val_a (call $vector_nth (local.get $entry) (i32.const 1)))
               (local.set $val_b (call $hash_map_get_sentinel (local.get $b) (local.get $key)))
               (br_if $neq (i32.const 0) (ref.eq (ref.cast eqref (local.get $val_b)) (global.get $__not_found_sentinel)))
               (br_if $neq (i32.const 0) (i32.eqz (call $eq (local.get $val_a) (local.get $val_b))))
-              (local.set $keys (struct.get $Cons $rest (ref.cast (ref $Cons) (local.get $keys))))
+              (local.set $entries (struct.get $Cons $rest (ref.cast (ref $Cons) (local.get $entries))))
               (br $loop)))
           (i32.const 1)))))
 
@@ -3195,7 +3520,8 @@
   ;; ==========================================
 
   (func $empty_hash_map (result anyref)
-    (struct.new $HashMap (i32.const 8) (i32.const 0) (ref.null none)))
+    ;; Returns an ArrayMap (tag 19) — promotes to HAMT HashMap at 9+ entries
+    (struct.new $HashMap (i32.const 19) (i32.const 0) (ref.null none)))
 
   (func $hash_map_count (param $m anyref) (result i32)
     (struct.get $HashMap $count (ref.cast (ref $HashMap) (local.get $m))))
@@ -3210,6 +3536,13 @@
       (then (ref.null none))
       (else
         (local.set $tag (call $type_tag (local.get $m)))
+        ;; ArrayMap (tag 19) — flat array linear scan
+        (if (result anyref) (i32.eq (local.get $tag) (i32.const 19))
+          (then (call $array_map_get
+            (struct.get $HashMap $array (ref.cast (ref $HashMap) (local.get $m)))
+            (local.get $key)
+            (struct.get $HashMap $count (ref.cast (ref $HashMap) (local.get $m)))))
+          (else
         (if (result anyref) (i32.or (i32.eq (local.get $tag) (i32.const 8)) (i32.eq (local.get $tag) (i32.const 16)))
           (then
             ;; HashMap or TransientHashMap - use HAMT lookup
@@ -3223,16 +3556,30 @@
               (else (local.get $result))))
           (else
             ;; Protocol fallback for user types implementing ILookup
-            (if (result anyref) (i31.get_s (ref.cast (ref i31) (call $__satisfies_ILookup (local.get $m))))
+            (if (result anyref) (call $truthy (call $__satisfies_ILookup (local.get $m)))
               (then (call $__dispatch__lookup (local.get $m) (local.get $key)))
-              (else (ref.null none))))))))
+              (else (ref.null none))))))))))
 
   (func $hash_map_assoc (param $m anyref) (param $key anyref) (param $val anyref) (result anyref)
+    ;; Dispatch: ArrayMap (tag 19) uses flat array, HashMap (tag 8) uses HAMT
+    ;; Unwrap WithMeta
+    (local.set $m (call $unwrap_meta (local.get $m)))
+    ;; nil -> create 1-entry ArrayMap
+    (if (ref.is_null (local.get $m))
+      (then (return (call $array_map_assoc
+        (ref.cast (ref $HashMap) (call $empty_hash_map))
+        (local.get $key) (local.get $val)))))
+    ;; ArrayMap (tag 19)
+    (if (i32.eq (call $type_tag (local.get $m)) (i32.const 19))
+      (then (return (call $array_map_assoc (ref.cast (ref $HashMap) (local.get $m)) (local.get $key) (local.get $val)))))
+    ;; HAMT HashMap (tag 8)
+    (call $hash_map_assoc_hamt (local.get $m) (local.get $key) (local.get $val)))
+
+  ;; hash_map_assoc_hamt: assoc on HAMT-backed HashMap only (tag 8)
+  (func $hash_map_assoc_hamt (param $m anyref) (param $key anyref) (param $val anyref) (result anyref)
     (local $map (ref $HashMap))
     (local $root anyref) (local $new_root anyref)
     (local $h i32)
-    ;; Unwrap WithMeta
-    (local.set $m (call $unwrap_meta (local.get $m)))
     (if (ref.is_null (local.get $m))
       (then
         (local.set $h (call $hash (local.get $key)))
@@ -3249,17 +3596,26 @@
 
   (func $hash_map_get_sentinel (param $m anyref) (param $key anyref) (result anyref)
     (local $root anyref)
+    (local $tag i32)
     ;; Unwrap WithMeta
     (local.set $m (call $unwrap_meta (local.get $m)))
     (if (result anyref) (ref.is_null (local.get $m))
       (then (global.get $__not_found_sentinel))
       (else
+        (local.set $tag (call $type_tag (local.get $m)))
+        ;; ArrayMap (tag 19) — flat array linear scan
+        (if (result anyref) (i32.eq (local.get $tag) (i32.const 19))
+          (then (call $array_map_get_sentinel
+            (struct.get $HashMap $array (ref.cast (ref $HashMap) (local.get $m)))
+            (local.get $key)
+            (struct.get $HashMap $count (ref.cast (ref $HashMap) (local.get $m)))))
+          (else
         ;; Get root: HashMap or TransientHashMap
-        (if (i32.eq (call $type_tag (local.get $m)) (i32.const 16))
+        (if (i32.eq (local.get $tag) (i32.const 16))
           (then (local.set $root (struct.get $TransientHashMap $array (ref.cast (ref $TransientHashMap) (local.get $m)))))
           (else (local.set $root (struct.get $HashMap $array (ref.cast (ref $HashMap) (local.get $m))))))
         (call $hamt_get (local.get $root)
-          (local.get $key) (call $hash (local.get $key)) (i32.const 0)))))
+          (local.get $key) (call $hash (local.get $key)) (i32.const 0)))))))
 
   (func $hash_map_get_default (param $m anyref) (param $key anyref) (param $default anyref) (result anyref)
     (local $result anyref)
@@ -3274,12 +3630,16 @@
       (else (global.get $__true))))
 
   (func $map_QMARK_ (param $val anyref) (result anyref)
-    (call $bool (i32.eq (call $type_tag (local.get $val)) (i32.const 8))))
+    (call $bool (i32.or (i32.eq (call $type_tag (local.get $val)) (i32.const 8))
+                        (i32.eq (call $type_tag (local.get $val)) (i32.const 19)))))
 
   (func $keys (param $m anyref) (result anyref)
     (if (result anyref) (ref.is_null (local.get $m))
       (then (ref.null none))
       (else
+        ;; ArrayMap — convert to HashMap first
+        (if (i32.eq (call $type_tag (local.get $m)) (i32.const 19))
+          (then (return (call $keys (call $array_map_to_hash_map (ref.cast (ref $HashMap) (local.get $m)))))))
         (if (result anyref) (i32.le_s (struct.get $HashMap $count (ref.cast (ref $HashMap) (local.get $m))) (i32.const 0))
           (then (ref.null none))
           (else (call $hamt_keys (struct.get $HashMap $array (ref.cast (ref $HashMap) (local.get $m))) (ref.null none)))))))
@@ -3288,6 +3648,9 @@
     (if (result anyref) (ref.is_null (local.get $m))
       (then (ref.null none))
       (else
+        ;; ArrayMap — convert to HashMap first
+        (if (i32.eq (call $type_tag (local.get $m)) (i32.const 19))
+          (then (return (call $vals (call $array_map_to_hash_map (ref.cast (ref $HashMap) (local.get $m)))))))
         (if (result anyref) (i32.le_s (struct.get $HashMap $count (ref.cast (ref $HashMap) (local.get $m))) (i32.const 0))
           (then (ref.null none))
           (else (call $hamt_vals (struct.get $HashMap $array (ref.cast (ref $HashMap) (local.get $m))) (ref.null none)))))))
@@ -3369,97 +3732,97 @@
     ;; Unwrap WithMeta
     (local.set $coll (call $unwrap_meta (local.get $coll)))
     ;; nil -> nil
-    (if (result anyref) (ref.is_null (local.get $coll))
-      (then (ref.null none))
-      (else
-        ;; LazySeq - realize and recurse
-        (if (result anyref) (ref.test (ref $LazySeq) (local.get $coll))
-          (then (call $seq (call $lazy_seq_realize (local.get $coll))))
-          (else
-            ;; Cons cell - return as-is if non-empty, nil if empty
-            (if (result anyref) (ref.test (ref $Cons) (local.get $coll))
-          (then (local.get $coll))
-          (else
-            ;; Vector - convert to cons list
-            (if (result anyref) (ref.test (ref $Vector) (local.get $coll))
-              (then
-                (local.set $count (call $vector_count (local.get $coll)))
-                (if (result anyref) (i32.le_s (local.get $count) (i32.const 0))
-                  (then (ref.null none))
-                  (else
-                    (local.set $result (ref.null none))
-                    (local.set $i (i32.sub (local.get $count) (i32.const 1)))
-                    (block $done
-                      (loop $loop
-                        (br_if $done (i32.lt_s (local.get $i) (i32.const 0)))
-                        (local.set $result (call $cons
-                          (call $vector_nth (local.get $coll) (local.get $i))
-                          (local.get $result)))
-                        (local.set $i (i32.sub (local.get $i) (i32.const 1)))
-                        (br $loop)))
-                    (local.get $result))))
-              (else
-                ;; HashMap - return entries as cons list of [k v] vectors
-                (if (result anyref) (i32.eq (call $type_tag (local.get $coll)) (i32.const 8))
-                  (then
-                    (local.set $count (struct.get $HashMap $count (ref.cast (ref $HashMap) (local.get $coll))))
-                    (if (result anyref) (i32.le_s (local.get $count) (i32.const 0))
-                      (then (ref.null none))
-                      (else (call $hamt_entries
-                        (struct.get $HashMap $array (ref.cast (ref $HashMap) (local.get $coll)))
-                        (ref.null none)))))
-                  (else
-                    ;; HashSet - return elements as cons list via HAMT keys
-                    (if (result anyref) (i32.eq (call $type_tag (local.get $coll)) (i32.const 9))
-                      (then
-                        (local.set $count (struct.get $HashSet $count (ref.cast (ref $HashSet) (local.get $coll))))
-                        (if (result anyref) (i32.le_s (local.get $count) (i32.const 0))
-                          (then (ref.null none))
-                          (else (call $hamt_keys
-                            (struct.get $HashSet $array (ref.cast (ref $HashSet) (local.get $coll)))
-                            (ref.null none)))))
-                      (else
-                        ;; String - convert to cons list of codepoint strings
-                        (if (result anyref) (ref.test (ref $String) (local.get $coll))
-                          (then
-                            (local.set $count (call $str_codepoint_count (local.get $coll)))
-                            (if (result anyref) (i32.le_s (local.get $count) (i32.const 0))
-                              (then (ref.null none))
-                              (else
-                                (local.set $result (ref.null none))
-                                (local.set $i (i32.sub (local.get $count) (i32.const 1)))
-                                (block $done3
-                                  (loop $loop3
-                                    (br_if $done3 (i32.lt_s (local.get $i) (i32.const 0)))
-                                    (local.set $result (call $cons
-                                      (call $char_at_as_str (local.get $coll) (local.get $i))
-                                      (local.get $result)))
-                                    (local.set $i (i32.sub (local.get $i) (i32.const 1)))
-                                    (br $loop3)))
-                                (local.get $result))))
-                          (else
-                            ;; Protocol fallback for user types implementing ISeqable
-                            (if (result anyref) (i31.get_s (ref.cast (ref i31) (call $__satisfies_ISeqable (local.get $coll))))
-                              (then (call $__dispatch__seq (local.get $coll)))
-                              (else (ref.null none))))))))))))))))))
+    (if (ref.is_null (local.get $coll))
+      (then (return (ref.null none))))
+    ;; LazySeq - realize and recurse
+    (block $not_lazy (result anyref)
+      (br_on_cast_fail $not_lazy anyref (ref $LazySeq) (local.get $coll))
+      (return (call $seq (call $lazy_seq_realize (local.get $coll)))))
+    (drop)
+    ;; Cons cell - return as-is
+    (block $not_cons (result anyref)
+      (br_on_cast_fail $not_cons anyref (ref $Cons) (local.get $coll))
+      (return (local.get $coll)))
+    (drop)
+    ;; VectorSeq - return as-is (already a seq)
+    (block $not_vseq (result anyref)
+      (br_on_cast_fail $not_vseq anyref (ref $VectorSeq) (local.get $coll))
+      (return (local.get $coll)))
+    (drop)
+    ;; Vector - return VectorSeq (lazy O(1) view)
+    (block $not_vec (result anyref)
+      (br_on_cast_fail $not_vec anyref (ref $Vector) (local.get $coll))
+      (local.set $count (call $vector_count (local.get $coll)))
+      (if (i32.le_s (local.get $count) (i32.const 0))
+        (then (return (ref.null none))))
+      (return (struct.new $VectorSeq (i32.const 18) (local.get $coll) (i32.const 0))))
+    (drop)
+    ;; HashMap/ArrayMap (tag=8/19)
+    (if (i32.or (i32.eq (call $type_tag (local.get $coll)) (i32.const 8))
+                (i32.eq (call $type_tag (local.get $coll)) (i32.const 19)))
+      (then
+        (local.set $count (struct.get $HashMap $count (ref.cast (ref $HashMap) (local.get $coll))))
+        (if (i32.le_s (local.get $count) (i32.const 0))
+          (then (return (ref.null none))))
+        ;; ArrayMap (tag 19) — produce seq from flat array
+        (if (i32.eq (call $type_tag (local.get $coll)) (i32.const 19))
+          (then (return (call $array_map_seq (ref.cast (ref $HashMap) (local.get $coll))))))
+        ;; HAMT HashMap (tag 8)
+        (return (call $hamt_entries
+          (struct.get $HashMap $array (ref.cast (ref $HashMap) (local.get $coll)))
+          (ref.null none)))))
+    ;; HashSet (tag=9)
+    (if (i32.eq (call $type_tag (local.get $coll)) (i32.const 9))
+      (then
+        (local.set $count (struct.get $HashSet $count (ref.cast (ref $HashSet) (local.get $coll))))
+        (if (i32.le_s (local.get $count) (i32.const 0))
+          (then (return (ref.null none))))
+        (return (call $hamt_keys
+          (struct.get $HashSet $array (ref.cast (ref $HashSet) (local.get $coll)))
+          (ref.null none)))))
+    ;; String - convert to cons list of codepoint strings
+    (block $not_str (result anyref)
+      (br_on_cast_fail $not_str anyref (ref $String) (local.get $coll))
+      (local.set $count (call $str_codepoint_count (local.get $coll)))
+      (if (i32.le_s (local.get $count) (i32.const 0))
+        (then (return (ref.null none))))
+      (local.set $result (ref.null none))
+      (local.set $i (i32.sub (local.get $count) (i32.const 1)))
+      (block $done3
+        (loop $loop3
+          (br_if $done3 (i32.lt_s (local.get $i) (i32.const 0)))
+          (local.set $result (call $cons
+            (call $char_at_as_str (local.get $coll) (local.get $i))
+            (local.get $result)))
+          (local.set $i (i32.sub (local.get $i) (i32.const 1)))
+          (br $loop3)))
+      (return (local.get $result)))
+    (drop)
+    ;; Protocol fallback for user types implementing ISeqable
+    (if (call $truthy (call $__satisfies_ISeqable (local.get $coll)))
+      (then (return (call $__dispatch__seq (local.get $coll)))))
+    (ref.null none))
 
-  ;; seq?: check if value is a seq (cons cell) or lazy seq
+    ;; seq?: check if value is a seq (cons cell), lazy seq, or VectorSeq
   (func $seq_QMARK_ (param $val anyref) (result anyref)
-    (call $bool (i32.or
+    (call $bool (i32.or (i32.or
       (ref.test (ref $Cons) (local.get $val))
-      (ref.test (ref $LazySeq) (local.get $val)))))
+      (ref.test (ref $LazySeq) (local.get $val)))
+      (ref.test (ref $VectorSeq) (local.get $val)))))
 
   ;; seqable?: check if value can be converted to a seq
   (func $seqable_QMARK_ (param $val anyref) (result anyref)
-    (call $bool (i32.or (i32.or (i32.or (i32.or (i32.or (i32.or (i32.or
+    (call $bool (i32.or (i32.or (i32.or (i32.or (i32.or (i32.or (i32.or (i32.or (i32.or
       (ref.is_null (local.get $val))
       (ref.test (ref $Cons) (local.get $val)))
       (ref.test (ref $Vector) (local.get $val)))
       (i32.eq (call $type_tag (local.get $val)) (i32.const 8)))
+      (i32.eq (call $type_tag (local.get $val)) (i32.const 19)))
       (i32.eq (call $type_tag (local.get $val)) (i32.const 9)))
       (ref.test (ref $LazySeq) (local.get $val)))
       (ref.test (ref $String) (local.get $val)))
-      (i31.get_s (ref.cast (ref i31) (call $__satisfies_ISeqable (local.get $val)))))))
+      (ref.test (ref $VectorSeq) (local.get $val)))
+      (call $truthy (call $__satisfies_ISeqable (local.get $val))))))
 
   ;; empty?: check if collection is empty
   (func $empty_QMARK_ (param $coll anyref) (result anyref)
@@ -3470,10 +3833,13 @@
           (if (result i32) (ref.test (ref $Cons) (local.get $coll))
             (then (i32.const 0))  ;; cons cells are never empty
             (else
+              (if (result i32) (ref.test (ref $VectorSeq) (local.get $coll))
+                (then (i32.const 0))  ;; VectorSeqs are never empty (only created from non-empty vectors)
+                (else
               (if (result i32) (ref.test (ref $Vector) (local.get $coll))
                 (then (i32.eqz (call $vector_count (local.get $coll))))
                 (else
-                  (if (result i32) (i32.eq (call $type_tag (local.get $coll)) (i32.const 8))
+                  (if (result i32) (i32.or (i32.eq (call $type_tag (local.get $coll)) (i32.const 8)) (i32.eq (call $type_tag (local.get $coll)) (i32.const 19)))
                     (then (i32.eqz (struct.get $HashMap $count (ref.cast (ref $HashMap) (local.get $coll)))))
                     (else
                       (if (result i32) (i32.eq (call $type_tag (local.get $coll)) (i32.const 9))
@@ -3487,11 +3853,11 @@
                                 (then (ref.is_null (call $seq (local.get $coll))))
                                 (else
                                   ;; Protocol fallback: empty if ISeqable returns nil seq
-                                  (if (result i32) (i31.get_s (ref.cast (ref i31) (call $__satisfies_ISeqable (local.get $coll))))
+                                  (if (result i32) (call $truthy (call $__satisfies_ISeqable (local.get $coll)))
                                     (then (ref.is_null (call $__dispatch__seq (local.get $coll))))
-                                    (else (i32.const 1)))))))))))))))))))
+                                    (else (i32.const 1)))))))))))))))))))))
 
-  ;; dissoc: remove key from hash map (HAMT-backed)
+  ;; dissoc: remove key from hash map
   (func $dissoc (param $m anyref) (param $key anyref) (result anyref)
     (local $h i32)
     (local $root anyref)
@@ -3501,6 +3867,9 @@
     (if (result anyref) (ref.is_null (local.get $m))
       (then (ref.null none))
       (else
+        ;; ArrayMap — convert to HashMap first, then dissoc
+        (if (i32.eq (call $type_tag (local.get $m)) (i32.const 19))
+          (then (return (call $dissoc (call $array_map_to_hash_map (ref.cast (ref $HashMap) (local.get $m))) (local.get $key)))))
         ;; Check if key exists using sentinel
         (if (result anyref) (ref.eq
             (ref.cast eqref (call $hash_map_get_sentinel (local.get $m) (local.get $key)))
@@ -3513,6 +3882,189 @@
             (struct.new $HashMap (i32.const 8)
               (i32.sub (local.get $count) (i32.const 1))
               (call $hamt_dissoc (local.get $root) (local.get $key) (local.get $h) (i32.const 0))))))))
+
+
+  ;; ==========================================
+  ;; ArrayMap (PersistentArrayMap) — flat array for small maps (≤8 entries)
+  ;; Uses $HashMap struct with type_id=19 and $array holding flat [k0,v0,k1,v1,...]
+  ;; Promotes to HAMT HashMap (tag 8) when exceeding 8 entries.
+  ;; ==========================================
+
+  ;; empty_hash_map_hamt: create an empty HAMT-backed HashMap (tag 8)
+  (func $empty_hash_map_hamt (result anyref)
+    (struct.new $HashMap (i32.const 8) (i32.const 0) (ref.null none)))
+
+  ;; array_map_get: linear scan of flat [k,v,k,v,...] array for key
+  (func $array_map_get (param $arr anyref) (param $key anyref) (param $count i32) (result anyref)
+    (local $i i32)
+    (local $len i32)
+    (local $typed_arr (ref $AnyArray))
+    (if (ref.is_null (local.get $arr))
+      (then (return (ref.null none))))
+    (local.set $typed_arr (ref.cast (ref $AnyArray) (local.get $arr)))
+    (local.set $len (i32.shl (local.get $count) (i32.const 1)))
+    (local.set $i (i32.const 0))
+    (block $done
+      (loop $loop
+        (br_if $done (i32.ge_s (local.get $i) (local.get $len)))
+        (if (call $eq (array.get $AnyArray (local.get $typed_arr) (local.get $i)) (local.get $key))
+          (then (return (array.get $AnyArray (local.get $typed_arr) (i32.add (local.get $i) (i32.const 1))))))
+        (local.set $i (i32.add (local.get $i) (i32.const 2)))
+        (br $loop)))
+    (ref.null none))
+
+  ;; array_map_get_sentinel: like array_map_get but returns sentinel instead of nil for not-found
+  (func $array_map_get_sentinel (param $arr anyref) (param $key anyref) (param $count i32) (result anyref)
+    (local $i i32)
+    (local $len i32)
+    (local $typed_arr (ref $AnyArray))
+    (if (ref.is_null (local.get $arr))
+      (then (return (global.get $__not_found_sentinel))))
+    (local.set $typed_arr (ref.cast (ref $AnyArray) (local.get $arr)))
+    (local.set $len (i32.shl (local.get $count) (i32.const 1)))
+    (local.set $i (i32.const 0))
+    (block $done
+      (loop $loop
+        (br_if $done (i32.ge_s (local.get $i) (local.get $len)))
+        (if (call $eq (array.get $AnyArray (local.get $typed_arr) (local.get $i)) (local.get $key))
+          (then (return (array.get $AnyArray (local.get $typed_arr) (i32.add (local.get $i) (i32.const 1))))))
+        (local.set $i (i32.add (local.get $i) (i32.const 2)))
+        (br $loop)))
+    (global.get $__not_found_sentinel))
+
+  ;; array_map_assoc: assoc on ArrayMap — copy+replace or copy+extend, promote to HashMap at 9+
+  (func $array_map_assoc (param $m (ref $HashMap)) (param $key anyref) (param $val anyref) (result anyref)
+    (local $arr anyref) (local $typed_arr (ref $AnyArray))
+    (local $count i32) (local $len i32) (local $i i32)
+    (local $new_arr (ref $AnyArray)) (local $new_len i32)
+    (local.set $arr (struct.get $HashMap $array (local.get $m)))
+    (local.set $count (struct.get $HashMap $count (local.get $m)))
+    (local.set $len (i32.shl (local.get $count) (i32.const 1)))
+    ;; Empty ArrayMap: create 1-entry ArrayMap
+    (if (i32.le_s (local.get $count) (i32.const 0))
+      (then
+        (local.set $new_arr (array.new $AnyArray (ref.null none) (i32.const 2)))
+        (array.set $AnyArray (local.get $new_arr) (i32.const 0) (local.get $key))
+        (array.set $AnyArray (local.get $new_arr) (i32.const 1) (local.get $val))
+        (return (struct.new $HashMap (i32.const 19) (i32.const 1) (local.get $new_arr)))))
+    (local.set $typed_arr (ref.cast (ref $AnyArray) (local.get $arr)))
+    ;; Check if key already exists (linear scan)
+    (local.set $i (i32.const 0))
+    (block $not_found
+      (loop $scan
+        (br_if $not_found (i32.ge_s (local.get $i) (local.get $len)))
+        (if (call $eq (array.get $AnyArray (local.get $typed_arr) (local.get $i)) (local.get $key))
+          (then
+            ;; Key found at $i — copy array and replace value at $i+1
+            (local.set $new_arr (array.new $AnyArray (ref.null none) (local.get $len)))
+            (array.copy $AnyArray $AnyArray (local.get $new_arr) (i32.const 0) (local.get $typed_arr) (i32.const 0) (local.get $len))
+            (array.set $AnyArray (local.get $new_arr) (i32.add (local.get $i) (i32.const 1)) (local.get $val))
+            (return (struct.new $HashMap (i32.const 19) (local.get $count) (local.get $new_arr)))))
+        (local.set $i (i32.add (local.get $i) (i32.const 2)))
+        (br $scan)))
+    ;; Key not found — promote to HashMap if count >= 8
+    (if (i32.ge_s (local.get $count) (i32.const 8))
+      (then (return (call $hash_map_assoc_hamt (call $array_map_to_hash_map (local.get $m)) (local.get $key) (local.get $val)))))
+    ;; Extend: copy array + append k,v
+    (local.set $new_len (i32.add (local.get $len) (i32.const 2)))
+    (local.set $new_arr (array.new $AnyArray (ref.null none) (local.get $new_len)))
+    (array.copy $AnyArray $AnyArray (local.get $new_arr) (i32.const 0) (local.get $typed_arr) (i32.const 0) (local.get $len))
+    (array.set $AnyArray (local.get $new_arr) (local.get $len) (local.get $key))
+    (array.set $AnyArray (local.get $new_arr) (i32.add (local.get $len) (i32.const 1)) (local.get $val))
+    (struct.new $HashMap (i32.const 19) (i32.add (local.get $count) (i32.const 1)) (local.get $new_arr)))
+
+  ;; array_map_to_hash_map: convert ArrayMap to HAMT HashMap (tag 8)
+  (func $array_map_to_hash_map (param $m (ref $HashMap)) (result anyref)
+    (local $arr (ref $AnyArray)) (local $count i32) (local $len i32)
+    (local $i i32) (local $result anyref)
+    (local.set $count (struct.get $HashMap $count (local.get $m)))
+    (if (i32.le_s (local.get $count) (i32.const 0))
+      (then (return (call $empty_hash_map_hamt))))
+    (local.set $arr (ref.cast (ref $AnyArray) (struct.get $HashMap $array (local.get $m))))
+    (local.set $len (i32.shl (local.get $count) (i32.const 1)))
+    (local.set $result (call $empty_hash_map_hamt))
+    (local.set $i (i32.const 0))
+    (block $done
+      (loop $loop
+        (br_if $done (i32.ge_s (local.get $i) (local.get $len)))
+        (local.set $result (call $hash_map_assoc_hamt (local.get $result)
+          (array.get $AnyArray (local.get $arr) (local.get $i))
+          (array.get $AnyArray (local.get $arr) (i32.add (local.get $i) (i32.const 1)))))
+        (local.set $i (i32.add (local.get $i) (i32.const 2)))
+        (br $loop)))
+    (local.get $result))
+
+  ;; array_map_seq: produce Cons list of [k,v] vectors from flat array
+  (func $array_map_seq (param $m (ref $HashMap)) (result anyref)
+    (local $arr (ref $AnyArray)) (local $count i32) (local $len i32)
+    (local $i i32) (local $result anyref) (local $entry anyref)
+    (local.set $count (struct.get $HashMap $count (local.get $m)))
+    (if (i32.le_s (local.get $count) (i32.const 0))
+      (then (return (ref.null none))))
+    (local.set $arr (ref.cast (ref $AnyArray) (struct.get $HashMap $array (local.get $m))))
+    (local.set $len (i32.shl (local.get $count) (i32.const 1)))
+    (local.set $result (ref.null none))
+    ;; Build cons list from back to front (so seq is in insertion order)
+    (local.set $i (i32.sub (local.get $len) (i32.const 2)))
+    (block $done
+      (loop $loop
+        (br_if $done (i32.lt_s (local.get $i) (i32.const 0)))
+        ;; Create [k v] vector via conj (2-element vector)
+        (local.set $entry (call $vector_conj (call $vector_conj (call $empty_vector)
+          (array.get $AnyArray (local.get $arr) (local.get $i)))
+          (array.get $AnyArray (local.get $arr) (i32.add (local.get $i) (i32.const 1)))))
+        (local.set $result (call $cons (local.get $entry) (local.get $result)))
+        (local.set $i (i32.sub (local.get $i) (i32.const 2)))
+        (br $loop)))
+    (local.get $result))
+
+  ;; array_map_reduce_kv: reduce over ArrayMap key-value pairs
+  (func $array_map_reduce_kv (param $f anyref) (param $init anyref) (param $m (ref $HashMap)) (result anyref)
+    (local $arr (ref $AnyArray)) (local $count i32) (local $len i32)
+    (local $i i32) (local $acc anyref)
+    (local.set $count (struct.get $HashMap $count (local.get $m)))
+    (if (i32.le_s (local.get $count) (i32.const 0))
+      (then (return (local.get $init))))
+    (local.set $arr (ref.cast (ref $AnyArray) (struct.get $HashMap $array (local.get $m))))
+    (local.set $len (i32.shl (local.get $count) (i32.const 1)))
+    (local.set $acc (local.get $init))
+    (local.set $i (i32.const 0))
+    (block $done
+      (loop $loop
+        (br_if $done (i32.ge_s (local.get $i) (local.get $len)))
+        (local.set $acc (call $invoke3 (local.get $f) (local.get $acc)
+          (array.get $AnyArray (local.get $arr) (local.get $i))
+          (array.get $AnyArray (local.get $arr) (i32.add (local.get $i) (i32.const 1)))))
+        ;; Check for reduced
+        (if (ref.test (ref $Reduced) (local.get $acc))
+          (then (return (local.get $acc))))
+        (local.set $i (i32.add (local.get $i) (i32.const 2)))
+        (br $loop)))
+    (local.get $acc))
+
+  ;; array_map_reduce_entries: reduce over ArrayMap entries as [k,v] vectors (for reduce on maps)
+  (func $array_map_reduce_entries (param $f anyref) (param $init anyref) (param $m (ref $HashMap)) (result anyref)
+    (local $arr (ref $AnyArray)) (local $count i32) (local $len i32)
+    (local $i i32) (local $acc anyref)
+    (local.set $count (struct.get $HashMap $count (local.get $m)))
+    (if (i32.le_s (local.get $count) (i32.const 0))
+      (then (return (local.get $init))))
+    (local.set $arr (ref.cast (ref $AnyArray) (struct.get $HashMap $array (local.get $m))))
+    (local.set $len (i32.shl (local.get $count) (i32.const 1)))
+    (local.set $acc (local.get $init))
+    (local.set $i (i32.const 0))
+    (block $done
+      (loop $loop
+        (br_if $done (i32.ge_s (local.get $i) (local.get $len)))
+        (local.set $acc (call $invoke2 (local.get $f) (local.get $acc)
+          (call $vector_conj (call $vector_conj (call $empty_vector)
+            (array.get $AnyArray (local.get $arr) (local.get $i)))
+            (array.get $AnyArray (local.get $arr) (i32.add (local.get $i) (i32.const 1))))))
+        (if (ref.test (ref $Reduced) (local.get $acc))
+          (then (return (local.get $acc))))
+        (local.set $i (i32.add (local.get $i) (i32.const 2)))
+        (br $loop)))
+    (local.get $acc))
 
 ")
 
@@ -3852,6 +4404,9 @@
           (struct.get $Vector $root (local.get $vec))
           (local.get $new_tail)
           (local.get $edit)))))
+    ;; ArrayMap -> convert to HashMap first, then make transient
+    (if (i32.eq (call $type_tag (local.get $coll)) (i32.const 19))
+      (then (return (call $transient (call $array_map_to_hash_map (ref.cast (ref $HashMap) (local.get $coll)))))))
     ;; HashMap -> TransientHashMap
     (if (i32.eq (call $type_tag (local.get $coll)) (i32.const 8))
       (then
@@ -4195,6 +4750,11 @@
 
 (defn emit-prelude-2b []
   "
+  ;; make_array_map: create ArrayMap directly from AnyArray of [k,v,k,v,...] pairs.
+  ;; No duplicate-key checking — caller guarantees uniqueness. count = number of k/v pairs.
+  (func $make_array_map (param $arr anyref) (param $count i32) (result anyref)
+    (struct.new $HashMap (i32.const 19) (local.get $count) (local.get $arr)))
+
   ;; ==========================================
   ;; Atom Operations
   ;; ==========================================
@@ -4310,9 +4870,13 @@
       (then (i32.const 0))
       (else (if (result i32) (ref.test (ref $Vector) (local.get $coll))
         (then (call $vector_count (local.get $coll)))
-        (else (if (result i32) (ref.test (ref $Cons) (local.get $coll))
+        (else (if (result i32) (ref.test (ref $VectorSeq) (local.get $coll))
+          (then (i32.sub
+            (call $vector_count (struct.get $VectorSeq $vec (ref.cast (ref $VectorSeq) (local.get $coll))))
+            (struct.get $VectorSeq $offset (ref.cast (ref $VectorSeq) (local.get $coll)))))
+          (else (if (result i32) (ref.test (ref $Cons) (local.get $coll))
           (then (call $list_length (local.get $coll)))
-          (else (if (result i32) (i32.eq (call $type_tag (local.get $coll)) (i32.const 8))
+          (else (if (result i32) (i32.or (i32.eq (call $type_tag (local.get $coll)) (i32.const 8)) (i32.eq (call $type_tag (local.get $coll)) (i32.const 19)))
             (then (struct.get $HashMap $count (ref.cast (ref $HashMap) (local.get $coll))))
             (else (if (result i32) (i32.eq (call $type_tag (local.get $coll)) (i32.const 9))
               (then (struct.get $HashSet $count (ref.cast (ref $HashSet) (local.get $coll))))
@@ -4328,7 +4892,7 @@
                         (then (struct.get $TransientHashSet $count (ref.cast (ref $TransientHashSet) (local.get $coll))))
                         (else
                           ;; Protocol fallback for ICounted
-                          (if (result i32) (i31.get_s (ref.cast (ref i31) (call $__satisfies_ICounted (local.get $coll))))
+                          (if (result i32) (call $truthy (call $__satisfies_ICounted (local.get $coll)))
                             (then (i31.get_s (ref.cast (ref i31) (call $__dispatch__count (local.get $coll)))))
                             (else (i32.const 0))))
                       ))
@@ -4340,7 +4904,7 @@
           ))
         ))
       ))
-    )
+    )))
   )
 
   ;; apply_0-8: helper functions for apply with specific arities
@@ -4533,47 +5097,40 @@
   (func $keyword_QMARK_ (param $val anyref) (result anyref)
     (call $bool (i32.eq (call $type_tag (local.get $val)) (i32.const 2))))
 
-  ;; fn?: check if value is a function (any closure type)
+  ;; fn?: check if value is a function (any closure type, all share tag 11)
   (func $fn_QMARK_ (param $val anyref) (result anyref)
-    (call $bool (i32.or (i32.or (i32.or (i32.or (i32.or (i32.or (i32.or (i32.or (i32.or (i32.or (i32.or
-      (ref.test (ref $Closure0) (local.get $val))
-      (ref.test (ref $Closure1) (local.get $val)))
-      (ref.test (ref $Closure2) (local.get $val)))
-      (ref.test (ref $Closure3) (local.get $val)))
-      (ref.test (ref $Closure4) (local.get $val)))
-      (ref.test (ref $Closure5) (local.get $val)))
-      (ref.test (ref $Closure6) (local.get $val)))
-      (ref.test (ref $Closure7) (local.get $val)))
-      (ref.test (ref $Closure8) (local.get $val)))
-      (ref.test (ref $Closure9) (local.get $val)))
-      (ref.test (ref $Closure10) (local.get $val)))
-      (ref.test (ref $MultiClosure) (local.get $val)))))
+    (call $bool (i32.eq (call $type_tag (local.get $val)) (i32.const 11))))
 
-  ;; coll?: check if value is a collection (vector, map, set, or list)
+  ;; coll?: check if value is a collection (vector, map, set, list, or VectorSeq)
   (func $coll_QMARK_ (param $val anyref) (result anyref)
-    (call $bool (i32.or (i32.or (i32.or
+    (call $bool (i32.or (i32.or (i32.or (i32.or (i32.or
       (ref.test (ref $Cons) (local.get $val))
       (ref.test (ref $Vector) (local.get $val)))
       (i32.eq (call $type_tag (local.get $val)) (i32.const 8)))
-      (i32.eq (call $type_tag (local.get $val)) (i32.const 9)))))
+      (i32.eq (call $type_tag (local.get $val)) (i32.const 19)))
+      (i32.eq (call $type_tag (local.get $val)) (i32.const 9)))
+      (ref.test (ref $VectorSeq) (local.get $val)))))
 
-  ;; sequential?: check if value is sequential (vector or list)
+  ;; sequential?: check if value is sequential (vector, list, or VectorSeq)
   (func $sequential_QMARK_ (param $val anyref) (result anyref)
-    (call $bool (i32.or
+    (call $bool (i32.or (i32.or
       (ref.test (ref $Cons) (local.get $val))
-      (ref.test (ref $Vector) (local.get $val)))))
+      (ref.test (ref $Vector) (local.get $val)))
+      (ref.test (ref $VectorSeq) (local.get $val)))))
 
   ;; associative?: check if value is associative (vector or map)
   (func $associative_QMARK_ (param $val anyref) (result anyref)
-    (call $bool (i32.or
-      (ref.test (ref $Vector) (local.get $val))
-      (i32.eq (call $type_tag (local.get $val)) (i32.const 8)))))
-
-  ;; counted?: check if value supports O(1) count (vector, map, set)
-  (func $counted_QMARK_ (param $val anyref) (result anyref)
     (call $bool (i32.or (i32.or
       (ref.test (ref $Vector) (local.get $val))
       (i32.eq (call $type_tag (local.get $val)) (i32.const 8)))
+      (i32.eq (call $type_tag (local.get $val)) (i32.const 19)))))
+
+  ;; counted?: check if value supports O(1) count (vector, map, set)
+  (func $counted_QMARK_ (param $val anyref) (result anyref)
+    (call $bool (i32.or (i32.or (i32.or
+      (ref.test (ref $Vector) (local.get $val))
+      (i32.eq (call $type_tag (local.get $val)) (i32.const 8)))
+      (i32.eq (call $type_tag (local.get $val)) (i32.const 19)))
       (i32.eq (call $type_tag (local.get $val)) (i32.const 9)))))
 
   ;; indexed?: check if value supports indexed access (vector)
@@ -4603,13 +5160,13 @@
           (i31.get_s (ref.cast (ref i31) (local.get $key)))
           (local.get $val)))
       (else
-        (if (result anyref) (i32.or (ref.is_null (local.get $coll)) (i32.eq (call $type_tag (local.get $coll)) (i32.const 8)))
+        (if (result anyref) (i32.or (i32.or (ref.is_null (local.get $coll)) (i32.eq (call $type_tag (local.get $coll)) (i32.const 8))) (i32.eq (call $type_tag (local.get $coll)) (i32.const 19)))
           (then
-            ;; nil or HashMap
+            ;; nil, HashMap, or ArrayMap
             (call $hash_map_assoc (local.get $coll) (local.get $key) (local.get $val)))
           (else
             ;; Protocol fallback for IAssociative
-            (if (result anyref) (i31.get_s (ref.cast (ref i31) (call $__satisfies_IAssociative (local.get $coll))))
+            (if (result anyref) (call $truthy (call $__satisfies_IAssociative (local.get $coll)))
               (then (call $__dispatch__assoc (local.get $coll) (local.get $key) (local.get $val)))
               (else (call $hash_map_assoc (local.get $coll) (local.get $key) (local.get $val)))))))))
 
@@ -4617,184 +5174,219 @@
   ;; Closure Runtime Functions
   ;; ==========================================
 
-  ;; closure?: check if value is any closure type
+  ;; closure?: check if value is any closure type (all share tag 11)
   (func $closure_QMARK_ (param $val anyref) (result anyref)
-    (call $bool (i32.or (i32.or (i32.or (i32.or (i32.or (i32.or (i32.or (i32.or (i32.or
-      (ref.test (ref $Closure0) (local.get $val))
-      (ref.test (ref $Closure1) (local.get $val)))
-      (ref.test (ref $Closure2) (local.get $val)))
-      (ref.test (ref $Closure3) (local.get $val)))
-      (ref.test (ref $Closure4) (local.get $val)))
-      (ref.test (ref $Closure5) (local.get $val)))
-      (ref.test (ref $Closure6) (local.get $val)))
-      (ref.test (ref $Closure7) (local.get $val)))
-      (ref.test (ref $Closure8) (local.get $val)))
-      (ref.test (ref $MultiClosure) (local.get $val)))))
+    (call $bool (i32.eq (call $type_tag (local.get $val)) (i32.const 11))))
 
   ;; invoke0: invoke a 0-arity closure
   (func $invoke0 (param $closure anyref) (result anyref)
+    (local $mc (ref null $MultiClosure))
     ;; Unwrap WithMeta if present
-    (if (ref.test (ref $WithMeta) (local.get $closure))
-      (then (local.set $closure (struct.get $WithMeta $inner (ref.cast (ref $WithMeta) (local.get $closure))))))
-    (if (result anyref) (ref.test (ref $MultiClosure) (local.get $closure))
-      (then
-        (call_ref $MultiClosureDispatch
-          (struct.get $MultiClosure $env (ref.cast (ref $MultiClosure) (local.get $closure)))
-          (i32.const 0)
-          (ref.null none)
-          (struct.get $MultiClosure $dispatch (ref.cast (ref $MultiClosure) (local.get $closure)))))
-      (else
-        (call_ref $ClosureFunc0
-          (struct.get $Closure0 $env (ref.cast (ref $Closure0) (local.get $closure)))
-          (struct.get $Closure0 $func (ref.cast (ref $Closure0) (local.get $closure)))))))
+    (local.set $closure (call $unwrap_meta (local.get $closure)))
+    ;; Check MultiClosure
+    (block $not_multi (result anyref)
+      (local.set $mc (br_on_cast_fail $not_multi anyref (ref $MultiClosure) (local.get $closure)))
+      (return (call_ref $MultiClosureDispatch
+        (struct.get $MultiClosure $env (local.get $mc))
+        (i32.const 0)
+        (ref.null none)
+        (struct.get $MultiClosure $dispatch (local.get $mc)))))
+    (drop)
+    ;; Regular closure
+    (call_ref $ClosureFunc0
+      (struct.get $Closure0 $env (ref.cast (ref $Closure0) (local.get $closure)))
+      (struct.get $Closure0 $func (ref.cast (ref $Closure0) (local.get $closure)))))
 
-  ;; invoke1: invoke a 1-arity closure (or keyword-as-function)
+  ;; invoke1: invoke a 1-arity closure (or keyword/map/set-as-function)
   (func $invoke1 (param $closure anyref) (param $arg0 anyref) (result anyref)
+    (local $mc (ref null $MultiClosure))
+    (local $tag i32)
     ;; Unwrap WithMeta if present
-    (if (ref.test (ref $WithMeta) (local.get $closure))
-      (then (local.set $closure (struct.get $WithMeta $inner (ref.cast (ref $WithMeta) (local.get $closure))))))
-    (if (result anyref) (i32.eq (call $type_tag (local.get $closure)) (i32.const 2))
-      (then (call $hash_map_get (local.get $arg0) (local.get $closure)))
-      (else (if (result anyref) (ref.test (ref $MultiClosure) (local.get $closure))
-        (then
-          (call_ref $MultiClosureDispatch
-            (struct.get $MultiClosure $env (ref.cast (ref $MultiClosure) (local.get $closure)))
-            (i32.const 1)
-            (call $cons (local.get $arg0) (ref.null none))
-            (struct.get $MultiClosure $dispatch (ref.cast (ref $MultiClosure) (local.get $closure)))))
-        (else
-          (call_ref $ClosureFunc1
-            (struct.get $Closure1 $env (ref.cast (ref $Closure1) (local.get $closure)))
-            (local.get $arg0)
-            (struct.get $Closure1 $func (ref.cast (ref $Closure1) (local.get $closure)))))))))
+    (local.set $closure (call $unwrap_meta (local.get $closure)))
+    (local.set $tag (call $type_tag (local.get $closure)))
+    ;; Keyword as function (tag=2)
+    (if (i32.eq (local.get $tag) (i32.const 2))
+      (then (return (call $hash_map_get (local.get $arg0) (local.get $closure)))))
+    ;; HashMap/ArrayMap as function (tags 8, 19) — (the-map key)
+    (if (i32.or (i32.eq (local.get $tag) (i32.const 8)) (i32.eq (local.get $tag) (i32.const 19)))
+      (then (return (call $hash_map_get (local.get $closure) (local.get $arg0)))))
+    ;; HashSet as function (tag 9) — returns element if present, else nil
+    (if (i32.eq (local.get $tag) (i32.const 9))
+      (then (return (if (result anyref) (call $truthy (call $set_contains_QMARK_ (local.get $closure) (local.get $arg0)))
+        (then (local.get $arg0))
+        (else (ref.null none))))))
+    ;; Check MultiClosure
+    (block $not_multi (result anyref)
+      (local.set $mc (br_on_cast_fail $not_multi anyref (ref $MultiClosure) (local.get $closure)))
+      (return (call_ref $MultiClosureDispatch
+        (struct.get $MultiClosure $env (local.get $mc))
+        (i32.const 1)
+        (call $cons (local.get $arg0) (ref.null none))
+        (struct.get $MultiClosure $dispatch (local.get $mc)))))
+    (drop)
+    ;; Regular closure
+    (call_ref $ClosureFunc1
+      (struct.get $Closure1 $env (ref.cast (ref $Closure1) (local.get $closure)))
+      (local.get $arg0)
+      (struct.get $Closure1 $func (ref.cast (ref $Closure1) (local.get $closure)))))
 
-  ;; invoke2: invoke a 2-arity closure
+  ;; invoke2: invoke a 2-arity closure (or map-as-function with default)
   (func $invoke2 (param $closure anyref) (param $arg0 anyref) (param $arg1 anyref) (result anyref)
+    (local $mc (ref null $MultiClosure))
+    (local $tag i32)
     ;; Unwrap WithMeta if present
-    (if (ref.test (ref $WithMeta) (local.get $closure))
-      (then (local.set $closure (struct.get $WithMeta $inner (ref.cast (ref $WithMeta) (local.get $closure))))))
-    (if (result anyref) (ref.test (ref $MultiClosure) (local.get $closure))
-      (then
-        (call_ref $MultiClosureDispatch
-          (struct.get $MultiClosure $env (ref.cast (ref $MultiClosure) (local.get $closure)))
-          (i32.const 2)
-          (call $cons (local.get $arg0) (call $cons (local.get $arg1) (ref.null none)))
-          (struct.get $MultiClosure $dispatch (ref.cast (ref $MultiClosure) (local.get $closure)))))
-      (else
-        (call_ref $ClosureFunc2
-          (struct.get $Closure2 $env (ref.cast (ref $Closure2) (local.get $closure)))
-          (local.get $arg0)
-          (local.get $arg1)
-          (struct.get $Closure2 $func (ref.cast (ref $Closure2) (local.get $closure)))))))
+    (local.set $closure (call $unwrap_meta (local.get $closure)))
+    (local.set $tag (call $type_tag (local.get $closure)))
+    ;; Keyword as function with default (tag=2) — (:kw map default)
+    (if (i32.eq (local.get $tag) (i32.const 2))
+      (then (return (call $hash_map_get_default (local.get $arg0) (local.get $closure) (local.get $arg1)))))
+    ;; HashMap/ArrayMap as function with default (tags 8, 19) — (the-map key default)
+    (if (i32.or (i32.eq (local.get $tag) (i32.const 8)) (i32.eq (local.get $tag) (i32.const 19)))
+      (then (return (call $hash_map_get_default (local.get $closure) (local.get $arg0) (local.get $arg1)))))
+    ;; Check MultiClosure
+    (block $not_multi (result anyref)
+      (local.set $mc (br_on_cast_fail $not_multi anyref (ref $MultiClosure) (local.get $closure)))
+      (return (call_ref $MultiClosureDispatch
+        (struct.get $MultiClosure $env (local.get $mc))
+        (i32.const 2)
+        (call $cons (local.get $arg0) (call $cons (local.get $arg1) (ref.null none)))
+        (struct.get $MultiClosure $dispatch (local.get $mc)))))
+    (drop)
+    ;; Regular closure
+    (call_ref $ClosureFunc2
+      (struct.get $Closure2 $env (ref.cast (ref $Closure2) (local.get $closure)))
+      (local.get $arg0)
+      (local.get $arg1)
+      (struct.get $Closure2 $func (ref.cast (ref $Closure2) (local.get $closure)))))
 
   ;; invoke3: invoke a 3-arity closure
   (func $invoke3 (param $closure anyref) (param $arg0 anyref) (param $arg1 anyref) (param $arg2 anyref) (result anyref)
-    (if (result anyref) (ref.test (ref $MultiClosure) (local.get $closure))
-      (then
-        (call_ref $MultiClosureDispatch
-          (struct.get $MultiClosure $env (ref.cast (ref $MultiClosure) (local.get $closure)))
-          (i32.const 3)
-          (call $cons (local.get $arg0) (call $cons (local.get $arg1) (call $cons (local.get $arg2) (ref.null none))))
-          (struct.get $MultiClosure $dispatch (ref.cast (ref $MultiClosure) (local.get $closure)))))
-      (else
-        (call_ref $ClosureFunc3
-          (struct.get $Closure3 $env (ref.cast (ref $Closure3) (local.get $closure)))
-          (local.get $arg0)
-          (local.get $arg1)
-          (local.get $arg2)
-          (struct.get $Closure3 $func (ref.cast (ref $Closure3) (local.get $closure)))))))
+    (local $mc (ref null $MultiClosure))
+    ;; Unwrap WithMeta if present
+    (local.set $closure (call $unwrap_meta (local.get $closure)))
+    ;; Check MultiClosure
+    (block $not_multi (result anyref)
+      (local.set $mc (br_on_cast_fail $not_multi anyref (ref $MultiClosure) (local.get $closure)))
+      (return (call_ref $MultiClosureDispatch
+        (struct.get $MultiClosure $env (local.get $mc))
+        (i32.const 3)
+        (call $cons (local.get $arg0) (call $cons (local.get $arg1) (call $cons (local.get $arg2) (ref.null none))))
+        (struct.get $MultiClosure $dispatch (local.get $mc)))))
+    (drop)
+    ;; Regular closure
+    (call_ref $ClosureFunc3
+      (struct.get $Closure3 $env (ref.cast (ref $Closure3) (local.get $closure)))
+      (local.get $arg0)
+      (local.get $arg1)
+      (local.get $arg2)
+      (struct.get $Closure3 $func (ref.cast (ref $Closure3) (local.get $closure)))))
 
   ;; invoke4: invoke a 4-arity closure
   (func $invoke4 (param $closure anyref) (param $arg0 anyref) (param $arg1 anyref) (param $arg2 anyref) (param $arg3 anyref) (result anyref)
-    (if (result anyref) (ref.test (ref $MultiClosure) (local.get $closure))
-      (then
-        (call_ref $MultiClosureDispatch
-          (struct.get $MultiClosure $env (ref.cast (ref $MultiClosure) (local.get $closure)))
-          (i32.const 4)
-          (call $cons (local.get $arg0) (call $cons (local.get $arg1) (call $cons (local.get $arg2) (call $cons (local.get $arg3) (ref.null none)))))
-          (struct.get $MultiClosure $dispatch (ref.cast (ref $MultiClosure) (local.get $closure)))))
-      (else
-        (call_ref $ClosureFunc4
-          (struct.get $Closure4 $env (ref.cast (ref $Closure4) (local.get $closure)))
-          (local.get $arg0)
+    (local $mc (ref null $MultiClosure))
+    ;; Check MultiClosure
+    (block $not_multi (result anyref)
+      (local.set $mc (br_on_cast_fail $not_multi anyref (ref $MultiClosure) (local.get $closure)))
+      (return (call_ref $MultiClosureDispatch
+        (struct.get $MultiClosure $env (local.get $mc))
+        (i32.const 4)
+        (call $cons (local.get $arg0) (call $cons (local.get $arg1) (call $cons (local.get $arg2) (call $cons (local.get $arg3) (ref.null none)))))
+        (struct.get $MultiClosure $dispatch (local.get $mc)))))
+    (drop)
+    ;; Regular closure
+    (call_ref $ClosureFunc4
+      (struct.get $Closure4 $env (ref.cast (ref $Closure4) (local.get $closure)))
+      (local.get $arg0)
           (local.get $arg1)
           (local.get $arg2)
           (local.get $arg3)
-          (struct.get $Closure4 $func (ref.cast (ref $Closure4) (local.get $closure)))))))
+      (struct.get $Closure4 $func (ref.cast (ref $Closure4) (local.get $closure)))))
 
   ;; invoke5: invoke a 5-arity closure
   (func $invoke5 (param $closure anyref) (param $arg0 anyref) (param $arg1 anyref) (param $arg2 anyref) (param $arg3 anyref) (param $arg4 anyref) (result anyref)
-    (if (result anyref) (ref.test (ref $MultiClosure) (local.get $closure))
-      (then
-        (call_ref $MultiClosureDispatch
-          (struct.get $MultiClosure $env (ref.cast (ref $MultiClosure) (local.get $closure)))
-          (i32.const 5)
-          (call $cons (local.get $arg0) (call $cons (local.get $arg1) (call $cons (local.get $arg2) (call $cons (local.get $arg3) (call $cons (local.get $arg4) (ref.null none))))))
-          (struct.get $MultiClosure $dispatch (ref.cast (ref $MultiClosure) (local.get $closure)))))
-      (else
-        (call_ref $ClosureFunc5
-          (struct.get $Closure5 $env (ref.cast (ref $Closure5) (local.get $closure)))
-          (local.get $arg0)
+    (local $mc (ref null $MultiClosure))
+    ;; Check MultiClosure
+    (block $not_multi (result anyref)
+      (local.set $mc (br_on_cast_fail $not_multi anyref (ref $MultiClosure) (local.get $closure)))
+      (return (call_ref $MultiClosureDispatch
+        (struct.get $MultiClosure $env (local.get $mc))
+        (i32.const 5)
+        (call $cons (local.get $arg0) (call $cons (local.get $arg1) (call $cons (local.get $arg2) (call $cons (local.get $arg3) (call $cons (local.get $arg4) (ref.null none))))))
+        (struct.get $MultiClosure $dispatch (local.get $mc)))))
+    (drop)
+    ;; Regular closure
+    (call_ref $ClosureFunc5
+      (struct.get $Closure5 $env (ref.cast (ref $Closure5) (local.get $closure)))
+      (local.get $arg0)
           (local.get $arg1)
           (local.get $arg2)
           (local.get $arg3)
           (local.get $arg4)
-          (struct.get $Closure5 $func (ref.cast (ref $Closure5) (local.get $closure)))))))
+      (struct.get $Closure5 $func (ref.cast (ref $Closure5) (local.get $closure)))))
 
   ;; invoke6: invoke a 6-arity closure
   (func $invoke6 (param $closure anyref) (param $arg0 anyref) (param $arg1 anyref) (param $arg2 anyref) (param $arg3 anyref) (param $arg4 anyref) (param $arg5 anyref) (result anyref)
-    (if (result anyref) (ref.test (ref $MultiClosure) (local.get $closure))
-      (then
-        (call_ref $MultiClosureDispatch
-          (struct.get $MultiClosure $env (ref.cast (ref $MultiClosure) (local.get $closure)))
-          (i32.const 6)
-          (call $cons (local.get $arg0) (call $cons (local.get $arg1) (call $cons (local.get $arg2) (call $cons (local.get $arg3) (call $cons (local.get $arg4) (call $cons (local.get $arg5) (ref.null none)))))))
-          (struct.get $MultiClosure $dispatch (ref.cast (ref $MultiClosure) (local.get $closure)))))
-      (else
-        (call_ref $ClosureFunc6
-          (struct.get $Closure6 $env (ref.cast (ref $Closure6) (local.get $closure)))
-          (local.get $arg0)
+    (local $mc (ref null $MultiClosure))
+    ;; Check MultiClosure
+    (block $not_multi (result anyref)
+      (local.set $mc (br_on_cast_fail $not_multi anyref (ref $MultiClosure) (local.get $closure)))
+      (return (call_ref $MultiClosureDispatch
+        (struct.get $MultiClosure $env (local.get $mc))
+        (i32.const 6)
+        (call $cons (local.get $arg0) (call $cons (local.get $arg1) (call $cons (local.get $arg2) (call $cons (local.get $arg3) (call $cons (local.get $arg4) (call $cons (local.get $arg5) (ref.null none)))))))
+        (struct.get $MultiClosure $dispatch (local.get $mc)))))
+    (drop)
+    ;; Regular closure
+    (call_ref $ClosureFunc6
+      (struct.get $Closure6 $env (ref.cast (ref $Closure6) (local.get $closure)))
+      (local.get $arg0)
           (local.get $arg1)
           (local.get $arg2)
           (local.get $arg3)
           (local.get $arg4)
           (local.get $arg5)
-          (struct.get $Closure6 $func (ref.cast (ref $Closure6) (local.get $closure)))))))
+      (struct.get $Closure6 $func (ref.cast (ref $Closure6) (local.get $closure)))))
 
   ;; invoke7: invoke a 7-arity closure
   (func $invoke7 (param $closure anyref) (param $arg0 anyref) (param $arg1 anyref) (param $arg2 anyref) (param $arg3 anyref) (param $arg4 anyref) (param $arg5 anyref) (param $arg6 anyref) (result anyref)
-    (if (result anyref) (ref.test (ref $MultiClosure) (local.get $closure))
-      (then
-        (call_ref $MultiClosureDispatch
-          (struct.get $MultiClosure $env (ref.cast (ref $MultiClosure) (local.get $closure)))
-          (i32.const 7)
-          (call $cons (local.get $arg0) (call $cons (local.get $arg1) (call $cons (local.get $arg2) (call $cons (local.get $arg3) (call $cons (local.get $arg4) (call $cons (local.get $arg5) (call $cons (local.get $arg6) (ref.null none))))))))
-          (struct.get $MultiClosure $dispatch (ref.cast (ref $MultiClosure) (local.get $closure)))))
-      (else
-        (call_ref $ClosureFunc7
-          (struct.get $Closure7 $env (ref.cast (ref $Closure7) (local.get $closure)))
-          (local.get $arg0)
+    (local $mc (ref null $MultiClosure))
+    ;; Check MultiClosure
+    (block $not_multi (result anyref)
+      (local.set $mc (br_on_cast_fail $not_multi anyref (ref $MultiClosure) (local.get $closure)))
+      (return (call_ref $MultiClosureDispatch
+        (struct.get $MultiClosure $env (local.get $mc))
+        (i32.const 7)
+        (call $cons (local.get $arg0) (call $cons (local.get $arg1) (call $cons (local.get $arg2) (call $cons (local.get $arg3) (call $cons (local.get $arg4) (call $cons (local.get $arg5) (call $cons (local.get $arg6) (ref.null none))))))))
+        (struct.get $MultiClosure $dispatch (local.get $mc)))))
+    (drop)
+    ;; Regular closure
+    (call_ref $ClosureFunc7
+      (struct.get $Closure7 $env (ref.cast (ref $Closure7) (local.get $closure)))
+      (local.get $arg0)
           (local.get $arg1)
           (local.get $arg2)
           (local.get $arg3)
           (local.get $arg4)
           (local.get $arg5)
           (local.get $arg6)
-          (struct.get $Closure7 $func (ref.cast (ref $Closure7) (local.get $closure)))))))
+      (struct.get $Closure7 $func (ref.cast (ref $Closure7) (local.get $closure)))))
 
   ;; invoke8: invoke a 8-arity closure
   (func $invoke8 (param $closure anyref) (param $arg0 anyref) (param $arg1 anyref) (param $arg2 anyref) (param $arg3 anyref) (param $arg4 anyref) (param $arg5 anyref) (param $arg6 anyref) (param $arg7 anyref) (result anyref)
-    (if (result anyref) (ref.test (ref $MultiClosure) (local.get $closure))
-      (then
-        (call_ref $MultiClosureDispatch
-          (struct.get $MultiClosure $env (ref.cast (ref $MultiClosure) (local.get $closure)))
-          (i32.const 8)
-          (call $cons (local.get $arg0) (call $cons (local.get $arg1) (call $cons (local.get $arg2) (call $cons (local.get $arg3) (call $cons (local.get $arg4) (call $cons (local.get $arg5) (call $cons (local.get $arg6) (call $cons (local.get $arg7) (ref.null none)))))))))
-          (struct.get $MultiClosure $dispatch (ref.cast (ref $MultiClosure) (local.get $closure)))))
-      (else
-        (call_ref $ClosureFunc8
-          (struct.get $Closure8 $env (ref.cast (ref $Closure8) (local.get $closure)))
-          (local.get $arg0)
+    (local $mc (ref null $MultiClosure))
+    ;; Check MultiClosure
+    (block $not_multi (result anyref)
+      (local.set $mc (br_on_cast_fail $not_multi anyref (ref $MultiClosure) (local.get $closure)))
+      (return (call_ref $MultiClosureDispatch
+        (struct.get $MultiClosure $env (local.get $mc))
+        (i32.const 8)
+        (call $cons (local.get $arg0) (call $cons (local.get $arg1) (call $cons (local.get $arg2) (call $cons (local.get $arg3) (call $cons (local.get $arg4) (call $cons (local.get $arg5) (call $cons (local.get $arg6) (call $cons (local.get $arg7) (ref.null none)))))))))
+        (struct.get $MultiClosure $dispatch (local.get $mc)))))
+    (drop)
+    ;; Regular closure
+    (call_ref $ClosureFunc8
+      (struct.get $Closure8 $env (ref.cast (ref $Closure8) (local.get $closure)))
+      (local.get $arg0)
           (local.get $arg1)
           (local.get $arg2)
           (local.get $arg3)
@@ -4802,21 +5394,24 @@
           (local.get $arg5)
           (local.get $arg6)
           (local.get $arg7)
-          (struct.get $Closure8 $func (ref.cast (ref $Closure8) (local.get $closure)))))))
+      (struct.get $Closure8 $func (ref.cast (ref $Closure8) (local.get $closure)))))
 
   ;; invoke9: invoke a 9-arity closure
   (func $invoke9 (param $closure anyref) (param $arg0 anyref) (param $arg1 anyref) (param $arg2 anyref) (param $arg3 anyref) (param $arg4 anyref) (param $arg5 anyref) (param $arg6 anyref) (param $arg7 anyref) (param $arg8 anyref) (result anyref)
-    (if (result anyref) (ref.test (ref $MultiClosure) (local.get $closure))
-      (then
-        (call_ref $MultiClosureDispatch
-          (struct.get $MultiClosure $env (ref.cast (ref $MultiClosure) (local.get $closure)))
-          (i32.const 9)
-          (call $cons (local.get $arg0) (call $cons (local.get $arg1) (call $cons (local.get $arg2) (call $cons (local.get $arg3) (call $cons (local.get $arg4) (call $cons (local.get $arg5) (call $cons (local.get $arg6) (call $cons (local.get $arg7) (call $cons (local.get $arg8) (ref.null none))))))))))
-          (struct.get $MultiClosure $dispatch (ref.cast (ref $MultiClosure) (local.get $closure)))))
-      (else
-        (call_ref $ClosureFunc9
-          (struct.get $Closure9 $env (ref.cast (ref $Closure9) (local.get $closure)))
-          (local.get $arg0)
+    (local $mc (ref null $MultiClosure))
+    ;; Check MultiClosure
+    (block $not_multi (result anyref)
+      (local.set $mc (br_on_cast_fail $not_multi anyref (ref $MultiClosure) (local.get $closure)))
+      (return (call_ref $MultiClosureDispatch
+        (struct.get $MultiClosure $env (local.get $mc))
+        (i32.const 9)
+        (call $cons (local.get $arg0) (call $cons (local.get $arg1) (call $cons (local.get $arg2) (call $cons (local.get $arg3) (call $cons (local.get $arg4) (call $cons (local.get $arg5) (call $cons (local.get $arg6) (call $cons (local.get $arg7) (call $cons (local.get $arg8) (ref.null none))))))))))
+        (struct.get $MultiClosure $dispatch (local.get $mc)))))
+    (drop)
+    ;; Regular closure
+    (call_ref $ClosureFunc9
+      (struct.get $Closure9 $env (ref.cast (ref $Closure9) (local.get $closure)))
+      (local.get $arg0)
           (local.get $arg1)
           (local.get $arg2)
           (local.get $arg3)
@@ -4825,21 +5420,24 @@
           (local.get $arg6)
           (local.get $arg7)
           (local.get $arg8)
-          (struct.get $Closure9 $func (ref.cast (ref $Closure9) (local.get $closure)))))))
+      (struct.get $Closure9 $func (ref.cast (ref $Closure9) (local.get $closure)))))
 
   ;; invoke10: invoke a 10-arity closure
   (func $invoke10 (param $closure anyref) (param $arg0 anyref) (param $arg1 anyref) (param $arg2 anyref) (param $arg3 anyref) (param $arg4 anyref) (param $arg5 anyref) (param $arg6 anyref) (param $arg7 anyref) (param $arg8 anyref) (param $arg9 anyref) (result anyref)
-    (if (result anyref) (ref.test (ref $MultiClosure) (local.get $closure))
-      (then
-        (call_ref $MultiClosureDispatch
-          (struct.get $MultiClosure $env (ref.cast (ref $MultiClosure) (local.get $closure)))
-          (i32.const 10)
-          (call $cons (local.get $arg0) (call $cons (local.get $arg1) (call $cons (local.get $arg2) (call $cons (local.get $arg3) (call $cons (local.get $arg4) (call $cons (local.get $arg5) (call $cons (local.get $arg6) (call $cons (local.get $arg7) (call $cons (local.get $arg8) (call $cons (local.get $arg9) (ref.null none)))))))))))
-          (struct.get $MultiClosure $dispatch (ref.cast (ref $MultiClosure) (local.get $closure)))))
-      (else
-        (call_ref $ClosureFunc10
-          (struct.get $Closure10 $env (ref.cast (ref $Closure10) (local.get $closure)))
-          (local.get $arg0)
+    (local $mc (ref null $MultiClosure))
+    ;; Check MultiClosure
+    (block $not_multi (result anyref)
+      (local.set $mc (br_on_cast_fail $not_multi anyref (ref $MultiClosure) (local.get $closure)))
+      (return (call_ref $MultiClosureDispatch
+        (struct.get $MultiClosure $env (local.get $mc))
+        (i32.const 10)
+        (call $cons (local.get $arg0) (call $cons (local.get $arg1) (call $cons (local.get $arg2) (call $cons (local.get $arg3) (call $cons (local.get $arg4) (call $cons (local.get $arg5) (call $cons (local.get $arg6) (call $cons (local.get $arg7) (call $cons (local.get $arg8) (call $cons (local.get $arg9) (ref.null none)))))))))))
+        (struct.get $MultiClosure $dispatch (local.get $mc)))))
+    (drop)
+    ;; Regular closure
+    (call_ref $ClosureFunc10
+      (struct.get $Closure10 $env (ref.cast (ref $Closure10) (local.get $closure)))
+      (local.get $arg0)
           (local.get $arg1)
           (local.get $arg2)
           (local.get $arg3)
@@ -4849,7 +5447,7 @@
           (local.get $arg7)
           (local.get $arg8)
           (local.get $arg9)
-          (struct.get $Closure10 $func (ref.cast (ref $Closure10) (local.get $closure)))))))
+      (struct.get $Closure10 $func (ref.cast (ref $Closure10) (local.get $closure)))))
 
   ;; ==========================================
   ;; IReduce Protocol Implementations
@@ -4886,6 +5484,11 @@
           (then (local.set $curr (call $lazy_seq_realize (local.get $curr)))))
         ;; If after realization curr is still null, we're done
         (br_if $done (ref.is_null (local.get $curr)))
+        ;; If curr became a VectorSeq, delegate to vectorseq_reduce
+        (if (ref.test (ref $VectorSeq) (local.get $curr))
+          (then
+            (local.set $acc (call $vectorseq_reduce (local.get $curr) (local.get $f) (local.get $acc)))
+            (br $done)))
         ;; Apply f: acc = f(acc, first(curr))
         (local.set $acc (call $invoke2 (local.get $f) (local.get $acc)
           (struct.get $Cons $first (ref.cast (ref $Cons) (local.get $curr)))))
@@ -4921,10 +5524,17 @@
 
   ;; hashmap-reduce: reduce over map entries as [k v] vectors (HAMT-backed)
   (func $hashmap_reduce (param $coll anyref) (param $f anyref) (param $init anyref) (result anyref)
-    (call $deref_reduced
-      (call $hamt_reduce_entries
-        (struct.get $HashMap $array (ref.cast (ref $HashMap) (local.get $coll)))
-        (local.get $f) (local.get $init))))
+    ;; ArrayMap (tag 19): iterate flat [k,v,...] array producing [k,v] vectors
+    (if (result anyref) (i32.eq (call $type_tag (local.get $coll)) (i32.const 19))
+      (then
+        (call $deref_reduced
+          (call $array_map_reduce_entries
+            (local.get $f) (local.get $init) (ref.cast (ref $HashMap) (local.get $coll)))))
+      (else
+        (call $deref_reduced
+          (call $hamt_reduce_entries
+            (struct.get $HashMap $array (ref.cast (ref $HashMap) (local.get $coll)))
+            (local.get $f) (local.get $init))))))
 
   ;; hashset-reduce: reduce over set elements (HAMT-backed)
   (func $hashset_reduce (param $coll anyref) (param $f anyref) (param $init anyref) (result anyref)
@@ -4932,6 +5542,28 @@
       (call $hamt_reduce_keys
         (struct.get $HashSet $array (ref.cast (ref $HashSet) (local.get $coll)))
         (local.get $f) (local.get $init))))
+
+  ;; vectorseq-reduce: reduce over VectorSeq (efficient indexed access from offset)
+  (func $vectorseq_reduce (param $coll anyref) (param $f anyref) (param $init anyref) (result anyref)
+    (local $acc anyref)
+    (local $i i32)
+    (local $count i32)
+    (local $vs (ref $VectorSeq))
+    (local $vec anyref)
+    (local.set $vs (ref.cast (ref $VectorSeq) (local.get $coll)))
+    (local.set $vec (struct.get $VectorSeq $vec (local.get $vs)))
+    (local.set $i (struct.get $VectorSeq $offset (local.get $vs)))
+    (local.set $count (call $vector_count (local.get $vec)))
+    (local.set $acc (local.get $init))
+    (block $done
+      (loop $loop
+        (br_if $done (i32.ge_s (local.get $i) (local.get $count)))
+        (br_if $done (call $reduced_QMARK_ (local.get $acc)))
+        (local.set $acc (call $invoke2 (local.get $f) (local.get $acc)
+          (call $vector_nth (local.get $vec) (local.get $i))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $loop)))
+    (call $deref_reduced (local.get $acc)))
 
   ;; Polymorphic reduce dispatcher
   (func $reduce (param $f anyref) (param $init anyref) (param $coll anyref) (result anyref)
@@ -4947,19 +5579,22 @@
             (if (result anyref) (ref.test (ref $Vector) (local.get $coll))
               (then (call $vector_reduce (local.get $coll) (local.get $f) (local.get $init)))
               (else
+                (if (result anyref) (ref.test (ref $VectorSeq) (local.get $coll))
+                  (then (call $vectorseq_reduce (local.get $coll) (local.get $f) (local.get $init)))
+                  (else
                 (if (result anyref) (ref.test (ref $Cons) (local.get $coll))
                   (then (call $cons_reduce (local.get $coll) (local.get $f) (local.get $init)))
                   (else
-                    (if (result anyref) (i32.eq (call $type_tag (local.get $coll)) (i32.const 8))
+                    (if (result anyref) (i32.or (i32.eq (call $type_tag (local.get $coll)) (i32.const 8)) (i32.eq (call $type_tag (local.get $coll)) (i32.const 19)))
                       (then (call $hashmap_reduce (local.get $coll) (local.get $f) (local.get $init)))
                       (else
                         (if (result anyref) (i32.eq (call $type_tag (local.get $coll)) (i32.const 9))
                           (then (call $hashset_reduce (local.get $coll) (local.get $f) (local.get $init)))
                           (else
                             ;; Protocol fallback for IReduce
-                            (if (result anyref) (i31.get_s (ref.cast (ref i31) (call $__satisfies_IReduce (local.get $coll))))
+                            (if (result anyref) (call $truthy (call $__satisfies_IReduce (local.get $coll)))
                               (then (call $__dispatch__reduce_init (local.get $coll) (local.get $f) (local.get $init)))
-                              (else (local.get $init))))))))))))))))
+                              (else (local.get $init))))))))))))))))))
 
   ;; reduce without initial value: (reduce f coll)
   ;; Uses first element as init, reduces rest. Empty coll calls (f).
@@ -4981,13 +5616,20 @@
     (if (result anyref) (ref.is_null (local.get $coll))
       (then (local.get $init))
       (else
+        ;; ArrayMap (tag 19) — iterate flat array
+        (if (result anyref) (i32.eq (call $type_tag (local.get $coll)) (i32.const 19))
+          (then
+            (call $deref_reduced
+              (call $array_map_reduce_kv (local.get $f) (local.get $init)
+                (ref.cast (ref $HashMap) (local.get $coll)))))
+          (else
         (if (result anyref) (i32.eq (call $type_tag (local.get $coll)) (i32.const 8))
           (then
             (call $deref_reduced
               (call $hamt_reduce
                 (struct.get $HashMap $array (ref.cast (ref $HashMap) (local.get $coll)))
                 (local.get $f) (local.get $init))))
-          (else (local.get $init))))))
+          (else (local.get $init))))))))
 
   ;; ==========================================
   ;; Lazy Sequence Operations
@@ -5004,6 +5646,13 @@
   ;; lazy-seq?: check if value is a lazy sequence
   (func $lazy_seq_QMARK_ (param $val anyref) (result anyref)
     (call $bool (ref.test (ref $LazySeq) (local.get $val))))
+
+  ;; lazy-seq-realized?: check if lazy seq has been realized (thunk is null)
+  (func $lazy_seq_realized_QMARK_ (param $val anyref) (result anyref)
+    (if (result anyref) (ref.test (ref $LazySeq) (local.get $val))
+      (then (call $bool (ref.is_null (struct.get $LazySeq $thunk
+              (ref.cast (ref $LazySeq) (local.get $val))))))
+      (else (call $bool (i32.const 0)))))
 
   ;; lazy-seq-realize: force evaluation of lazy sequence, return realized value
   ;; If already realized, return cached value
@@ -5037,7 +5686,8 @@
   ;; nil = 0, i31 (int) = 1, Keyword = 2, String = 3, Symbol = 4, Float = 5
   ;; Cons = 6, Vector = 7, HashMap = 8, HashSet = 9, Atom = 10
   ;; Closure0-10 = 11 (all closures share tag), LazySeq = 12, Reduced = 13, Boolean = 14
-  ;; ExceptionInfo = 100, User-types = 15+
+  ;; TransientVector = 15, TransientHashMap = 16, TransientHashSet = 17
+  ;; VectorSeq = 18, ExceptionInfo = 100, User-types = 19+
 
   ;; type_tag: returns numeric type tag for dispatch
   ;; All struct types extend $Tagged with $__type_id as first field,
@@ -5045,17 +5695,18 @@
   ;; WithMeta (tag=99) is transparent: returns the inner value's tag.
   (func $type_tag (param $val anyref) (result i32)
     (local $tag i32)
-    (if (result i32) (ref.is_null (local.get $val))
-      (then (i32.const 0))
-      (else (if (result i32) (ref.test (ref i31) (local.get $val))
-        (then (i32.const 1))
-        (else (if (result i32) (ref.test (ref $Tagged) (local.get $val))
-          (then
-            (local.set $tag (struct.get $Tagged $__type_id (ref.cast (ref $Tagged) (local.get $val))))
-            (if (result i32) (i32.eq (local.get $tag) (i32.const 99))
-              (then (call $type_tag (struct.get $WithMeta $inner (ref.cast (ref $WithMeta) (local.get $val)))))
-              (else (local.get $tag))))
-          (else (i32.const -1))))))))
+    (if (ref.is_null (local.get $val))
+      (then (return (i32.const 0))))
+    (if (ref.test (ref i31) (local.get $val))
+      (then (return (i32.const 1))))
+    (block $not_tagged (result anyref)
+      (local.set $tag (struct.get $Tagged $__type_id
+        (br_on_cast_fail $not_tagged anyref (ref $Tagged) (local.get $val))))
+      (if (i32.eq (local.get $tag) (i32.const 99))
+        (then (return (call $type_tag (struct.get $WithMeta $inner (ref.cast (ref $WithMeta) (local.get $val)))))))
+      (return (local.get $tag)))
+    (drop)
+    (i32.const -1))
 
   ;; unwrap_meta: strip WithMeta wrapper if present, returning inner value
   (func $unwrap_meta (param $val anyref) (result anyref)
@@ -5070,17 +5721,14 @@
   (func $with_meta_ (param $val anyref) (param $meta anyref) (result anyref)
     ;; If val already has meta, unwrap first
     (local $inner anyref)
-    (if (ref.test (ref $Tagged) (local.get $val))
-      (then (if (i32.eq (struct.get $Tagged $__type_id (ref.cast (ref $Tagged) (local.get $val))) (i32.const 99))
-        (then (local.set $inner (struct.get $WithMeta $inner (ref.cast (ref $WithMeta) (local.get $val)))))
-        (else (local.set $inner (local.get $val)))))
-      (else (local.set $inner (local.get $val))))
+    (local.set $inner (call $unwrap_meta (local.get $val)))
     ;; If meta is nil, return unwrapped value (no metadata)
     (if (result anyref) (ref.is_null (local.get $meta))
       (then (local.get $inner))
       (else (struct.new $WithMeta (i32.const 99) (i32.const 0) (i32.const 0) (local.get $inner) (local.get $meta)))))
 
   ;; meta_: extract metadata from a value (nil if none)
+  ;; Uses tag check (tag=99) to avoid structural typing conflict
   (func $meta_ (param $val anyref) (result anyref)
     (if (result anyref) (ref.test (ref $Tagged) (local.get $val))
       (then (if (result anyref)
@@ -5352,11 +6000,42 @@
         (br $search)))
     (call $make_empty_str))
 
-  ;; name_fn: get bare name from keyword (without colon)
+  ;; strip_ns: given a string like foo/bar, return bar. If no slash, return as-is.
+  (func $strip_ns (param $s anyref) (result anyref)
+    (local $src (ref $CharArray))
+    (local $len i32)
+    (local $i i32)
+    (local $slash_pos i32)
+    (local $new_len i32)
+    (local $dst (ref $CharArray))
+    (local.set $src (struct.get $String $data (ref.cast (ref $String) (local.get $s))))
+    (local.set $len (array.len (local.get $src)))
+    (local.set $slash_pos (i32.const -1))
+    (local.set $i (i32.const 0))
+    (block $done
+      (loop $loop
+        (br_if $done (i32.ge_s (local.get $i) (local.get $len)))
+        (if (i32.eq (array.get_u $CharArray (local.get $src) (local.get $i)) (i32.const 47))  ;; '/'
+          (then (local.set $slash_pos (local.get $i))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $loop)))
+    (if (result anyref) (i32.lt_s (local.get $slash_pos) (i32.const 0))
+      (then (local.get $s))
+      (else
+        (local.set $new_len (i32.sub (local.get $len) (i32.add (local.get $slash_pos) (i32.const 1))))
+        (if (result anyref) (i32.le_s (local.get $new_len) (i32.const 0))
+          (then (call $make_empty_str))
+          (else
+            (local.set $dst (array.new $CharArray (i32.const 0) (local.get $new_len)))
+            (array.copy $CharArray $CharArray (local.get $dst) (i32.const 0) (local.get $src)
+              (i32.add (local.get $slash_pos) (i32.const 1)) (local.get $new_len))
+            (struct.new $String (i32.const 3) (i32.const -1) (local.get $dst)))))))
+
+  ;; name_fn: get bare name from keyword (without namespace) or symbol
   (func $name_fn (param $val anyref) (result anyref)
     (if (result anyref) (i32.eq (call $type_tag (local.get $val)) (i32.const 2))
       (then
-        (call $kw_name_lookup (struct.get $Keyword $id (ref.cast (ref $Keyword) (local.get $val)))))
+        (call $strip_ns (call $kw_name_lookup (struct.get $Keyword $id (ref.cast (ref $Keyword) (local.get $val))))))
       (else
         ;; Symbol -> read name from struct
         (if (result anyref) (i32.eq (call $type_tag (local.get $val)) (i32.const 4))
@@ -5719,6 +6398,24 @@
         (br $loop)))
     (local.get $len))
 
+  ;; mem->string: read len bytes from linear memory at offset, return String
+  (func $mem__GT_string (param $offset i32) (param $len i32) (result anyref)
+    (local $chars (ref $CharArray))
+    (local $i i32)
+    (if (i32.le_s (local.get $len) (i32.const 0))
+      (then (return (struct.new $String (i32.const 3) (i32.const -1)
+                      (array.new $CharArray (i32.const 0) (i32.const 0))))))
+    (local.set $chars (array.new $CharArray (i32.const 0) (local.get $len)))
+    (local.set $i (i32.const 0))
+    (block $done
+      (loop $loop
+        (br_if $done (i32.ge_s (local.get $i) (local.get $len)))
+        (array.set $CharArray (local.get $chars) (local.get $i)
+          (i32.load8_u (i32.add (local.get $offset) (local.get $i))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $loop)))
+    (struct.new $String (i32.const 3) (i32.const -1) (local.get $chars)))
+
   ;; char_at_as_str: return codepoint at codepoint index as string
   (func $char_at_as_str (param $s anyref) (param $idx i32) (result anyref)
     (local $data (ref $CharArray))
@@ -5732,14 +6429,22 @@
     (array.copy $CharArray $CharArray (local.get $new_data) (i32.const 0) (local.get $data) (local.get $offset) (local.get $cp_len))
     (struct.new $String (i32.const 3) (i32.const -1) (local.get $new_data)))
 
-  ;; nth_polymorphic: get element at index from vector, transient vector, or string
+  ;; nth_polymorphic: get element at index from vector, transient vector, string, or cons
   (func $nth_polymorphic (param $coll anyref) (param $idx i32) (result anyref)
     (local $tv (ref $TransientVector))
+    (local $cur anyref)
+    (local $i i32)
     ;; Unwrap WithMeta
     (local.set $coll (call $unwrap_meta (local.get $coll)))
     (if (result anyref) (ref.test (ref $Vector) (local.get $coll))
       (then (call $vector_nth (local.get $coll) (local.get $idx)))
       (else
+        (if (result anyref) (ref.test (ref $VectorSeq) (local.get $coll))
+          (then (call $vector_nth
+            (struct.get $VectorSeq $vec (ref.cast (ref $VectorSeq) (local.get $coll)))
+            (i32.add (struct.get $VectorSeq $offset (ref.cast (ref $VectorSeq) (local.get $coll)))
+                     (local.get $idx))))
+          (else
         (if (result anyref) (i32.eq (call $type_tag (local.get $coll)) (i32.const 15))
           (then
             ;; TransientVector — build temp Vector for array_for lookup
@@ -5754,7 +6459,41 @@
           (else
             (if (result anyref) (ref.test (ref $String) (local.get $coll))
               (then (call $char_at_as_str (local.get $coll) (local.get $idx)))
-              (else (ref.null none))))))))
+              (else
+                ;; Cons (list) — walk the chain idx times
+                (if (result anyref) (ref.test (ref $Cons) (local.get $coll))
+                  (then
+                    (local.set $cur (local.get $coll))
+                    (local.set $i (local.get $idx))
+                    (block $found
+                      (loop $walk
+                        (br_if $found (i32.or (ref.is_null (local.get $cur)) (i32.eqz (ref.test (ref $Cons) (local.get $cur)))))
+                        (if (i32.eqz (local.get $i))
+                          (then
+                            (local.set $cur (struct.get $Cons $first (ref.cast (ref $Cons) (local.get $cur))))
+                            (br $found)))
+                        (local.set $cur (struct.get $Cons $rest (ref.cast (ref $Cons) (local.get $cur))))
+                        (local.set $i (i32.sub (local.get $i) (i32.const 1)))
+                        (br $walk)))
+                    (local.get $cur))
+                  (else
+                    ;; LazySeq or other seq — walk using first/rest
+                    (if (result anyref) (ref.test (ref $LazySeq) (local.get $coll))
+                      (then
+                        (local.set $cur (local.get $coll))
+                        (local.set $i (local.get $idx))
+                        (block $done2
+                          (loop $walk2
+                            (br_if $done2 (ref.is_null (call $seq (local.get $cur))))
+                            (if (i32.eqz (local.get $i))
+                              (then
+                                (local.set $cur (call $first (local.get $cur)))
+                                (br $done2)))
+                            (local.set $cur (call $rest (local.get $cur)))
+                            (local.set $i (i32.sub (local.get $i) (i32.const 1)))
+                            (br $walk2)))
+                        (local.get $cur))
+                      (else (ref.null none))))))))))))))
 
   ;; Keyword name table global (initialized in $start)
   (global $__kw_names (mut anyref) (ref.null none))
@@ -5815,14 +6554,45 @@
         (call $str_concat (call $str_concat (struct.get $Symbol $ns (local.get $s)) (local.get $slash_str))
                           (struct.get $Symbol $name (local.get $s))))))
 
+  ;; extract_ns: given a string like foo/bar, return foo. If no slash, return null.
+  (func $extract_ns (param $s anyref) (result anyref)
+    (local $src (ref $CharArray))
+    (local $len i32)
+    (local $i i32)
+    (local $slash_pos i32)
+    (local $dst (ref $CharArray))
+    (local.set $src (struct.get $String $data (ref.cast (ref $String) (local.get $s))))
+    (local.set $len (array.len (local.get $src)))
+    (local.set $slash_pos (i32.const -1))
+    (local.set $i (i32.const 0))
+    (block $done
+      (loop $loop
+        (br_if $done (i32.ge_s (local.get $i) (local.get $len)))
+        (if (i32.eq (array.get_u $CharArray (local.get $src) (local.get $i)) (i32.const 47))  ;; '/'
+          (then (local.set $slash_pos (local.get $i))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $loop)))
+    (if (result anyref) (i32.lt_s (local.get $slash_pos) (i32.const 0))
+      (then (ref.null none))
+      (else
+        (if (result anyref) (i32.le_s (local.get $slash_pos) (i32.const 0))
+          (then (call $make_empty_str))
+          (else
+            (local.set $dst (array.new $CharArray (i32.const 0) (local.get $slash_pos)))
+            (array.copy $CharArray $CharArray (local.get $dst) (i32.const 0) (local.get $src)
+              (i32.const 0) (local.get $slash_pos))
+            (struct.new $String (i32.const 3) (i32.const -1) (local.get $dst)))))))
+
   ;; namespace: get namespace of keyword or symbol
   (func $namespace (param $val anyref) (result anyref)
     ;; Symbol -> return ns field (may be null)
     (if (result anyref) (i32.eq (call $type_tag (local.get $val)) (i32.const 4))
       (then (struct.get $Symbol $ns (ref.cast (ref $Symbol) (local.get $val))))
       (else
-        ;; Keyword -> return nil (keywords don't have namespaces yet)
-        (ref.null none))))
+        ;; Keyword -> extract namespace from full name
+        (if (result anyref) (i32.eq (call $type_tag (local.get $val)) (i32.const 2))
+          (then (call $extract_ns (call $kw_name_lookup (struct.get $Keyword $id (ref.cast (ref $Keyword) (local.get $val))))))
+          (else (ref.null none))))))
 
   ;; symbol: construct a symbol from a string, keyword, or symbol (1-arg)
   (func $symbol (param $arg anyref) (result anyref)
@@ -5893,6 +6663,14 @@
                   (global.get $__kw_runtime_list)))
     (local.get $current))
 
+  ;; keyword2: construct a namespaced keyword from two strings (2-arg)
+  ;; Stub: ignores namespace, creates keyword from name only
+  (func $keyword2 (param $ns anyref) (param $name anyref) (result anyref)
+    ;; If ns is nil, just use name
+    (if (result anyref) (ref.is_null (local.get $ns))
+      (then (call $keyword (local.get $name)))
+      (else (call $keyword (local.get $name)))))
+
   ;; Boolean constants (singleton instances)
   (global $__true (ref $Boolean) (struct.new $Boolean (i32.const 14) (i32.const 1)))
   (global $__false (ref $Boolean) (struct.new $Boolean (i32.const 14) (i32.const 0)))
@@ -5915,20 +6693,23 @@
       (then (global.get $__false))
       (else
         (local.set $tag (call $type_tag (local.get $coll)))
-        (if (result anyref) (i32.eq (local.get $tag) (i32.const 8))
+        (if (result anyref) (i32.or (i32.eq (local.get $tag) (i32.const 8)) (i32.eq (local.get $tag) (i32.const 19)))
           (then (call $hash_map_contains_QMARK_ (local.get $coll) (local.get $key)))
           (else
             (if (result anyref) (i32.eq (local.get $tag) (i32.const 9))
               (then (call $set_contains_QMARK_ (local.get $coll) (local.get $key)))
               (else
-                ;; Vector - check if index is in bounds
+                ;; Vector - check if index is in bounds (key must be i31 integer)
                 (if (result anyref) (ref.test (ref $Vector) (local.get $coll))
                   (then
-                    (if (result anyref) (i32.and
-                        (i32.ge_s (i31.get_s (ref.cast (ref i31) (local.get $key))) (i32.const 0))
-                        (i32.lt_s (i31.get_s (ref.cast (ref i31) (local.get $key)))
-                                  (struct.get $Vector $count (ref.cast (ref $Vector) (local.get $coll)))))
-                      (then (global.get $__true))
+                    (if (result anyref) (ref.test (ref i31) (local.get $key))
+                      (then
+                        (if (result anyref) (i32.and
+                            (i32.ge_s (i31.get_s (ref.cast (ref i31) (local.get $key))) (i32.const 0))
+                            (i32.lt_s (i31.get_s (ref.cast (ref i31) (local.get $key)))
+                                      (struct.get $Vector $count (ref.cast (ref $Vector) (local.get $coll)))))
+                          (then (global.get $__true))
+                          (else (global.get $__false))))
                       (else (global.get $__false))))
                   (else
                     ;; TransientHashMap
@@ -5950,7 +6731,16 @@
                                 (global.get $__not_found_sentinel))
                               (then (global.get $__false))
                               (else (global.get $__true))))
-                          (else (global.get $__false))))))))))))))
+                          (else
+                            ;; Protocol fallback: user types implementing ILookup (defrecord etc.)
+                            (if (result anyref) (call $truthy (call $__satisfies_ILookup (local.get $coll)))
+                              (then
+                                (if (result anyref) (ref.eq (ref.cast eqref
+                                    (call $hash_map_get_default (local.get $coll) (local.get $key) (global.get $__not_found_sentinel)))
+                                    (global.get $__not_found_sentinel))
+                                  (then (global.get $__false))
+                                  (else (global.get $__true))))
+                              (else (global.get $__false))))))))))))))))
 
   ;; ==========================================
   ;; Polymorphic conj (vectors, lists, sets, maps, nil)
@@ -5970,20 +6760,24 @@
             (if (result anyref) (ref.test (ref $Cons) (local.get $coll))
               (then (call $cons (local.get $val) (local.get $coll)))
               (else
+                ;; VectorSeq -> prepend (like a seq/list)
+                (if (result anyref) (ref.test (ref $VectorSeq) (local.get $coll))
+                  (then (call $cons (local.get $val) (local.get $coll)))
+                  (else
                 ;; HashSet -> add element
                 (if (result anyref) (i32.eq (call $type_tag (local.get $coll)) (i32.const 9))
                   (then (call $set_conj (local.get $coll) (local.get $val)))
                   (else
-                    ;; HashMap -> assoc key-value pair (val must be a 2-element vector [k v])
-                    (if (result anyref) (i32.eq (call $type_tag (local.get $coll)) (i32.const 8))
+                    ;; HashMap/ArrayMap -> assoc key-value pair (val must be a 2-element vector [k v])
+                    (if (result anyref) (i32.or (i32.eq (call $type_tag (local.get $coll)) (i32.const 8)) (i32.eq (call $type_tag (local.get $coll)) (i32.const 19)))
                       (then (call $hash_map_assoc (local.get $coll)
                         (call $vector_nth (local.get $val) (i32.const 0))
                         (call $vector_nth (local.get $val) (i32.const 1))))
                       (else
                         ;; Protocol fallback for ICollection
-                        (if (result anyref) (i31.get_s (ref.cast (ref i31) (call $__satisfies_ICollection (local.get $coll))))
+                        (if (result anyref) (call $truthy (call $__satisfies_ICollection (local.get $coll)))
                           (then (call $__dispatch__conj (local.get $coll) (local.get $val)))
-                          (else (call $vector_conj (local.get $coll) (local.get $val)))))))))))))))
+                          (else (call $vector_conj (local.get $coll) (local.get $val)))))))))))))))))
 
   ;; ==========================================
   ;; Polymorphic comparison (int + float)
@@ -6396,8 +7190,8 @@
                             (if (result anyref) (ref.test (ref $Vector) (local.get $val))
                               (then (call $pr_str_vector (local.get $val)))
                               (else
-                                ;; HashMap -> {:k1 v1, :k2 v2}
-                                (if (result anyref) (i32.eq (call $type_tag (local.get $val)) (i32.const 8))
+                                ;; HashMap/ArrayMap -> {:k1 v1, :k2 v2}
+                                (if (result anyref) (i32.or (i32.eq (call $type_tag (local.get $val)) (i32.const 8)) (i32.eq (call $type_tag (local.get $val)) (i32.const 19)))
                                   (then (call $pr_str_map (local.get $val)))
                                   (else
                                     ;; HashSet -> #{elem1 elem2}
@@ -6416,8 +7210,12 @@
                                                 (if (result anyref) (ref.test (ref $LazySeq) (local.get $val))
                                                   (then (call $pr_str_list (call $seq (local.get $val))))
                                                   (else
-                                                    ;; Unknown -> nil placeholder
-                                                    (call $pr_str_literal_nil))))))))))))))))))))))))))
+                                                    ;; VectorSeq -> print as list
+                                                    (if (result anyref) (ref.test (ref $VectorSeq) (local.get $val))
+                                                      (then (call $pr_str_vectorseq (local.get $val)))
+                                                      (else
+                                                        ;; Unknown -> nil placeholder
+                                                        (call $pr_str_literal_nil))))))))))))))))))))))))))))
 
   ;; pr_str_literal_nil: return the 3-char string nil
   (func $pr_str_literal_nil (result anyref)
@@ -6548,6 +7346,32 @@
         (local.set $result (call $str_concat (local.get $result)
           (call $pr_str1 (struct.get $Cons $first (ref.cast (ref $Cons) (local.get $current))))))
         (local.set $current (struct.get $Cons $rest (ref.cast (ref $Cons) (local.get $current))))
+        (br $loop)))
+    ;; Close with paren
+    (call $str_concat (local.get $result) (call $pr_str_char (i32.const 41))))
+
+  ;; pr_str_vectorseq: format VectorSeq as (elem1 elem2 ...)
+  (func $pr_str_vectorseq (param $vs anyref) (result anyref)
+    (local $result anyref)
+    (local $vseq (ref $VectorSeq))
+    (local $vec anyref)
+    (local $i i32)
+    (local $count i32)
+    (local.set $vseq (ref.cast (ref $VectorSeq) (local.get $vs)))
+    (local.set $vec (struct.get $VectorSeq $vec (local.get $vseq)))
+    (local.set $i (struct.get $VectorSeq $offset (local.get $vseq)))
+    (local.set $count (call $vector_count (local.get $vec)))
+    (local.set $result (call $pr_str_char (i32.const 40)))  ;; '('
+    (block $done
+      (loop $loop
+        (br_if $done (i32.ge_s (local.get $i) (local.get $count)))
+        ;; Add space separator (not before first)
+        (if (i32.gt_s (local.get $i) (struct.get $VectorSeq $offset (local.get $vseq)))
+          (then (local.set $result (call $str_concat (local.get $result) (call $pr_str_char (i32.const 32))))))
+        ;; Add pr-str of element
+        (local.set $result (call $str_concat (local.get $result)
+          (call $pr_str1 (call $vector_nth (local.get $vec) (local.get $i)))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
         (br $loop)))
     ;; Close with paren
     (call $str_concat (local.get $result) (call $pr_str_char (i32.const 41))))
@@ -6763,13 +7587,13 @@
                                             'dissoc 2, 'disj 2, 'set-conj 2,
                                             'assoc 3, 'assoc-map 3,
                                             'reduce 3, 'reduce-kv 3, 'reduced 1, 'reduced? 1,
-                                            'make-lazy-seq 1, 'lazy-seq? 1,
-                                            'str1 1, 'str-concat 2, 'name 1, 'subs 3, 'string->mem! 2, 'pr-str1 1, 'char 1,
-                                            'keyword 1,
+                                            'make-lazy-seq 1, 'lazy-seq? 1, 'lazy-seq-realized? 1,
+                                            'str1 1, 'str-concat 2, 'name 1, 'subs 3, 'string->mem! 2, 'mem->string 2, 'pr-str1 1, 'char 1,
+                                            'keyword 1, 'keyword2 2,
                                          ;; Float operations
-                                            'to-float 1, 'math-floor 1, 'math-ceil 1, 'math-sqrt 1,
+                                            'to-float 1, 'to-int 1, 'math-floor 1, 'math-ceil 1, 'math-sqrt 1,
                                             'math-abs 1, 'math-round 1,
-                                            'empty-vector 0, 'empty-hash-map 0,
+                                            'empty-vector 0, 'empty-hash-map 0, 'make-array-map 2,
                                          ;; Bit operations
                                             'bit-and 2, 'bit-or 2, 'bit-xor 2, 'bit-not 1,
                                             'bit-shift-left 2, 'bit-shift-right 2,
@@ -6804,17 +7628,35 @@
           proto-impl-closures (when (seq *protocol-impls*)
                                 (generate-protocol-impl-closures *protocol-impls*))
         ;; Generate dispatch functions for each protocol method
+        ;; For multi-arity methods, generate one dispatch per arity
           proto-dispatch-funcs (when (seq *protocol-methods*)
-                                 (for [[method-name {:keys [arity]}] *protocol-methods*
-                                       :let [method-impls (filter (fn [[[_ m] _]] (= m method-name)) *protocol-impls*)]]
-                                   (when (seq method-impls)
-                                     (generate-dispatch-function method-name arity method-impls))))
+                                 (mapcat
+                                  (fn [[method-name {:keys [arity arities]}]]
+                                    (if (and arities (> (count arities) 1))
+                                      ;; Multi-arity: generate dispatch per arity
+                                      (for [[a _] arities
+                                            :let [;; Multi-arity impls use [type-tag method arity] key
+                                                  method-impls (filter (fn [[[_ m ar] _]]
+                                                                        (and (= m method-name) (= ar a)))
+                                                                       *protocol-impls*)
+                                                  ;; Rekey to [type-tag method] for generate-dispatch-function
+                                                  rekeyed (map (fn [[[tt m _a] v]] [[tt m] v]) method-impls)]]
+                                        (when (seq rekeyed)
+                                          (generate-dispatch-function
+                                           (symbol (str (name method-name) "_arity_" a)) a rekeyed)))
+                                      ;; Single-arity: original behavior
+                                      (let [method-impls (filter (fn [[[_ m & _] _]] (= m method-name)) *protocol-impls*)]
+                                        (when (seq method-impls)
+                                          [(generate-dispatch-function method-name arity method-impls)]))))
+                                  *protocol-methods*))
         ;; Generate satisfies? predicates for each protocol
           proto-satisfies-funcs (when (seq *protocols*)
                                   (for [[proto-name _] *protocols*
                                         :let [;; Get all impls for methods of this protocol
                                               proto-methods (set (map :name (:methods (get *protocols* proto-name))))
-                                              proto-impls (filter (fn [[[_ m] _]] (contains? proto-methods m)) *protocol-impls*)]]
+                                              proto-impls (filter (fn [[k _]]
+                                                                       (contains? proto-methods (nth k 1)))
+                                                                     *protocol-impls*)]]
                                     (generate-satisfies-function proto-name proto-impls)))
         ;; Generate stubs for core protocol methods/satisfies if not already defined
         ;; These are needed because the WAT prelude references them unconditionally
@@ -6838,7 +7680,7 @@
                                   (let [munged (munge-name proto-name)
                                         fn-name (str "$__satisfies_" munged)]
                                     (str "(func " fn-name " (param $val anyref) (result anyref)\n"
-                                         "    (ref.i31 (i32.const 0)))")))]
+                                         "    (global.get $__false))")))]
             (concat (distinct dispatch-stubs) (distinct satisfies-stubs)))
           prelude (emit-prelude)
         ;; Add builtin and fn wrapper globals
@@ -6872,7 +7714,9 @@
           kw-name-init-code (when (pos? kw-count)
                               (let [kw-init-lines
                                     (for [[kw id] kw-entries]
-                                      (let [kw-name (name kw)
+                                      (let [kw-name (if (namespace kw)
+                                                      (str (namespace kw) "/" (name kw))
+                                                      (name kw))
                                             bytes (map int (.getBytes ^String kw-name "UTF-8"))
                                             len (count bytes)]
                                         (str "(func $__init_kw_name_" id " (result anyref)\n"
@@ -6921,7 +7765,12 @@
                             {:funcs sym-init-fns
                              :init-code (for [[_ id] sym-entries]
                                           (str "(global.set $__sym_" id " (call $__init_sym_" id "))"))}))
-          all-globals (concat *globals-emit* builtin-globals fn-globals proto-globals string-globals sym-globals)
+        ;; Extract dispatch table info from protocol dispatch maps
+          proto-dispatch-infos (filter some? proto-dispatch-funcs)
+          dispatch-table-globals (when (seq proto-dispatch-infos)
+                                   (map :table-global-decl proto-dispatch-infos))
+          all-globals (concat *globals-emit* builtin-globals fn-globals proto-globals
+                              dispatch-table-globals string-globals sym-globals)
           globals-section (str-join "\n  " all-globals)
         ;; Add builtin and fn wrapper functions
           builtin-funcs (when (seq builtin-wrappers)
@@ -6965,7 +7814,7 @@
     (call $__repl_print_str (local.get $str))
     (ref.null none))"]
           all-functions (concat *functions* builtin-funcs fn-funcs
-                                (filter some? proto-dispatch-funcs)
+                                (map :func-def proto-dispatch-infos)
                                 (filter some? proto-satisfies-funcs)
                                 (filter some? core-proto-stubs)
                                 string-init-fns
@@ -7001,11 +7850,15 @@
         ;; Generate initialization code for protocol impl closures
           proto-init-code (when (seq proto-impl-closures)
                             (map :init-code proto-impl-closures))
+        ;; Generate dispatch table init code (must come after proto-init-code since tables reference closures)
+          dispatch-table-init-code (when (seq proto-dispatch-infos)
+                                     (mapcat :table-init-code proto-dispatch-infos))
         ;; Add drop after each init expression since they return values but $start doesn't
           init-with-drops (map (fn [code] (str code "\n    drop")) init-code)
-        ;; Combine builtin init, fn init, proto init, string init, kw name init (no drops needed) with user init
+        ;; Combine builtin init, fn init, proto init, dispatch table init, string init, kw name init (no drops needed) with user init
           all-init (concat
                     builtin-init-code fn-init-code proto-init-code
+                    dispatch-table-init-code
                     string-init-code
                     (:init-code kw-name-init-code)
                     (:init-code sym-init-code)

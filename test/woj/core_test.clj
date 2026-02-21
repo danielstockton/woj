@@ -440,6 +440,17 @@
     (assert (str-contains? result "i32.mul"))
     (println "  PASS: thread-first compiles")))
 
+(defn test-compile-closure-in-thread []
+  (println "Testing compile-closure-in-thread...")
+  ;; (-> x (#(reduce f % coll))) expands to (#(reduce f % coll) x)
+  ;; The anonymous fn captures 'coll' from the outer scope, making it a closure.
+  ;; The closure's $__tmp_env local must be declared in the enclosing function.
+  (let [source "(defn process [s added removed] (-> s (into added) (#(reduce disj % removed))))"
+        result (main/compile-string source)]
+    (assert (str-contains? result "func $process") "Should have process function")
+    (assert (str-contains? result "__tmp_env") "Should declare __tmp_env for closure env")
+    (println "  PASS: closure in thread-first compiles")))
+
 (defn test-compile-variadic-assoc []
   (println "Testing compile-variadic-assoc...")
   (let [source "(defn multi-assoc [m] (assoc m :a 1 :b 2))"
@@ -448,6 +459,21 @@
     ;; Should have two hash_map_assoc calls (nested)
     (assert (str-contains? result "hash_map_assoc"))
     (println "  PASS: variadic assoc compiles")))
+
+(defn test-compile-lazy-seq-iteration []
+  (println "Testing compile-lazy-seq-iteration...")
+  ;; Verify that every?, some, and doseq compile correctly with lazy seqs.
+  ;; These use seq(rest(...)) to properly terminate on lazy seq tails
+  ;; instead of raw rest(...) which would produce a phantom nil element.
+  (let [source "(defn test-lazy []
+                  (let [xs (map inc [1 2 3])]
+                    (every? number? xs)))
+                (defn test-doseq [xs]
+                  (doseq [x xs] (println x)))"
+        result (main/compile-string source)]
+    (assert (str-contains? result "func $test_lazy") "Should have test-lazy function")
+    (assert (str-contains? result "func $test_doseq") "Should have test-doseq function")
+    (println "  PASS: lazy seq iteration compiles")))
 
 ;; ============================================
 ;; Test runner
@@ -505,7 +531,9 @@
   (test-compile-closure)
   (test-compile-recursive-fn)
   (test-compile-thread-first)
+  (test-compile-closure-in-thread)
   (test-compile-variadic-assoc)
+  (test-compile-lazy-seq-iteration)
   (println "")
 
   (println "=== All tests passed! ==="))
