@@ -7,6 +7,8 @@
             [clojure.tools.reader :as reader]
             [clojure.tools.reader.reader-types :as reader-types]))
 
+(def ^:dynamic *quiet* false)
+
 ;; ============================================
 ;; Reader
 ;; ============================================
@@ -224,11 +226,12 @@
                                  (contains? reachable (:name a))))
                            core-asts)
         shaken-count (- (count core-asts) (count kept-core))]
-    (binding [*out* *err*]
-      (when (pos? shaken-count)
-        (println (str "[tree-shaker] Removed " shaken-count " unused core definitions"
-                      " (kept " (count (filter #(= :def (:op %)) kept-core)) " of "
-                      (count (filter #(= :def (:op %)) core-asts)) ")"))))
+    (when-not *quiet*
+      (binding [*out* *err*]
+        (when (pos? shaken-count)
+          (println (str "[tree-shaker] Removed " shaken-count " unused core definitions"
+                        " (kept " (count (filter #(= :def (:op %)) kept-core)) " of "
+                        (count (filter #(= :def (:op %)) core-asts)) ")")))))
     (into [] (concat ns-asts kept-core user-asts))))
 
 ;; ============================================
@@ -248,56 +251,57 @@
   ([source include-core?] (compile-string source include-core? false))
   ([source include-core? repl-mode?] (compile-string source include-core? repl-mode? []))
   ([source include-core? repl-mode? search-paths]
-   (let [;; Read core/lib forms separately from user forms for tree-shaking
-         core-source (if include-core?
-                       (str (or (load-core-lib) "") "\n"
-                            (or (load-edn-lib) "") "\n"
-                            (or (load-regex-lib) "") "\n")
-                       "")
-         core-forms (if include-core? (read-all core-source) [])
-         user-forms (read-all source)
-         core-form-count (count core-forms)
-         forms (into core-forms user-forms)
-         ;; Don't filter defmacro forms - they need to be analyzed to register macros
-         analysis-result (binding [analyzer/*ns-load-fn* (when (seq search-paths)
-                                                           (make-ns-load-fn search-paths))
-                                   analyzer/*ns-read-fn* (when (seq search-paths)
-                                                           read-all)]
-                           (analyzer/analyze-forms forms))
-         ast (:ast analysis-result)
-         ;; Tree-shake unused core definitions
-         ns-ast-count (- (count ast) (count forms))
-         ast (if (and include-core? (pos? core-form-count))
-               (tree-shake ast ns-ast-count core-form-count)
-               ast)
-         keywords (:keywords analysis-result)
-         strings (:strings analysis-result)
-         callable-globals (:callable-globals analysis-result)
-         direct-fn-globals (:direct-fn-globals analysis-result)
-         builtin-refs (:builtin-refs analysis-result)
-         symbols (:symbols analysis-result)
-         user-types (:user-types analysis-result)]
-     (binding [emitter/*functions* []
-               emitter/*globals-emit* []
-               emitter/*globals-declared* #{}
-               emitter/*fn-counter* 0
-               emitter/*loop-counter* 0
-               emitter/*loop-context* nil
-               emitter/*keywords* keywords
-               emitter/*internal-fn-names* {}
-               emitter/*closure-env-param* nil
-               emitter/*capture-indices* nil
-               emitter/*callable-globals* callable-globals
-               emitter/*direct-fn-globals* direct-fn-globals
-               emitter/*fn-refs* #{}
-               emitter/*closure-funcs* []
-               emitter/*builtin-refs* builtin-refs
-               emitter/*emitted-fn-names* #{}
-               emitter/*strings* strings
-               emitter/*symbols* (or symbols {})
-               emitter/*repl-mode* repl-mode?
-               emitter/*user-types* (or user-types {})]
-       (emitter/emit-module ast)))))
+   (binding [*quiet* repl-mode?]
+     (let [;; Read core/lib forms separately from user forms for tree-shaking
+           core-source (if include-core?
+                         (str (or (load-core-lib) "") "\n"
+                              (or (load-edn-lib) "") "\n"
+                              (or (load-regex-lib) "") "\n")
+                         "")
+           core-forms (if include-core? (read-all core-source) [])
+           user-forms (read-all source)
+           core-form-count (count core-forms)
+           forms (into core-forms user-forms)
+           ;; Don't filter defmacro forms - they need to be analyzed to register macros
+           analysis-result (binding [analyzer/*ns-load-fn* (when (seq search-paths)
+                                                             (make-ns-load-fn search-paths))
+                                     analyzer/*ns-read-fn* (when (seq search-paths)
+                                                             read-all)]
+                             (analyzer/analyze-forms forms))
+           ast (:ast analysis-result)
+           ;; Tree-shake unused core definitions
+           ns-ast-count (- (count ast) (count forms))
+           ast (if (and include-core? (pos? core-form-count))
+                 (tree-shake ast ns-ast-count core-form-count)
+                 ast)
+           keywords (:keywords analysis-result)
+           strings (:strings analysis-result)
+           callable-globals (:callable-globals analysis-result)
+           direct-fn-globals (:direct-fn-globals analysis-result)
+           builtin-refs (:builtin-refs analysis-result)
+           symbols (:symbols analysis-result)
+           user-types (:user-types analysis-result)]
+       (binding [emitter/*functions* []
+                 emitter/*globals-emit* []
+                 emitter/*globals-declared* #{}
+                 emitter/*fn-counter* 0
+                 emitter/*loop-counter* 0
+                 emitter/*loop-context* nil
+                 emitter/*keywords* keywords
+                 emitter/*internal-fn-names* {}
+                 emitter/*closure-env-param* nil
+                 emitter/*capture-indices* nil
+                 emitter/*callable-globals* callable-globals
+                 emitter/*direct-fn-globals* direct-fn-globals
+                 emitter/*fn-refs* #{}
+                 emitter/*closure-funcs* []
+                 emitter/*builtin-refs* builtin-refs
+                 emitter/*emitted-fn-names* #{}
+                 emitter/*strings* strings
+                 emitter/*symbols* (or symbols {})
+                 emitter/*repl-mode* repl-mode?
+                 emitter/*user-types* (or user-types {})]
+         (emitter/emit-module ast))))))
 
 (defn- woj-lib-path []
   (try

@@ -1,5 +1,8 @@
 (ns woj.core-test
-  "Tests for the woj compiler."
+  "JVM tests for the woj compiler. Run with `clj -M:test`.
+   These test the compiler's own functions (analyzer, emitter, util) on the JVM.
+   NOT a woj source file — do not compile with woj.
+   For woj-compiled tests, see test/clojure-test-suite/."
   (:require [woj.analyzer :as analyzer]
             [woj.emitter :as emitter]
             [woj.main :as main]

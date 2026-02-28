@@ -1334,15 +1334,15 @@
 ;; namespace: get namespace of symbol (builtin)
 ;; namespace is a builtin - no need for a function definition
 
-;; simple-ident?/simple-keyword?/simple-symbol?: stubs
-(defn simple-ident? [x] false)
-(defn simple-keyword? [x] (keyword? x))
-(defn simple-symbol? [x] (symbol? x))
+;; simple-ident?/simple-keyword?/simple-symbol?
+(defn simple-keyword? [x] (and (keyword? x) (nil? (namespace x))))
+(defn simple-symbol? [x] (and (symbol? x) (nil? (namespace x))))
+(defn simple-ident? [x] (or (simple-keyword? x) (simple-symbol? x)))
 
-;; qualified-ident?/qualified-keyword?/qualified-symbol?: stubs
-(defn qualified-ident? [x] false)
-(defn qualified-keyword? [x] false)
-(defn qualified-symbol? [x] false)
+;; qualified-ident?/qualified-keyword?/qualified-symbol?
+(defn qualified-keyword? [x] (and (keyword? x) (some? (namespace x))))
+(defn qualified-symbol? [x] (and (symbol? x) (some? (namespace x))))
+(defn qualified-ident? [x] (or (qualified-keyword? x) (qualified-symbol? x)))
 
 ;; ident?: check if keyword or symbol
 (defn ident? [x] (or (keyword? x) (symbol? x)))
@@ -1659,7 +1659,7 @@
     `(do ~@body nil)
     (let [first-elem (first bindings)]
       (cond
-        ;; :when filter
+        ;; :when filter — skip this iteration if pred is false, but continue loop
         (= first-elem :when)
         (let [pred (second bindings)
               rest-bindings (drop 2 bindings)]
@@ -1673,12 +1673,15 @@
           `(let ~let-bindings
              (doseq ~(vec rest-bindings) ~@body)))
 
-        ;; :while for early termination (simplified - just filters)
+        ;; :while for early termination — stop the enclosing loop entirely when false
+        ;; We set a sentinel that the loop checks before recurring
         (= first-elem :while)
         (let [pred (second bindings)
-              rest-bindings (drop 2 bindings)]
-          `(when ~pred
-             (doseq ~(vec rest-bindings) ~@body)))
+              rest-bindings (drop 2 bindings)
+              done (gensym "done__")]
+          `(if ~pred
+             (doseq ~(vec rest-bindings) ~@body)
+             :doseq-while-stop))
 
         ;; Regular binding pair
         :else
@@ -1686,11 +1689,22 @@
               coll (second bindings)
               rest-bindings (drop 2 bindings)
               remaining (gensym "remaining__")]
-          `(loop [~remaining (seq ~coll)]
-             (when ~remaining
-               (let [~binding (first ~remaining)]
-                 (doseq ~(vec rest-bindings) ~@body)
-                 (recur (next ~remaining))))))))))
+          ;; Check if any :while appears in rest-bindings — if so, we need to
+          ;; check its result to decide whether to continue recurring
+          (if (some #{:while} rest-bindings)
+            (let [result (gensym "result__")]
+              `(loop [~remaining (seq ~coll)]
+                 (when ~remaining
+                   (let [~binding (first ~remaining)
+                         ~result (doseq ~(vec rest-bindings) ~@body)]
+                     (when (not= ~result :doseq-while-stop)
+                       (recur (next ~remaining)))))))
+            `(loop [~remaining (seq ~coll)]
+               (when ~remaining
+                 (let [~binding (first ~remaining)]
+                   (doseq ~(vec rest-bindings) ~@body)
+                   (recur (next ~remaining)))))))))))
+
 
 ;; for: list comprehension (supports multiple bindings, :let, :when, :while)
 (defmacro for [bindings body]

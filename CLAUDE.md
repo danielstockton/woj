@@ -61,13 +61,14 @@ clj -M:run --path test/clojure-test-suite/test examples/multi_file.clj > output.
 # Compiler unit tests
 clj -M:test
 
-# Clojure compatibility test suite (individual test files)
-clj -M:run --path test/clojure-test-suite/test \
-  test/clojure-test-suite/test/clojure/core_test/<file>.cljc > /tmp/test.wat 2>/dev/null && \
-  wasmtime -W gc=y -W function-references=y -W exceptions=y --invoke test-<name> /tmp/test.wat
-# Invoke the deftest function name (e.g., --invoke test-eq for eq.cljc)
-# Output: 0 = all tests pass, >0 = failure count
-# Note: run-tests is a no-op stub (always returns 0) — use the deftest name instead
+# Clojure compatibility test suite (all 216 tests, ~10s)
+./test/run-compat-tests.sh
+
+# Run specific compat tests by name
+./test/run-compat-tests.sh first eq empty_qmark
+
+# List all compat tests
+./test/run-compat-tests.sh --list
 ```
 
 ### Full Pipeline (with WasmGC)

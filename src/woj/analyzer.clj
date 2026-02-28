@@ -1847,7 +1847,21 @@
                      {:op :builtin :name fn-expr}
                      (symbol? fn-expr)
                      (analyze-symbol fn-expr)
-                     :else (analyze fn-expr))]
+                     :else (analyze fn-expr))
+            call-arity (count args)]
+        ;; Compile-time arity check for known functions
+        (when (= :fn-global (:op fn-ast))
+          (let [{:keys [arities variadic? min-arity variadic-arity]} (:fn-info fn-ast)]
+            (when (and (some? arities) (not (empty? arities)) (not variadic?))
+              ;; Fixed-arity only: call arity must be in the set
+              (when-not (contains? arities call-arity)
+                (throw-error (str "Wrong number of args (" call-arity ") passed to " fn-expr) form)))
+            (when variadic?
+              ;; Variadic: call arity must be >= (variadic-arity - 1) or in fixed arities
+              (let [var-min (if variadic-arity (dec variadic-arity) 0)]
+                (when-not (or (contains? arities call-arity)
+                              (>= call-arity var-min))
+                  (throw-error (str "Wrong number of args (" call-arity ") passed to " fn-expr) form))))))
         (annotate-num-type
           {:op :call :fn fn-ast :args (into [] (map analyze args))})))))
 

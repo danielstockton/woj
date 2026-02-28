@@ -7863,8 +7863,12 @@
                     (:init-code kw-name-init-code)
                     (:init-code sym-init-code)
                     init-with-drops)
+          ;; Collect locals from top-level user code (let bindings, loops, etc.)
+          start-locals (distinct (mapcat collect-locals ast-forms))
           start-fn (if (seq all-init)
-                     (str "\n\n  ;; Initialization\n  (func $start\n    " (str-join "\n    " all-init) ")\n  (start $start)")
+                     (str "\n\n  ;; Initialization\n  (func $start"
+                          (if (seq start-locals) (str "\n    " (str-join "\n    " start-locals)) "")
+                          "\n    " (str-join "\n    " all-init) ")\n  (start $start)")
                      "")]
       (str prelude
            (if (seq all-globals) (str "\n\n  ;; Globals\n  " globals-section) "")
