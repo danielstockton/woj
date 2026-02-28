@@ -1,5 +1,7 @@
 (ns woj.emitter
   (:require [woj.util :refer [munge-name str-join]]
+            [woj.wasm :as w]
+            [woj.optimize :as opt]
             [clojure.string :as string]))
 
 ;; ============================================
@@ -25,6 +27,8 @@
 (def ^:dynamic *strings* {})  ;; string -> id mapping for interning (from analyzer)
 (def ^:dynamic *symbols* {})  ;; symbol -> id mapping for interning (from analyzer)
 (def ^:dynamic *repl-mode* false)  ;; when true, __repl_eval returns (i32 i32) type tag + value
+(def ^:dynamic *host-imports* [])  ;; vec of {:module :name :func-name :arity} for host imports
+(def ^:dynamic *host-import-fns* #{})  ;; set of munged function names that are host imports
 
 ;; Protocol support
 (def ^:dynamic *protocols* {})  ;; protocol-name -> {:methods [...]}
@@ -33,7 +37,13 @@
 (def ^:dynamic *protocol-dispatch-tables* {})  ;; method-name -> global array name
 
 ;; User-defined types from deftype/defrecord
-(def ^:dynamic *user-types* {})  ;; type-name -> {:tag N, :fields [...], :kind :deftype/:defrecord}
+(def ^:dynamic *user-types* {})
+
+;; Forward declarations
+(declare emit emit-str)
+
+;; Tail call optimization
+(def ^:dynamic *tail-position* false)  ;; true when emitting code in tail position of a function  ;; type-name -> {:tag N, :fields [...], :kind :deftype/:defrecord}
 
 ;; Max type tag for dispatch table size (nil=0 through VectorSeq=18, plus 1 for default)
 ;; Computed dynamically when user types are present
@@ -138,10 +148,12 @@
           _ (set! *loop-counter* (inc *loop-counter*))
           loop-label (str "$fn_recur" counter)
           body-code (binding [*loop-context* {:loop-label loop-label
-                                              :loop-bindings params}]
-                      (emit body))]
+                                              :loop-bindings params}
+                              *tail-position* false]
+                      (emit-str body))]
       (str "(loop " loop-label " (result anyref)\n      " body-code ")"))
-    (emit body)))
+    (binding [*tail-position* true]
+      (emit-str body))))
 
 (defn- emit-function
   "Emit a WAT function definition. Returns the function name.
@@ -278,7 +290,7 @@
 (def lazy-seq-builtins #{'make-lazy-seq 'lazy-seq? 'lazy-seq-realized?})
 
 ;; String builtins
-(def string-builtins #{'str1 'str-concat 'name 'subs 'string->mem! 'mem->string 'pr-str1 'char})
+(def string-builtins #{'str1 'str-concat 'name 'subs 'string->mem! 'mem->string 'pr-str1 'char 'str-hash})
 
 ;; Float operation builtins
 (def float-op-builtins #{'to-float 'to-int 'math-floor 'math-ceil 'math-sqrt 'math-abs 'math-round})
@@ -319,18 +331,18 @@
 
 ;; Helper to unbox anyref to i32 (assumes i31ref)
 (defn- emit-unbox [code]
-  (str "(i31.get_s (ref.cast (ref i31) " code "))"))
+  [:i31.get_s [:ref.cast [:ref :i31] code]])
 
 ;; Helper to box i32 to anyref (via i31ref)
 (defn- emit-box [code]
-  (str "(ref.i31 " code ")"))
+  [:ref.i31 code])
 
 ;; Helper to emit a boolean result from an i32 expression
 ;; Returns $Boolean struct (global $__true or $__false)
 (defn- emit-bool [i32-code]
-  (str "(if (result anyref) " i32-code
-       " (then (global.get $__true))"
-       " (else (global.get $__false)))"))
+  [:if [:result :anyref] i32-code
+   [:then [:global.get "$__true"]]
+   [:else [:global.get "$__false"]]])
 
 ;; Emit raw i32 value from an AST node known to have :num-type :i32
 ;; This avoids box/unbox overhead for typed integer operations.
@@ -339,7 +351,7 @@
   (cond
     ;; Integer constant: just the raw i32
     (and (= (:op ast) :const) (= (:type ast) :int))
-    (str "(i32.const " (:val ast) ")")
+    [:i32.const (:val ast)]
 
     ;; Typed arithmetic call: emit the i32 operation directly (no boxing)
     (and (= (:op ast) :call) (= :i32 (:num-type ast)))
@@ -347,18 +359,32 @@
           args (:args ast)]
       (case fn-name
         (+ - * /)
-        (let [wasm-op (case fn-name + "i32.add" - "i32.sub" * "i32.mul" / "i32.div_s")
+        (let [wasm-op (case fn-name + :i32.add - :i32.sub * :i32.mul / :i32.div_s)
               a (emit-i32-raw (first args))
               b (emit-i32-raw (second args))]
-          (str "(" wasm-op " " a " " b ")"))
-        inc (str "(i32.add " (emit-i32-raw (first args)) " (i32.const 1))")
-        dec (str "(i32.sub " (emit-i32-raw (first args)) " (i32.const 1))")
+          [wasm-op a b])
+        inc [:i32.add (emit-i32-raw (first args)) [:i32.const 1]]
+        dec [:i32.sub (emit-i32-raw (first args)) [:i32.const 1]]
         ;; fallback: emit normally and unbox
         (emit-unbox (emit ast))))
 
     ;; Local with known i32 type: unbox from i31ref
     (and (= (:op ast) :local) (= :i32 (:num-type ast)))
-    (str "(i31.get_s (ref.cast (ref i31) (local.get $" (munge-name (:name ast)) ")))")
+    [:i31.get_s [:ref.cast [:ref :i31] [:local.get (str "$" (munge-name (:name ast)))]]]
+
+    ;; if with i32 result: emit both branches as i32 directly
+    (and (= (:op ast) :if) (= :i32 (:num-type ast)))
+    [:if [:result :i32] [:call "$truthy" (emit (:test ast))]
+     [:then (emit-i32-raw (:then ast))]
+     [:else (emit-i32-raw (:else ast))]]
+
+    ;; do with i32 result: emit normally but unbox the final result
+    (and (= (:op ast) :do) (= :i32 (:num-type ast)))
+    (emit-unbox (emit ast))
+
+    ;; let with i32 result: emit normally but unbox the final result
+    (and (= (:op ast) :let) (= :i32 (:num-type ast)))
+    (emit-unbox (emit ast))
 
     ;; Fallback: emit normally and unbox
     :else
@@ -371,43 +397,36 @@
     (case fn-name
       ;; = and not= use $eq which already returns i32
       = (if (every? #(= :i32 (:num-type %)) args)
-          ;; Optimized: direct i32 equality
-          (str "(i32.eq " (emit-i32-raw (first args)) " " (emit-i32-raw (second args)) ")")
-          (str "(call $eq " (emit (first args)) " " (emit (second args)) ")"))
+          [:i32.eq (emit-i32-raw (first args)) (emit-i32-raw (second args))]
+          [:call "$eq" (emit (first args)) (emit (second args))])
       not= (if (every? #(= :i32 (:num-type %)) args)
-             (str "(i32.ne " (emit-i32-raw (first args)) " " (emit-i32-raw (second args)) ")")
-             (str "(i32.eqz (call $eq " (emit (first args)) " " (emit (second args)) "))"))
+             [:i32.ne (emit-i32-raw (first args)) (emit-i32-raw (second args))]
+             [:i32.eqz [:call "$eq" (emit (first args)) (emit (second args))]])
       ;; All others return $Boolean - extract the val field directly
       (< > <= >=)
       (if (every? #(= :i32 (:num-type %)) args)
-        ;; Optimized: direct i32 comparison
-        (let [wasm-op (case fn-name < "i32.lt_s" > "i32.gt_s" <= "i32.le_s" >= "i32.ge_s")]
-          (str "(" wasm-op " " (emit-i32-raw (first args)) " " (emit-i32-raw (second args)) ")"))
+        (let [wasm-op (case fn-name < :i32.lt_s > :i32.gt_s <= :i32.le_s >= :i32.ge_s)]
+          [wasm-op (emit-i32-raw (first args)) (emit-i32-raw (second args))])
         (let [a (emit (first args))
-              b (emit (second args))]
-          (str "(struct.get $Boolean $val (ref.cast (ref $Boolean) (call $cmp_"
-               (case fn-name < "lt" > "gt" <= "le" >= "ge")
-               " " a " " b ")))")))
+              b (emit (second args))
+              cmp-fn (str "$cmp_" (case fn-name < "lt" > "gt" <= "le" >= "ge"))]
+          [:struct.get "$Boolean" "$val" [:ref.cast [:ref "$Boolean"] [:call cmp-fn a b]]]))
       neg?
       (if (= :i32 (:num-type (first args)))
-        (str "(i32.lt_s " (emit-i32-raw (first args)) " (i32.const 0))")
-        (str "(struct.get $Boolean $val (ref.cast (ref $Boolean) (call $cmp_lt "
-             (emit (first args)) " (ref.i31 (i32.const 0)))))"))
+        [:i32.lt_s (emit-i32-raw (first args)) [:i32.const 0]]
+        [:struct.get "$Boolean" "$val" [:ref.cast [:ref "$Boolean"] [:call "$cmp_lt" (emit (first args)) [:ref.i31 [:i32.const 0]]]]])
       pos?
       (if (= :i32 (:num-type (first args)))
-        (str "(i32.gt_s " (emit-i32-raw (first args)) " (i32.const 0))")
-        (str "(struct.get $Boolean $val (ref.cast (ref $Boolean) (call $cmp_gt "
-             (emit (first args)) " (ref.i31 (i32.const 0)))))"))
+        [:i32.gt_s (emit-i32-raw (first args)) [:i32.const 0]]
+        [:struct.get "$Boolean" "$val" [:ref.cast [:ref "$Boolean"] [:call "$cmp_gt" (emit (first args)) [:ref.i31 [:i32.const 0]]]]])
       zero?
       (if (= :i32 (:num-type (first args)))
-        (str "(i32.eqz " (emit-i32-raw (first args)) ")")
-        (str "(struct.get $Boolean $val (ref.cast (ref $Boolean) (call $zero_QMARK_ "
-             (emit (first args)) ")))"))
+        [:i32.eqz (emit-i32-raw (first args))]
+        [:struct.get "$Boolean" "$val" [:ref.cast [:ref "$Boolean"] [:call "$zero_QMARK_" (emit (first args))]]])
       NaN?
-      (str "(struct.get $Boolean $val (ref.cast (ref $Boolean) (call $is_nan "
-           (emit (first args)) ")))")
+      [:struct.get "$Boolean" "$val" [:ref.cast [:ref "$Boolean"] [:call "$is_nan" (emit (first args))]]]
       ;; Fallback - shouldn't happen but just in case
-      (str "(call $truthy " (emit ast) ")"))))
+      [:call "$truthy" (emit ast)])))
 
 ;; Check if an AST node is a call to a comparison builtin
 (defn- comparison-call? [ast]
@@ -421,7 +440,7 @@
   "Emit code and check truthiness for conditionals that need i32"
   (if (comparison-call? ast)
     (emit-comparison-as-i32 ast)
-    (str "(call $truthy " (emit ast) ")")))
+    [:call "$truthy" (emit ast)]))
 
 (defn emit [{:keys [op] :as ast}]
   (cond
@@ -432,67 +451,62 @@
              ;; i31ref can only hold 31-bit signed integers (-1073741824 to 1073741823)
              ;; Larger integers must be stored as Float (f64)
              (if (and (>= v -1073741824) (<= v 1073741823))
-               (emit-box (str "(i32.const " v ")"))
-               (str "(struct.new $Float (i32.const 5) (f64.const " (double v) "))")))
-      :bool (if (= (:val ast) 1) "(global.get $__true)" "(global.get $__false)")
-      :nil "(ref.null none)"
-      :keyword (emit-box (str "(i32.const " (:val ast) ")"))
+               (emit-box [:i32.const v])
+               [:struct.new "$Float" [:i32.const 5] [:f64.const (double v)]]))
+      :bool (if (= (:val ast) 1) [:global.get "$__true"] [:global.get "$__false"])
+      :nil [:ref.null :none]
+      :keyword (emit-box [:i32.const (:val ast)])
       ;; Fallback for old-style consts without type
-      (emit-box (str "(i32.const " (:val ast) ")")))
+      (emit-box [:i32.const (:val ast)]))
 
-    (= op :nil) "(ref.null none)"
+    (= op :nil) [:ref.null :none]
     ;; Keywords are struct references with unique IDs
-    (= op :keyword) (str "(struct.new $Keyword (i32.const 2) (i32.const " (:id ast) "))")
+    (= op :keyword) [:struct.new "$Keyword" [:i32.const 2] [:i32.const (:id ast)]]
     ;; Strings are interned globals with unique IDs
-    (= op :string) (str "(global.get $__str_" (:id ast) ")")
+    (= op :string) [:global.get (str "$__str_" (:id ast))]
     ;; Symbols are globals (like strings) - initialized with name/namespace
-    (= op :symbol) (str "(global.get $__sym_" (:id ast) ")")
+    (= op :symbol) [:global.get (str "$__sym_" (:id ast))]
     ;; Floats are struct references with f64 value
     ;; Handle special values: Infinity, -Infinity, NaN
     (= op :float) (let [v (:val ast)]
-                    (str "(struct.new $Float (i32.const 5) (f64.const "
-                         (cond
-                           (Double/isNaN v) "nan"
-                           (= v Double/POSITIVE_INFINITY) "inf"
-                           (= v Double/NEGATIVE_INFINITY) "-inf"
-                           :else v)
-                         "))"))
-    (= op :local) (str "(local.get $" (munge-name (:name ast)) ")")
-    (= op :global) (str "(global.get $" (munge-name (:name ast)) ")")
+                    [:struct.new "$Float" [:i32.const 5]
+                     [:f64.const (cond
+                                   (Double/isNaN v) ##NaN
+                                   (= v Double/POSITIVE_INFINITY) ##Inf
+                                   (= v Double/NEGATIVE_INFINITY) ##-Inf
+                                   :else v)]])
+    (= op :local) [:local.get (str "$" (munge-name (:name ast)))]
+    (= op :global) [:global.get (str "$" (munge-name (:name ast)))]
     ;; Direct function used as a value - reference the wrapper closure global
     (= op :fn-global) (do
                         (set! *fn-refs* (conj *fn-refs* (:name ast)))
-                        (str "(global.get $__fn_" (munge-name (:name ast)) ")"))
+                        [:global.get (str "$__fn_" (munge-name (:name ast)))])
     ;; Builtin used as a value - reference the wrapper closure global
-    (= op :builtin-ref) (str "(global.get $__builtin_" (munge-name (:name ast)) ")")
+    (= op :builtin-ref) [:global.get (str "$__builtin_" (munge-name (:name ast)))]
 
     ;; Captured variables - fetch from environment array
     (= op :captured)
-    (str "(call $array_get (local.get " *closure-env-param* ") (i32.const " (:index ast) "))")
+    [:call "$array_get" [:local.get *closure-env-param*] [:i32.const (:index ast)]]
 
     (= op :call)
     (let [fn-ast (:fn ast)
-          fn-name (when (#{:builtin :global :fn-global} (:op fn-ast)) (:name fn-ast))]
-      (cond
+          fn-name (when (#{:builtin :global :fn-global} (:op fn-ast)) (:name fn-ast))
+          ;; Capture tail position and clear for argument evaluation
+          tail? *tail-position*
+          call-prefix (if tail? "return_call" "call")]
+      (binding [*tail-position* false]
+       (cond
         ;; Arithmetic: use inline i32 ops when types are known, else call runtime
         (contains? arithmetic-builtins fn-name)
         (if (= :i32 (:num-type ast))
-          ;; Optimized path: all args are known i32, emit raw i32 ops and box result
           (emit-box (emit-i32-raw ast))
-          ;; Generic path: call polymorphic runtime functions
           (let [args (:args ast)]
             (case fn-name
               (+ - * /)
-              (let [op-name (case fn-name + "$add" - "$sub" * "$mul" / "$div")
-                    a (emit (first args))
-                    b (emit (second args))]
-                (str "(call " op-name " " a " " b ")"))
-              inc
-              (let [a (emit (first args))]
-                (str "(call $inc " a ")"))
-              dec
-              (let [a (emit (first args))]
-                (str "(call $dec " a ")")))))
+              (let [op-name (case fn-name + "$add" - "$sub" * "$mul" / "$div")]
+                [:call op-name (emit (first args)) (emit (second args))])
+              inc [:call "$inc" (emit (first args))]
+              dec [:call "$dec" (emit (first args))])))
 
 ;; Comparisons: compare, return $Boolean
         (contains? comparison-builtins fn-name)
@@ -502,95 +516,74 @@
             (let [a (emit (first args))
                   b (emit (second args))]
               (case fn-name
-                = (emit-bool (str "(call $eq " a " " b ")"))
-                not= (emit-bool (str "(i32.eqz (call $eq " a " " b "))"))))
+                = (emit-bool [:call "$eq" a b])
+                not= (emit-bool [:i32.eqz [:call "$eq" a b]])))
             (< > <= >=)
             (if (every? #(= :i32 (:num-type %)) args)
-              ;; Optimized: both args are known i32, use direct comparison
-              (let [wasm-op (case fn-name < "i32.lt_s" > "i32.gt_s" <= "i32.le_s" >= "i32.ge_s")
-                    a (emit-i32-raw (first args))
-                    b (emit-i32-raw (second args))]
-                (emit-bool (str "(" wasm-op " " a " " b ")")))
-              ;; Generic: polymorphic comparison
-              (let [a (emit (first args))
-                    b (emit (second args))]
-                (str "(call $cmp_" (case fn-name < "lt" > "gt" <= "le" >= "ge") " " a " " b ")")))
+              (let [wasm-op (case fn-name < :i32.lt_s > :i32.gt_s <= :i32.le_s >= :i32.ge_s)]
+                (emit-bool [wasm-op (emit-i32-raw (first args)) (emit-i32-raw (second args))]))
+              (let [cmp-fn (str "$cmp_" (case fn-name < "lt" > "gt" <= "le" >= "ge"))]
+                [:call cmp-fn (emit (first args)) (emit (second args))]))
             neg?
             (let [a (first args)]
               (if (= :i32 (:num-type a))
-                (emit-bool (str "(i32.lt_s " (emit-i32-raw a) " (i32.const 0))"))
-                (str "(call $cmp_lt " (emit a) " (ref.i31 (i32.const 0)))")))
+                (emit-bool [:i32.lt_s (emit-i32-raw a) [:i32.const 0]])
+                [:call "$cmp_lt" (emit a) [:ref.i31 [:i32.const 0]]]))
             pos?
             (let [a (first args)]
               (if (= :i32 (:num-type a))
-                (emit-bool (str "(i32.gt_s " (emit-i32-raw a) " (i32.const 0))"))
-                (str "(call $cmp_gt " (emit a) " (ref.i31 (i32.const 0)))")))
+                (emit-bool [:i32.gt_s (emit-i32-raw a) [:i32.const 0]])
+                [:call "$cmp_gt" (emit a) [:ref.i31 [:i32.const 0]]]))
             zero?
             (let [a (first args)]
               (if (= :i32 (:num-type a))
-                (emit-bool (str "(i32.eqz " (emit-i32-raw a) ")"))
-                (str "(call $zero_QMARK_ " (emit a) ")")))
+                (emit-bool [:i32.eqz (emit-i32-raw a)])
+                [:call "$zero_QMARK_" (emit a)]))
             NaN?
-            ;; NaN? - call the $is_nan helper function
-            (str "(call $is_nan " (emit (first args)) ")")))
+            [:call "$is_nan" (emit (first args))]))
 
 ;; Boolean ops: use $truthy for polymorphic truthiness
         (contains? boolean-builtins fn-name)
         (let [args (:args ast)]
           (case fn-name
-            not
-            (let [a (emit (first args))]
-              ;; Use $truthy which handles all types (nil, bool, int, keyword, etc.)
-              (emit-bool (str "(i32.eqz (call $truthy " a "))")))
+            not (emit-bool [:i32.eqz [:call "$truthy" (emit (first args))]])
             and
             (let [a (emit (first args))
                   b (emit (second args))]
-              ;; Short-circuit: if a is falsy, return a, else return b
-              (str "(if (result anyref) (call $truthy " a ")\n        (then " b ")\n        (else " a "))"))
+              [:if [:result :anyref] [:call "$truthy" a]
+               [:then b]
+               [:else a]])
             or
             (let [a (emit (first args))
                   b (emit (second args))]
-              ;; Short-circuit: if a is truthy, return a, else return b
-              (str "(if (result anyref) (call $truthy " a ")\n        (then " a ")\n        (else " b "))"))))
+              [:if [:result :anyref] [:call "$truthy" a]
+               [:then a]
+               [:else b]])))
 
 ;; List operations - work directly with anyref
         (contains? list-builtins fn-name)
-        (let [emitted-args (into [] (map emit (:args ast)))]
-          (str "(call $" (munge-name fn-name) " " (str-join " " emitted-args) ")"))
+        (into [:call (str "$" (munge-name fn-name))] (map emit (:args ast)))
 
         ;; Vector operations
         (contains? vector-builtins fn-name)
         (let [args (:args ast)]
           (case fn-name
-            nth
-            (let [v (emit (first args))
-                  idx (emit-unbox (emit (second args)))]
-              (str "(call $nth_polymorphic " v " " idx ")"))
-            count
-            ;; count returns boxed integer - polymorphic via $count_internal
-            (let [v (emit (first args))]
-              (emit-box (str "(call $count_internal " v ")")))
+            nth [:call "$nth_polymorphic" (emit (first args)) (emit-unbox (emit (second args)))]
+            count (emit-box [:call "$count_internal" (emit (first args))])
             conj
             (let [[base elements] (collect-conj-chain ast)]
               (reduce (fn [acc elem-ast]
-                        (str "(call $conj " acc " " (emit elem-ast) ")"))
+                        [:call "$conj" acc (emit elem-ast)])
                       (emit base)
                       elements))
-            vector?
-            (let [v (emit (first args))]
-              (str "(call $vector_QMARK_ " v ")"))
-            empty-vector
-            "(call $empty_vector)"))
+            vector? [:call "$vector_QMARK_" (emit (first args))]
+            empty-vector [:call "$empty_vector"]))
 
         ;; Polymorphic operations (work on multiple types)
         (contains? polymorphic-builtins fn-name)
         (let [args (:args ast)]
           (case fn-name
-            assoc
-            (let [coll (emit (first args))
-                  k (emit (second args))
-                  v (emit (nth args 2))]
-              (str "(call $assoc " coll " " k " " v ")"))))
+            assoc [:call "$assoc" (emit (first args)) (emit (second args)) (emit (nth args 2))]))
 
         ;; Reduce operations
         (contains? reduce-builtins fn-name)
@@ -598,569 +591,359 @@
           (case fn-name
             reduce
             (if (= (count args) 2)
-              ;; 2-arity: (reduce f coll) - use first element as init
-              (let [f (emit (first args))
-                    coll (emit (second args))]
-                (str "(call $reduce_no_init " f " " coll ")"))
-              ;; 3-arity: (reduce f init coll)
-              (let [f (emit (first args))
-                    init (emit (second args))
-                    coll (emit (nth args 2))]
-                (str "(call $reduce " f " " init " " coll ")")))
-            reduce-kv
-            (let [f (emit (first args))
-                  init (emit (second args))
-                  coll (emit (nth args 2))]
-              (str "(call $reduce_kv " f " " init " " coll ")"))
-            reduced
-            (let [val (emit (first args))]
-              (str "(call $reduced " val ")"))
-            reduced?
-            (let [val (emit (first args))]
-              ;; $reduced_QMARK_ returns i32, need to wrap as Boolean
-              (str "(call $bool (call $reduced_QMARK_ " val "))"))))
+              [:call "$reduce_no_init" (emit (first args)) (emit (second args))]
+              [:call "$reduce" (emit (first args)) (emit (second args)) (emit (nth args 2))])
+            reduce-kv [:call "$reduce_kv" (emit (first args)) (emit (second args)) (emit (nth args 2))]
+            reduced [:call "$reduced" (emit (first args))]
+            reduced? [:call "$bool" [:call "$reduced_QMARK_" (emit (first args))]]))
 
         ;; Lazy sequence operations
         (contains? lazy-seq-builtins fn-name)
         (let [args (:args ast)]
           (case fn-name
-            make-lazy-seq
-            (let [thunk (emit (first args))]
-              (str "(call $make_lazy_seq " thunk ")"))
-            lazy-seq?
-            (let [val (emit (first args))]
-              (str "(call $lazy_seq_QMARK_ " val ")"))
-            lazy-seq-realized?
-            (let [val (emit (first args))]
-              (str "(call $lazy_seq_realized_QMARK_ " val ")"))))
+            make-lazy-seq [:call "$make_lazy_seq" (emit (first args))]
+            lazy-seq? [:call "$lazy_seq_QMARK_" (emit (first args))]
+            lazy-seq-realized? [:call "$lazy_seq_realized_QMARK_" (emit (first args))]))
 
         ;; String operations
         (contains? string-builtins fn-name)
         (let [args (:args ast)]
           (case fn-name
-            str1
-            (let [val (emit (first args))]
-              (str "(call $str1 " val ")"))
-            str-concat
-            (let [a (emit (first args))
-                  b (emit (second args))]
-              (str "(call $str_concat " a " " b ")"))
-            name
-            (let [val (emit (first args))]
-              (str "(call $name_fn " val ")"))
-            subs
-            (let [s (emit (first args))
-                  start (emit-unbox (emit (second args)))
-                  end (emit-unbox (emit (nth args 2)))]
-              (str "(call $subs " s " " start " " end ")"))
-            string->mem!
-            (let [s (emit (first args))
-                  offset (emit-unbox (emit (second args)))]
-              (emit-box (str "(call $string__GT_mem_BANG_ " s " " offset ")")))
-            mem->string
-            (let [offset (emit-unbox (emit (first args)))
-                  len (emit-unbox (emit (second args)))]
-              (str "(call $mem__GT_string " offset " " len ")"))
-            pr-str1
-            (let [val (emit (first args))]
-              (str "(call $pr_str1 " val ")"))
-            char
-            (let [val (emit (first args))]
-              (str "(call $char_from_code " (emit-unbox val) ")"))))
+            str1 [:call "$str1" (emit (first args))]
+            str-concat [:call "$str_concat" (emit (first args)) (emit (second args))]
+            name [:call "$name_fn" (emit (first args))]
+            subs [:call "$subs" (emit (first args)) (emit-unbox (emit (second args))) (emit-unbox (emit (nth args 2)))]
+            string->mem! (emit-box [:call "$string__GT_mem_BANG_" (emit (first args)) (emit-unbox (emit (second args)))])
+            mem->string [:call "$mem__GT_string" (emit-unbox (emit (first args))) (emit-unbox (emit (second args)))]
+            pr-str1 [:call "$pr_str1" (emit (first args))]
+            char [:call "$char_from_code" (emit-unbox (emit (first args)))]
+            str-hash (emit-box [:call "$str_hash" (emit (first args))])))
 
         ;; Float operation builtins
         (contains? float-op-builtins fn-name)
-        (let [args (:args ast)]
+        (let [args (:args ast)
+              v (emit (first args))]
           (case fn-name
-            to-float
-            (let [val (emit (first args))]
-              (str "(struct.new $Float (i32.const 5) (call $to_f64 " val "))"))
-            to-int
-            (let [val (emit (first args))]
-              ;; If already i31ref (integer), return as-is; otherwise truncate f64 toward zero
-              (str "(if (result anyref) (ref.test (ref i31) " val ")"
-                   " (then " val ")"
-                   " (else (ref.i31 (i32.trunc_sat_f64_s (f64.trunc (call $to_f64 " val "))))))"))
-            math-floor
-            (let [val (emit (first args))]
-              (str "(struct.new $Float (i32.const 5) (f64.floor (call $to_f64 " val ")))"))
-            math-ceil
-            (let [val (emit (first args))]
-              (str "(struct.new $Float (i32.const 5) (f64.ceil (call $to_f64 " val ")))"))
-            math-sqrt
-            (let [val (emit (first args))]
-              (str "(struct.new $Float (i32.const 5) (f64.sqrt (call $to_f64 " val ")))"))
-            math-abs
-            (let [val (emit (first args))]
-              (str "(struct.new $Float (i32.const 5) (f64.abs (call $to_f64 " val ")))"))
-            math-round
-            (let [val (emit (first args))]
-              (str "(struct.new $Float (i32.const 5) (f64.nearest (call $to_f64 " val ")))"))))
+            to-float [:struct.new "$Float" [:i32.const 5] [:call "$to_f64" v]]
+            to-int [:if [:result :anyref] [:ref.test [:ref :i31] v]
+                    [:then v]
+                    [:else [:ref.i31 [:i32.trunc_sat_f64_s [:f64.trunc [:call "$to_f64" v]]]]]]
+            math-floor [:struct.new "$Float" [:i32.const 5] [:f64.floor [:call "$to_f64" v]]]
+            math-ceil [:struct.new "$Float" [:i32.const 5] [:f64.ceil [:call "$to_f64" v]]]
+            math-sqrt [:struct.new "$Float" [:i32.const 5] [:f64.sqrt [:call "$to_f64" v]]]
+            math-abs [:struct.new "$Float" [:i32.const 5] [:f64.abs [:call "$to_f64" v]]]
+            math-round [:struct.new "$Float" [:i32.const 5] [:f64.nearest [:call "$to_f64" v]]]))
 
         ;; Exception builtins
         (contains? exception-builtins fn-name)
         (let [args (:args ast)]
           (case fn-name
-            ex-info
-            (let [msg (emit (first args))
-                  data (emit (second args))
-                  cause (if (>= (count args) 3)
-                          (emit (nth args 2))
-                          "(ref.null none)")]
-              (str "(struct.new $ExceptionInfo (i32.const 100) " msg " " data " " cause ")"))
-            ex-data
-            (let [e (emit (first args))]
-              (str "(struct.get $ExceptionInfo $data (ref.cast (ref $ExceptionInfo) " e "))"))
-            ex-message
-            (let [e (emit (first args))]
-              (str "(struct.get $ExceptionInfo $message (ref.cast (ref $ExceptionInfo) " e "))"))
-            ex-cause
-            (let [e (emit (first args))]
-              (str "(struct.get $ExceptionInfo $cause (ref.cast (ref $ExceptionInfo) " e "))"))))
+            ex-info [:struct.new "$ExceptionInfo" [:i32.const 100]
+                     (emit (first args)) (emit (second args))
+                     (if (>= (count args) 3) (emit (nth args 2)) [:ref.null :none])]
+            ex-data [:struct.get "$ExceptionInfo" "$data" [:ref.cast [:ref "$ExceptionInfo"] (emit (first args))]]
+            ex-message [:struct.get "$ExceptionInfo" "$message" [:ref.cast [:ref "$ExceptionInfo"] (emit (first args))]]
+            ex-cause [:struct.get "$ExceptionInfo" "$cause" [:ref.cast [:ref "$ExceptionInfo"] (emit (first args))]]))
 
         ;; String primitives
         (contains? #{'str-index-of 'str-to-lower 'str-to-upper 'str-starts-with 'str-ends-with 'str-trim 'str-replace 'str-split} fn-name)
         (let [args (:args ast)]
           (case fn-name
-            str-index-of
-            (let [s (emit (first args)) sub (emit (second args))]
-              (str "(call $str_index_of " s " " sub ")"))
-            str-to-lower
-            (let [s (emit (first args))]
-              (str "(call $str_to_lower " s ")"))
-            str-to-upper
-            (let [s (emit (first args))]
-              (str "(call $str_to_upper " s ")"))
-            str-starts-with
-            (let [s (emit (first args)) prefix (emit (second args))]
-              (str "(call $str_starts_with " s " " prefix ")"))
-            str-ends-with
-            (let [s (emit (first args)) suffix (emit (second args))]
-              (str "(call $str_ends_with " s " " suffix ")"))
-            str-trim
-            (let [s (emit (first args))]
-              (str "(call $str_trim " s ")"))
-            str-replace
-            (let [s (emit (first args)) target (emit (second args)) replacement (emit (nth args 2))]
-              (str "(call $str_replace " s " " target " " replacement ")"))
-            str-split
-            (let [s (emit (first args)) sep (emit (second args))]
-              (str "(call $str_split " s " " sep ")"))))
+            str-index-of [:call "$str_index_of" (emit (first args)) (emit (second args))]
+            str-to-lower [:call "$str_to_lower" (emit (first args))]
+            str-to-upper [:call "$str_to_upper" (emit (first args))]
+            str-starts-with [:call "$str_starts_with" (emit (first args)) (emit (second args))]
+            str-ends-with [:call "$str_ends_with" (emit (first args)) (emit (second args))]
+            str-trim [:call "$str_trim" (emit (first args))]
+            str-replace [:call "$str_replace" (emit (first args)) (emit (second args)) (emit (nth args 2))]
+            str-split [:call "$str_split" (emit (first args)) (emit (second args))]))
 
         ;; Print operations (WASI fd_write)
         (contains? #{'print! 'pr! 'print-str!} fn-name)
-        (let [args (:args ast)]
-          (case fn-name
-            print!
-            (let [val (emit (first args))]
-              (str "(call $print_BANG_ " val ")"))
-            pr!
-            (let [val (emit (first args))]
-              (str "(call $pr_BANG_ " val ")"))
-            print-str!
-            (let [val (emit (first args))]
-              (str "(call $print_str_BANG_ " val ")"))))
+        (case fn-name
+          print! [:call "$print_BANG_" (emit (first (:args ast)))]
+          pr! [:call "$pr_BANG_" (emit (first (:args ast)))]
+          print-str! [:call "$print_str_BANG_" (emit (first (:args ast)))])
 
         ;; Metadata operations
         (contains? metadata-builtins fn-name)
-        (let [args (:args ast)]
-          (case fn-name
-            with-meta
-            (let [val (emit (first args))
-                  meta-val (emit (second args))]
-              (str "(call $with_meta_ " val " " meta-val ")"))
-            meta
-            (let [val (emit (first args))]
-              (str "(call $meta_ " val ")"))))
+        (case fn-name
+          with-meta [:call "$with_meta_" (emit (first (:args ast))) (emit (second (:args ast)))]
+          meta [:call "$meta_" (emit (first (:args ast)))])
 
         ;; Atom watch/validator operations
         (contains? atom-watch-builtins fn-name)
         (let [args (:args ast)]
           (case fn-name
-            add-watch
-            (let [a (emit (first args))
-                  k (emit (second args))
-                  f (emit (nth args 2))]
-              (str "(call $add_watch " a " " k " " f ")"))
-            remove-watch
-            (let [a (emit (first args))
-                  k (emit (second args))]
-              (str "(call $remove_watch " a " " k ")"))
-            set-validator!
-            (let [a (emit (first args))
-                  f (emit (second args))]
-              (str "(call $set_validator_BANG_ " a " " f ")"))))
+            add-watch [:call "$add_watch" (emit (first args)) (emit (second args)) (emit (nth args 2))]
+            remove-watch [:call "$remove_watch" (emit (first args)) (emit (second args))]
+            set-validator! [:call "$set_validator_BANG_" (emit (first args)) (emit (second args))]))
 
         ;; Regex
         (= fn-name 're-pattern)
-        (let [pat (emit (first (:args ast)))]
-          (str "(struct.new $Regex (i32.const 98) " pat ")"))
+        [:struct.new "$Regex" [:i32.const 98] (emit (first (:args ast)))]
 
         ;; Bit operations: native WASM i32 instructions
         (contains? bit-builtins fn-name)
         (let [args (:args ast)]
           (case fn-name
-            bit-and
-            (let [a (emit-unbox (emit (first args)))
-                  b (emit-unbox (emit (second args)))]
-              (emit-box (str "(i32.and " a " " b ")")))
-            bit-or
-            (let [a (emit-unbox (emit (first args)))
-                  b (emit-unbox (emit (second args)))]
-              (emit-box (str "(i32.or " a " " b ")")))
-            bit-xor
-            (let [a (emit-unbox (emit (first args)))
-                  b (emit-unbox (emit (second args)))]
-              (emit-box (str "(i32.xor " a " " b ")")))
-            bit-not
-            (let [a (emit-unbox (emit (first args)))]
-              (emit-box (str "(i32.xor " a " (i32.const -1))")))
-            bit-shift-left
-            (let [a (emit-unbox (emit (first args)))
-                  b (emit-unbox (emit (second args)))]
-              (emit-box (str "(i32.shl " a " " b ")")))
-            bit-shift-right
-            (let [a (emit-unbox (emit (first args)))
-                  b (emit-unbox (emit (second args)))]
-              (emit-box (str "(i32.shr_s " a " " b ")")))
-            unsigned-bit-shift-right
-            (let [a (emit-unbox (emit (first args)))
-                  b (emit-unbox (emit (second args)))]
-              (emit-box (str "(i32.shr_u " a " " b ")")))
-            bit-test
-            (let [a (emit-unbox (emit (first args)))
-                  b (emit-unbox (emit (second args)))]
-              (str "(call $bool (i32.and (i32.shr_u " a " " b ") (i32.const 1)))"))))
+            bit-and (emit-box [:i32.and (emit-unbox (emit (first args))) (emit-unbox (emit (second args)))])
+            bit-or (emit-box [:i32.or (emit-unbox (emit (first args))) (emit-unbox (emit (second args)))])
+            bit-xor (emit-box [:i32.xor (emit-unbox (emit (first args))) (emit-unbox (emit (second args)))])
+            bit-not (emit-box [:i32.xor (emit-unbox (emit (first args))) [:i32.const -1]])
+            bit-shift-left (emit-box [:i32.shl (emit-unbox (emit (first args))) (emit-unbox (emit (second args)))])
+            bit-shift-right (emit-box [:i32.shr_s (emit-unbox (emit (first args))) (emit-unbox (emit (second args)))])
+            unsigned-bit-shift-right (emit-box [:i32.shr_u (emit-unbox (emit (first args))) (emit-unbox (emit (second args)))])
+            bit-test [:call "$bool" [:i32.and [:i32.shr_u (emit-unbox (emit (first args))) (emit-unbox (emit (second args)))] [:i32.const 1]]]))
 
         ;; Compare: three-way comparison returning -1/0/1
         (contains? compare-builtins fn-name)
-        (let [a (emit (first (:args ast)))
-              b (emit (second (:args ast)))]
-          (str "(call $__compare " a " " b ")"))
+        [:call "$__compare" (emit (first (:args ast))) (emit (second (:args ast)))]
 
         ;; Array operations: native WasmGC array instructions
         (contains? array-op-builtins fn-name)
         (let [args (:args ast)]
           (case fn-name
-            make-array
-            (let [n (emit-unbox (emit (first args)))]
-              (str "(array.new_default $AnyArray " n ")"))
-            aget
-            (let [arr (emit (first args))
-                  i (emit-unbox (emit (second args)))]
-              (str "(array.get $AnyArray (ref.cast (ref $AnyArray) " arr ") " i ")"))
-            aset
-            (let [arr (emit (first args))
-                  i (emit-unbox (emit (second args)))
-                  v (emit (nth args 2))]
-              ;; aset returns the value; we call a helper to avoid double-evaluating v
-              (str "(call $__aset " arr " " i " " v ")"))
-            alength
-            (let [arr (emit (first args))]
-              (emit-box (str "(array.len (ref.cast (ref $AnyArray) " arr "))")))
-            aclone
-            (let [arr (emit (first args))]
-              (str "(call $__aclone " arr ")"))
-            acopy
-            (let [src (emit (first args))
-                  si (emit-unbox (emit (second args)))
-                  dst (emit (nth args 2))
-                  di (emit-unbox (emit (nth args 3)))
-                  len (emit-unbox (emit (nth args 4)))]
-              (str "(block (result anyref)"
-                   " (array.copy $AnyArray $AnyArray"
-                   " (ref.cast (ref $AnyArray) " dst ") " di
-                   " (ref.cast (ref $AnyArray) " src ") " si
-                   " " len ")"
-                   " (ref.null none))"))
-            object-array
-            (let [arg (first args)]
-              ;; For now, emit as a call to $object_array helper that converts a seq/vector to array
-              (str "(call $__object_array " (emit arg) ")"))
-            array?
-            (let [v (emit (first args))]
-              (str "(call $bool (ref.test (ref $AnyArray) " v "))"))
-            vector-from-array
-            (str "(call $vector_from_array " (emit (first args)) ")")))
+            make-array [:array.new_default "$AnyArray" (emit-unbox (emit (first args)))]
+            aget [:array.get "$AnyArray" [:ref.cast [:ref "$AnyArray"] (emit (first args))] (emit-unbox (emit (second args)))]
+            aset [:call "$__aset" (emit (first args)) (emit-unbox (emit (second args))) (emit (nth args 2))]
+            alength (emit-box [:array.len [:ref.cast [:ref "$AnyArray"] (emit (first args))]])
+            aclone [:call "$__aclone" (emit (first args))]
+            acopy [:block [:result :anyref]
+                   [:array.copy "$AnyArray" "$AnyArray"
+                    [:ref.cast [:ref "$AnyArray"] (emit (nth args 2))] (emit-unbox (emit (nth args 3)))
+                    [:ref.cast [:ref "$AnyArray"] (emit (first args))] (emit-unbox (emit (second args)))
+                    (emit-unbox (emit (nth args 4)))]
+                   [:ref.null :none]]
+            object-array [:call "$__object_array" (emit (first args))]
+            array? [:call "$bool" [:ref.test [:ref "$AnyArray"] (emit (first args))]]
+            vector-from-array [:call "$vector_from_array" (emit (first args))]))
 
         ;; Transient collection operations
         (contains? transient-builtins fn-name)
         (let [args (:args ast)]
           (case fn-name
-            transient  (str "(call $transient " (emit (first args)) ")")
-            persistent! (str "(call $persistent_BANG_ " (emit (first args)) ")")
-            conj!      (str "(call $conj_BANG_ " (emit (first args)) " " (emit (second args)) ")")
-            assoc!     (str "(call $assoc_BANG_ " (emit (first args)) " " (emit (second args)) " " (emit (nth args 2)) ")")
-            dissoc!    (str "(call $dissoc_BANG_ " (emit (first args)) " " (emit (second args)) ")")
-            disj!      (str "(call $disj_BANG_ " (emit (first args)) " " (emit (second args)) ")")
-            pop!       (str "(call $pop_BANG_ " (emit (first args)) ")")))
+            transient    [:call "$transient" (emit (first args))]
+            persistent!  [:call "$persistent_BANG_" (emit (first args))]
+            conj!        [:call "$conj_BANG_" (emit (first args)) (emit (second args))]
+            assoc!       [:call "$assoc_BANG_" (emit (first args)) (emit (second args)) (emit (nth args 2))]
+            dissoc!      [:call "$dissoc_BANG_" (emit (first args)) (emit (second args))]
+            disj!        [:call "$disj_BANG_" (emit (first args)) (emit (second args))]
+            pop!         [:call "$pop_BANG_" (emit (first args))]))
 
         ;; Map operations
         (contains? map-builtins fn-name)
         (let [args (:args ast)]
           (case fn-name
-            get
-            (if (= (count args) 3)
-              (let [m (emit (first args))
-                    k (emit (second args))
-                    default (emit (nth args 2))]
-                (str "(call $hash_map_get_default " m " " k " " default ")"))
-              (let [m (emit (first args))
-                    k (emit (second args))]
-                (str "(call $hash_map_get " m " " k ")")))
-            contains?
-            (let [m (emit (first args))
-                  k (emit (second args))]
-              (str "(call $contains_QMARK_ " m " " k ")"))
-            map?
-            (let [v (emit (first args))]
-              (str "(call $map_QMARK_ " v ")"))
-            empty-hash-map
-            "(call $empty_hash_map)"
-            assoc-map
-            (let [m (emit (first args))
-                  k (emit (second args))
-                  v (emit (nth args 2))]
-              (str "(call $hash_map_assoc " m " " k " " v ")"))
-            make-array-map
-            (let [arr (emit (first args))
-                  cnt (emit (second args))]
-              (str "(call $make_array_map " arr " " (emit-unbox cnt) ")"))
-            dissoc
-            (let [m (emit (first args))
-                  k (emit (second args))]
-              (str "(call $dissoc " m " " k ")"))
-            keys
-            (let [m (emit (first args))]
-              (str "(call $keys " m ")"))
-            vals
-            (let [m (emit (first args))]
-              (str "(call $vals " m ")"))))
+            get (if (= (count args) 3)
+                  [:call "$hash_map_get_default" (emit (first args)) (emit (second args)) (emit (nth args 2))]
+                  [:call "$hash_map_get" (emit (first args)) (emit (second args))])
+            contains? [:call "$contains_QMARK_" (emit (first args)) (emit (second args))]
+            map? [:call "$map_QMARK_" (emit (first args))]
+            empty-hash-map [:call "$empty_hash_map"]
+            assoc-map [:call "$hash_map_assoc" (emit (first args)) (emit (second args)) (emit (nth args 2))]
+            make-array-map [:call "$make_array_map" (emit (first args)) (emit-unbox (emit (second args)))]
+            dissoc [:call "$dissoc" (emit (first args)) (emit (second args))]
+            keys [:call "$keys" (emit (first args))]
+            vals [:call "$vals" (emit (first args))]))
 
         ;; Set operations
         (contains? set-builtins fn-name)
         (let [args (:args ast)]
           (case fn-name
-            set?
-            (let [v (emit (first args))]
-              (str "(call $set_QMARK_ " v ")"))
-            empty-hash-set
-            "(call $empty_hash_set)"
-            set-conj
-            (let [s (emit (first args))
-                  elem (emit (second args))]
-              (str "(call $set_conj " s " " elem ")"))
-            disj
-            (let [s (emit (first args))
-                  elem (emit (second args))]
-              (str "(call $disj " s " " elem ")"))))
+            set? [:call "$set_QMARK_" (emit (first args))]
+            empty-hash-set [:call "$empty_hash_set"]
+            set-conj [:call "$set_conj" (emit (first args)) (emit (second args))]
+            disj [:call "$disj" (emit (first args)) (emit (second args))]))
 
         ;; Seq operations
         (contains? seq-builtins fn-name)
         (let [args (:args ast)]
           (case fn-name
-            seq
-            (let [coll (emit (first args))]
-              (str "(call $seq " coll ")"))
-            seq?
-            (let [v (emit (first args))]
-              (str "(call $seq_QMARK_ " v ")"))
-            seqable?
-            (let [v (emit (first args))]
-              (str "(call $seqable_QMARK_ " v ")"))
-            empty?
-            (let [coll (emit (first args))]
-              (str "(call $empty_QMARK_ " coll ")"))))
+            seq [:call "$seq" (emit (first args))]
+            seq? [:call "$seq_QMARK_" (emit (first args))]
+            seqable? [:call "$seqable_QMARK_" (emit (first args))]
+            empty? [:call "$empty_QMARK_" (emit (first args))]))
 
         ;; Atom operations
         (contains? atom-builtins fn-name)
         (let [args (:args ast)]
           (case fn-name
-            atom
-            (let [val (emit (first args))]
-              (str "(call $atom " val ")"))
-            deref
-            (let [a (emit (first args))]
-              (str "(call $deref " a ")"))
-            atom?
-            (let [v (emit (first args))]
-              (str "(call $atom_QMARK_ " v ")"))
-            reset!
-            (let [a (emit (first args))
-                  val (emit (second args))]
-              (str "(call $reset_BANG_ " a " " val ")"))
+            atom [:call "$atom" (emit (first args))]
+            deref [:call "$deref" (emit (first args))]
+            atom? [:call "$atom_QMARK_" (emit (first args))]
+            reset! [:call "$reset_BANG_" (emit (first args)) (emit (second args))]
             swap!
             (let [a (emit (first args))
                   f (emit (second args))
                   extra-args (drop 2 args)]
               (if (empty? extra-args)
-                (str "(call $swap_BANG_ " a " " f ")")
-                ;; Variadic: (swap! a f x y) -> read old, call (f old x y), write new
-                (let [emitted-extra (map emit extra-args)
-                      arity (inc (count extra-args))  ;; f receives old-val + extra args
-                      invoke-args (str-join " " emitted-extra)]
-                  (str "(call $swap_BANG_" arity " " a " " f " " invoke-args ")"))))))
+                [:call "$swap_BANG_" a f]
+                (into [:call (str "$swap_BANG_" (inc (count extra-args))) a f]
+                      (map emit extra-args))))))
 
         ;; User-defined function call (callable global - may hold closure)
         (= (:op fn-ast) :global)
         (let [munged (munge-name fn-name)
               emitted-args (into [] (map emit (:args ast)))
               arity (count emitted-args)]
-          (if (contains? *callable-globals* fn-name)
+          (cond
+            ;; Host import: unbox args to i32, box i32 result
+            (contains? *host-import-fns* munged)
+            (emit-box (into [:call (str "$" munged)] (map emit-unbox emitted-args)))
             ;; Callable global (closure) - use invokeN
-            (str "(call $invoke" arity " (global.get $" munged ") " (str-join " " emitted-args) ")")
+            (contains? *callable-globals* fn-name)
+            (into [(keyword call-prefix) (str "$invoke" arity) [:global.get (str "$" munged)]] emitted-args)
             ;; Direct function - use internal name if available
+            :else
             (let [call-name (get *internal-fn-names* munged munged)]
-              (str "(call $" call-name " " (str-join " " emitted-args) ")"))))
+              (into [(keyword call-prefix) (str "$" call-name)] emitted-args))))
 
         ;; Direct function global - always a direct call
         (= (:op fn-ast) :fn-global)
         (let [munged (munge-name fn-name)
               emitted-args (into [] (map emit (:args ast)))
               arg-count (count emitted-args)
-              ;; Use latest fn-info from *direct-fn-globals* (handles forward declarations
-              ;; where placeholder info was used during analysis but real defn came later)
               fn-info (or (get *direct-fn-globals* fn-name) (:fn-info fn-ast))
               fixed-arities (or (:arities fn-info) #{})
               variadic? (:variadic? fn-info)
               min-arity (or (:min-arity fn-info) 0)
-              ;; Multi-arity means multiple fixed arities exist (not counting variadic)
               is-true-multi-arity (> (count fixed-arities) 1)
-              ;; Could also be multi if there's both fixed arities AND variadic
               has-variadic-alongside-fixed (and variadic? (seq fixed-arities))
               is-multi-arity (or is-true-multi-arity has-variadic-alongside-fixed)
-              ;; Check if we have an exact fixed arity match
-              has-exact-match (contains? fixed-arities arg-count)]
+              has-exact-match (contains? fixed-arities arg-count)
+              build-rest-list (fn [rest-args]
+                                (if (empty? rest-args)
+                                  [:ref.null :none]
+                                  (reduce (fn [acc arg] [:call "$cons" arg acc])
+                                          [:ref.null :none]
+                                          (reverse rest-args))))]
           (cond
-            ;; Multi-arity with exact match: select function by arity
+            ;; Multi-arity with exact match
             (and is-multi-arity has-exact-match)
-            (let [call-name (str munged "_arity" arg-count "_internal")]
-              (str "(call $" call-name " " (str-join " " emitted-args) ")"))
+            (into [(keyword call-prefix) (str "$" munged "_arity" arg-count "_internal")] emitted-args)
 
-            ;; Multi-arity with variadic (no exact match - use variadic version)
+            ;; Multi-arity with variadic (no exact match)
             (and is-multi-arity variadic? (not has-exact-match))
-            (let [;; Find the variadic arity's required param count
-                  ;; Use min-arity as the base, or largest fixed arity that's <= arg-count
-                  variadic-min (if (seq fixed-arities)
+            (let [variadic-min (if (seq fixed-arities)
                                  (apply max (filter #(<= % arg-count) (conj fixed-arities min-arity)))
                                  min-arity)
                   required-args (take variadic-min emitted-args)
-                  rest-args (drop variadic-min emitted-args)
-                  ;; Build list from rest args: (cons a (cons b nil))
-                  rest-list (if (empty? rest-args)
-                              "(ref.null none)"
-                              (reduce (fn [acc arg]
-                                        (str "(call $cons " arg " " acc ")"))
-                                      "(ref.null none)"
-                                      (reverse rest-args)))
-                  all-args (concat required-args [rest-list])
-                  call-name (str munged "_variadic_internal")]
-              (str "(call $" call-name " " (str-join " " all-args) ")"))
+                  rest-args (drop variadic-min emitted-args)]
+              (into [(keyword call-prefix) (str "$" munged "_variadic_internal")]
+                    (concat required-args [(build-rest-list rest-args)])))
 
-            ;; Single variadic function (no fixed arities, just variadic)
+            ;; Single variadic function
             variadic?
             (let [required-args (take min-arity emitted-args)
                   rest-args (drop min-arity emitted-args)
-                  ;; Build list from rest args: (cons a (cons b nil))
-                  rest-list (if (empty? rest-args)
-                              "(ref.null none)"
-                              (reduce (fn [acc arg]
-                                        (str "(call $cons " arg " " acc ")"))
-                                      "(ref.null none)"
-                                      (reverse rest-args)))
-                  all-args (concat required-args [rest-list])
                   call-name (get *internal-fn-names* munged munged)]
-              (str "(call $" call-name " " (str-join " " all-args) ")"))
+              (into [(keyword call-prefix) (str "$" call-name)]
+                    (concat required-args [(build-rest-list rest-args)])))
 
             ;; Regular single-arity function
             :else
             (let [call-name (get *internal-fn-names* munged munged)]
-              (str "(call $" call-name " " (str-join " " emitted-args) ")"))))
+              (into [(keyword call-prefix) (str "$" call-name)] emitted-args))))
 
         ;; Builtin not in special categories - legacy call
         (= (:op fn-ast) :builtin)
         (let [emitted-args (into [] (map emit (:args ast)))
               munged (munge-name fn-name)
               call-name (get *internal-fn-names* munged munged)]
-          (str "(call $" call-name " " (str-join " " emitted-args) ")"))
+          (into [(keyword call-prefix) (str "$" call-name)] emitted-args))
 
         ;; Calling a local variable - must be a closure, use invokeN
         (= (:op fn-ast) :local)
         (let [emitted-args (into [] (map emit (:args ast)))
-              arity (count emitted-args)
-              closure-ref (str "(local.get $" (munge-name (:name fn-ast)) ")")]
-          (str "(call $invoke" arity " " closure-ref " " (str-join " " emitted-args) ")"))
+              arity (count emitted-args)]
+          (into [(keyword call-prefix) (str "$invoke" arity) [:local.get (str "$" (munge-name (:name fn-ast)))]]
+                emitted-args))
 
         ;; Calling a captured variable - must be a closure, use invokeN
         (= (:op fn-ast) :captured)
         (let [emitted-args (into [] (map emit (:args ast)))
-              arity (count emitted-args)
-              closure-ref (emit fn-ast)]
-          (str "(call $invoke" arity " " closure-ref " " (str-join " " emitted-args) ")"))
+              arity (count emitted-args)]
+          (into [(keyword call-prefix) (str "$invoke" arity) (emit fn-ast)]
+                emitted-args))
 
         ;; Calling the result of another expression (e.g., ((constantly x)))
-        ;; Treat as closure invocation
         :else
         (let [emitted-args (into [] (map emit (:args ast)))
-              arity (count emitted-args)
-              closure-ref (emit fn-ast)]
-          (str "(call $invoke" arity " " closure-ref " " (str-join " " emitted-args) ")"))))
+              arity (count emitted-args)]
+          (into [(keyword call-prefix) (str "$invoke" arity) (emit fn-ast)]
+                emitted-args)))))
 
     ;; if: unbox test for conditional, branches return anyref
     (= op :if)
-    (str "(if (result anyref)\n      " (emit-as-i32 (:test ast))
-         "\n      (then " (emit (:then ast)) ")"
-         "\n      (else " (emit (:else ast)) "))")
+    (let [tail? *tail-position*
+          test-code (binding [*tail-position* false] (emit-as-i32 (:test ast)))
+          then-code (binding [*tail-position* tail?] (emit (:then ast)))
+          else-code (binding [*tail-position* tail?] (emit (:else ast)))]
+      [:if [:result :anyref] test-code
+       [:then then-code]
+       [:else else-code]])
 
     (= op :let)
-    (let [local-sets (map (fn [b]
-                            (str "(local.set $" (munge-name (:name b)) " " (emit (:init b)) ")"))
-                          (:bindings ast))]
-      (str "(block (result anyref)\n      " (str-join "\n      " local-sets) "\n      " (emit (:body ast)) ")"))
+    (let [tail? *tail-position*
+          local-sets (binding [*tail-position* false]
+                       (mapv (fn [b]
+                               [:local.set (str "$" (munge-name (:name b))) (emit (:init b))])
+                             (:bindings ast)))
+          body-code (binding [*tail-position* tail?] (emit (:body ast)))]
+      (into [:block [:result :anyref]] (conj local-sets body-code)))
 
     (= op :loop)
     (let [counter *loop-counter*
           _ (set! *loop-counter* (inc *loop-counter*))
           loop-label (str "$loop" counter)
-          ;; Initial binding setup
-          init-sets (map (fn [b]
-                           (str "(local.set $" (munge-name (:name b)) " " (emit (:init b)) ")"))
-                         (:bindings ast))
-          ;; Emit body with loop context
+          init-sets (binding [*tail-position* false]
+                      (mapv (fn [b]
+                              [:local.set (str "$" (munge-name (:name b))) (emit (:init b))])
+                            (:bindings ast)))
           binding-names (mapv :name (:bindings ast))
           body-code (binding [*loop-context* {:loop-label loop-label
-                                              :loop-bindings binding-names}]
+                                              :loop-bindings binding-names}
+                              *tail-position* false]
                       (emit (:body ast)))]
-      (str "(block (result anyref)\n      "
-           (str-join "\n      " init-sets)
-           "\n      (loop " loop-label " (result anyref)\n        "
-           body-code "))"))
+      (into [:block [:result :anyref]]
+            (conj init-sets [:loop loop-label [:result :anyref] body-code])))
 
     (= op :recur)
     (let [ctx *loop-context*
           loop-label (:loop-label ctx)
           binding-names (:loop-bindings ctx)
-          ;; Emit all values first (evaluated with old binding values)
           value-emissions (mapv emit (:args ast))
-          ;; Then set bindings in reverse order (stack pops)
-          sets-reversed (map-indexed (fn [i name]
-                                       (str "(local.set $" (munge-name name) ")"))
-                                     (reverse binding-names))]
-      (str (str-join "\n        " value-emissions)
-           "\n        " (str-join "\n        " sets-reversed)
-           "\n        (br " loop-label ")"))
+          sets-reversed (mapv (fn [name]
+                                [:local.set (str "$" (munge-name name))])
+                              (reverse binding-names))]
+      ;; Emit values then sets as a sibling sequence, ending with br
+      (list* (concat value-emissions sets-reversed [[:br loop-label]])))
 
     (= op :fn)
     (let [arities (:arities ast)
-          multi-arity? (and arities (> (count arities) 1))]
+          multi-arity? (and arities (> (count arities) 1))
+          ;; Helper to build env-init IR for captured variables
+          build-env-init (fn [captures]
+                           (if (empty? captures)
+                             [:call "$array_new" [:i32.const 0]]
+                             (let [env-size (count captures)
+                                   env-sets (map-indexed
+                                             (fn [i sym]
+                                               (let [value-code (if (and *capture-indices* (contains? *capture-indices* sym))
+                                                                  [:call "$array_get" [:local.get *closure-env-param*] [:i32.const (get *capture-indices* sym)]]
+                                                                  [:local.get (str "$" (munge-name sym))])]
+                                               [:call "$array_set" [:local.get "$__tmp_env"] [:i32.const i] value-code]))
+                                             captures)]
+                               (into [:block [:result :anyref]
+                                      [:local.set "$__tmp_env" [:call "$array_new" [:i32.const env-size]]]]
+                                     (conj (vec env-sets) [:local.get "$__tmp_env"])))))]
       (if multi-arity?
         ;; Multi-arity anonymous fn: emit as MultiClosure with dispatch function
         (let [counter *fn-counter*
               _ (set! *fn-counter* (inc *fn-counter*))
               base-name (str "anon_multi" (inc counter))
               captures (or (:captures ast) [])
-              is-closure (seq captures)
-              ;; Emit each arity as a closure function
               arity-fn-names (mapv (fn [arity-info]
                                     (let [suffix (if (:variadic? arity-info)
                                                    "_variadic"
@@ -1175,11 +958,10 @@
                                        :variadic? (:variadic? arity-info)
                                        :param-count (count params)}))
                                   arities)
-              ;; Build dispatch function
+              ;; Build dispatch function (as string for add-function!)
               fixed-fns (filter (complement :variadic?) arity-fn-names)
               variadic-fn (first (filter :variadic? arity-fn-names))
               dispatch-name (str "$" base-name "_dispatch")
-              ;; Generate destructure code for N args from cons list
               gen-destructure (fn [n]
                                 (if (zero? n)
                                   ["" "" " (local.get $__env)"]
@@ -1193,8 +975,7 @@
                                         refs (str " (local.get $__env)" (apply str (for [i (range n)] (str " (local.get $a" i ")"))))]
                                     [locals destruct refs])))
               gen-variadic-destructure (fn []
-                                         (let [va (:arity variadic-fn)
-                                               n-required va]
+                                         (let [n-required (:arity variadic-fn)]
                                            (if (zero? n-required)
                                              ["" "" " (local.get $__env) (local.get $args)"]
                                              (let [locals (apply str (for [i (range n-required)]
@@ -1207,7 +988,6 @@
                                                              (apply str (for [i (range n-required)] (str " (local.get $a" i ")")))
                                                              " (local.get $args)")]
                                                [locals destruct refs]))))
-              ;; Build dispatch body
               else-case (if variadic-fn
                           (let [[_ v-destruct v-refs] (gen-variadic-destructure)]
                             (str v-destruct "(call " (:wasm-name variadic-fn) v-refs ")"))
@@ -1229,163 +1009,108 @@
                             all-locals "\n    "
                             dispatch-body ")")
               _ (add-function! func-def)
-              _ (set! *closure-funcs* (conj *closure-funcs* dispatch-name))
-              ;; Build environment array
-              env-size (count captures)
-              env-init (if (empty? captures)
-                         "(call $array_new (i32.const 0))"
-                         (let [env-sets (map-indexed
-                                         (fn [i sym]
-                                           (let [value-code (if (and *capture-indices* (contains? *capture-indices* sym))
-                                                              (str "(call $array_get (local.get " *closure-env-param* ") (i32.const " (get *capture-indices* sym) "))")
-                                                              (str "(local.get $" (munge-name sym) ")"))]
-                                             (str "(call $array_set (local.get $__tmp_env) (i32.const " i ") " value-code ")")))
-                                         captures)]
-                           (str "(block (result anyref)\n        "
-                                "(local.set $__tmp_env (call $array_new (i32.const " env-size ")))\n        "
-                                (str-join "\n        " env-sets) "\n        "
-                                "(local.get $__tmp_env))")))]
-          ;; MultiClosure: type_id=11, env, dispatch
-          (str "(struct.new $MultiClosure (i32.const 11) " env-init " (ref.func " dispatch-name "))"))
-        ;; Single-arity fn (original code path)
+              _ (set! *closure-funcs* (conj *closure-funcs* dispatch-name))]
+          [:struct.new "$MultiClosure" [:i32.const 11] (build-env-init captures) [:ref.func dispatch-name]])
+        ;; Single-arity fn
         (let [counter *fn-counter*
               _ (set! *fn-counter* (inc *fn-counter*))
               is-closure (:is-closure ast)
               captures (:captures ast)
               params (:params ast)
               arity (count params)
-          self-name (:fn-name ast)]
+              self-name (:fn-name ast)]
           (if is-closure
-            ;; Emit closure: create env array, create closure struct
             (let [fn-name (emit-closure-function (str "closure" (inc counter)) params (:body ast) captures
                                                  :has-recur (:has-recur ast) :self-name self-name)
-                  closure-type (str "$Closure" arity)
-                  ;; Build environment array with captured values
-                  env-size (count captures)
-                  env-init (if (empty? captures)
-                             "(call $array_new (i32.const 0))"
-                             ;; Generate code to access each captured variable
-                             ;; They might be locals or captured from our own env
-                             (let [env-sets (map-indexed
-                                             (fn [i sym]
-                                               (let [;; Check if this sym is in our capture-indices (we captured it)
-                                                     ;; or it's a local parameter
-                                                     value-code (if (and *capture-indices* (contains? *capture-indices* sym))
-                                                                  ;; Access from our environment
-                                                                  (str "(call $array_get (local.get " *closure-env-param* ") (i32.const " (get *capture-indices* sym) "))")
-                                                                  ;; Access as local
-                                                                  (str "(local.get $" (munge-name sym) ")"))]
-                                                 (str "(call $array_set (local.get $__tmp_env) (i32.const " i ") " value-code ")")))
-                                             captures)]
-                               ;; We need a local to hold the env array during construction
-                               ;; But we're in expression context... use a nested block
-                               (str "(block (result anyref)\n        "
-                                    "(local.set $__tmp_env (call $array_new (i32.const " env-size ")))\n        "
-                                    (str-join "\n        " env-sets) "\n        "
-                                    "(local.get $__tmp_env))")))]
-              (str "(struct.new " closure-type " (i32.const 11) (ref.func " fn-name ") " env-init ")"))
-            ;; Not a closure: emit plain function reference
-            ;; But since it's used as a value, we need to wrap it in a Closure struct
-            ;; Use emit-closure-function so it has the right type signature
+                  closure-type (str "$Closure" arity)]
+              [:struct.new closure-type [:i32.const 11] [:ref.func fn-name] (build-env-init captures)])
             (let [fn-name (emit-closure-function (str "fn" (inc counter)) params (:body ast) []
                                                  :has-recur (:has-recur ast) :self-name self-name)]
-              ;; Create a closure struct with empty environment
-              (str "(struct.new $Closure" arity " (i32.const 11) (ref.func " fn-name ") (call $array_new (i32.const 0)))"))))))
+              [:struct.new (str "$Closure" arity) [:i32.const 11] [:ref.func fn-name] [:call "$array_new" [:i32.const 0]]])))))
 
     (= op :do)
-    (let [exprs (:exprs ast)
-          emitted (map emit exprs)
-          ;; Filter out nil results (side-effect-only forms like deftest)
+    (let [tail? *tail-position*
+          exprs (:exprs ast)
+          n (count exprs)
+          emitted (map-indexed (fn [i e]
+                                 (binding [*tail-position* (and tail? (= i (dec n)))]
+                                   (emit e)))
+                               exprs)
           emitted (remove nil? emitted)
-          ;; All but last are for side effects (drop their results)
           side-effects (butlast emitted)
-          result (or (last emitted) "(ref.null none)")
-          drops (map (fn [e] (str e "\n      drop")) side-effects)]
-      (str "(block (result anyref)\n      "
-           (str-join "\n      " drops)
-           (if (seq drops) "\n      " "")
-           result ")"))
+          result (or (last emitted) [:ref.null :none])
+          ;; Wrap side-effect exprs in (drop ...)
+          drops (mapv (fn [e] [:drop e]) side-effects)]
+      (into [:block [:result :anyref]] (conj drops result)))
 
     (= op :set!)
     (let [munged (munge-name (:name ast))]
-      (str "(block (result anyref) "
-           "(global.set $" munged " " (emit (:val ast)) ") "
-           "(global.get $" munged "))"))
+      [:block [:result :anyref]
+       [:global.set (str "$" munged) (emit (:val ast))]
+       [:global.get (str "$" munged)]])
 
     ;; throw: (throw expr) - throws an exception with anyref value
     (= op :throw)
-    (str "(throw $exn " (emit (:val ast)) ") (unreachable)")
+    (list [:throw "$exn" (emit (:val ast))] [:unreachable])
 
     ;; try/catch/finally
     (= op :try)
     (let [{:keys [body catch finally]} ast
           has-catch (some? catch)
           has-finally (some? finally)
-          body-code (emit body)]
+          body-code (binding [*tail-position* false] (emit body))]
       (cond
-        ;; try + catch (+ optional finally)
         has-catch
         (let [binding-name (munge-name (:binding catch))
               catch-code (emit (:body catch))
               finally-code (when has-finally (emit finally))
-              ;; Wrap in block that catches the exception
-              ;; try_table body branches to $catch on exception,
-              ;; falls through on success
-              result (str
-                      "(block $__no_exn (result anyref)\n"
-                      "      (block $__catch_entry (result anyref)\n"
-                      "        (try_table (result anyref) (catch $exn $__catch_entry)\n"
-                      "          " body-code "\n"
-                      "        )\n"
-                      "        (br $__no_exn)\n"
-                      "      )\n"
-                ;; Catch path: exception value (anyref) is on the stack
-                      "      (local.set $" binding-name ")\n"
-                      "      " catch-code "\n"
-                      "    )")]
+              result [:block "$__no_exn" [:result :anyref]
+                      [:block "$__catch_entry" [:result :anyref]
+                       [:try_table [:result :anyref] [:catch "$exn" "$__catch_entry"]
+                        body-code]
+                       [:br "$__no_exn"]]
+                      [:local.set (str "$" binding-name)]
+                      catch-code]]
           (if has-finally
-            ;; With finally: wrap everything, run finally for side effects, then return result
-            (str "(block (result anyref)\n      "
-                 result
-                 "\n      " finally-code "\n      drop"
-                 "\n    )")
+            [:block [:result :anyref] result finally-code :drop]
             result))
 
-        ;; try + finally (no catch)
         has-finally
         (let [finally-code (emit finally)]
-          (str "(block (result anyref)\n      "
-               body-code "\n      "
-               finally-code "\n      drop)"))
+          [:block [:result :anyref] body-code finally-code :drop])
 
-        ;; Just try (no catch, no finally) - just emit the body
         :else body-code))
 
     (= op :def)
     (let [munged (munge-name (:name ast))
           init (:init ast)]
-      (if (= (:op init) :fn)
+      (cond
+        ;; Host import: register import, no function body emitted
+        (= (:op init) :host-import)
+        (let [arity (:arity init)
+              func-name (str "$" munged)
+              param-decls (str-join " " (repeat arity "(param i32)"))
+              import-str (str "(import \"" (:module init) "\" \"" (:import-name init)
+                              "\" (func " func-name " " param-decls " (result i32)))")]
+          (set! *host-imports* (conj *host-imports* import-str))
+          (set! *host-import-fns* (conj *host-import-fns* munged))
+          nil)
+
+        (= (:op init) :fn)
         (do
-          ;; Handle multi-arity functions
           (let [arities (:arities init)]
             (if (and arities (> (count arities) 1))
-              ;; Multi-arity: emit a function for each arity
               (doseq [arity-info arities]
-                (let [;; Variadic arity gets _variadic suffix, fixed gets _arityN
-                      arity-suffix (if (:variadic? arity-info)
+                (let [arity-suffix (if (:variadic? arity-info)
                                      "_variadic"
                                      (str "_arity" (:arity arity-info)))
-                      ;; Munge the base name first, then append suffix
-                      ;; This ensures operators like + and - get properly munged
                       munged-base (munge-name (:name ast))
                       full-name (str munged-base arity-suffix)
-                      ;; For variadic arity, include rest-param in params
                       params (if (:variadic? arity-info)
                                (conj (:params arity-info) (:rest-param arity-info))
                                (:params arity-info))]
                   (emit-function full-name params (:body arity-info) full-name
                                  :has-recur (:has-recur arity-info))))
-              ;; Single arity: use old behavior
               (let [arity-info (first arities)
                     params (if (and arity-info (:variadic? arity-info))
                              (conj (:params arity-info) (:rest-param arity-info))
@@ -1395,35 +1120,39 @@
                                (name (:name ast))
                                :has-recur (or (:has-recur init) (:has-recur arity-info))))))
           nil)
+
+        :else
         (do
-          ;; Only declare the global if not already declared
-          ;; All globals are now anyref for uniform representation
           (when-not (contains? *globals-declared* munged)
             (set! *globals-declared* (conj *globals-declared* munged))
             (set! *globals-emit* (conj *globals-emit* (str "(global $" munged " (mut anyref) (ref.null none))"))))
-          ;; Wrap in block to return nil (global.set doesn't return a value)
-          (str "(block (result anyref) (global.set $" munged " " (emit init) ") (ref.null none))"))))
+          (let [init-fn-name (str "__init_def_" munged)
+                init-body (emit-str init)
+                init-locals (distinct (collect-locals init))]
+            (set! *functions* (conj *functions*
+                               (str "(func $" init-fn-name " (result anyref)"
+                                    (when (seq init-locals) (str "\n    " (str-join "\n    " init-locals)))
+                                    "\n    " init-body ")")))
+            [:block [:result :anyref]
+             [:global.set (str "$" munged) [:call (str "$" init-fn-name)]]
+             [:ref.null :none]]))))
 
     ;; Protocol definitions
     (= op :defprotocol)
     (do
-      ;; Store protocol info for later use
       (set! *protocols* (assoc *protocols* (:name ast) {:methods (:methods ast)}))
-      ;; Register each method (with multi-arity support)
       (doseq [{:keys [name arity arities]} (:methods ast)]
         (set! *protocol-methods* (assoc *protocol-methods* name
                                         {:protocol (:name ast)
                                          :arity arity
                                          :arities (when arities
                                                     (into {} (map (fn [a] [(:arity a) a]) arities)))})))
-      ;; defprotocol produces no runtime code in itself
-      "(ref.null none)")
+      [:ref.null :none])
 
     ;; extend-type implementations
     (= op :extend-type)
     (let [type-tag (:type-tag ast)
           impls (:impls ast)]
-      ;; For each implementation, emit a closure function and register it
       (doseq [{:keys [method impl params]} impls]
         (let [method-info (get *protocol-methods* method)
               multi-arity? (and method-info (:arities method-info) (> (count (:arities method-info)) 1))
@@ -1434,43 +1163,35 @@
               impl-key (if multi-arity?
                          [type-tag method arity]
                          [type-tag method])]
-          ;; Emit the impl as a closure function
           (emit-closure-function fn-name params (:body impl) (or (:captures impl) []))
-          ;; Register the impl
           (set! *protocol-impls* (assoc *protocol-impls* impl-key fn-name))))
-      ;; extend-type produces no runtime code
-      "(ref.null none)")
+      [:ref.null :none])
 
     ;; extend-protocol: emit each extend-type
     (= op :extend-protocol)
     (do
       (doseq [et (:extend-types ast)]
         (emit et))
-      "(ref.null none)")
+      [:ref.null :none])
 
     ;; Protocol method calls
     (= op :protocol-call)
     (let [method (:method ast)
           args (:args ast)
           arity (count args)
-          ;; First arg is always 'this' - the dispatch target
           munged-method (munge-name method)
-          ;; Use arity-specific dispatch fn if method has multiple arities
           method-info (get *protocol-methods* method)
           multi-arity? (and method-info (:arities method-info) (> (count (:arities method-info)) 1))
           dispatch-fn (if multi-arity?
                         (str "$__dispatch_" munged-method "_arity_" arity)
-                        (str "$__dispatch_" munged-method))]
-      ;; Generate call to dispatch function
-      ;; The dispatch function takes the target as first arg and dispatches based on type
-      (str "(call " dispatch-fn " " (str-join " " (map emit args)) ")"))
+                        (str "$__dispatch_" munged-method))
+          call-prefix (if *tail-position* "return_call" "call")]
+      (binding [*tail-position* false]
+        (into [(keyword call-prefix) dispatch-fn] (map emit args))))
 
     ;; satisfies? check
     (= op :satisfies?)
-    (let [protocol-name (:protocol ast)
-          val-code (emit (:val ast))]
-      ;; Check if dispatch table has non-null entry for this value's type
-      (str "(call $__satisfies_" (munge-name protocol-name) " " val-code ")"))
+    [:call (str "$__satisfies_" (munge-name (:protocol ast))) (emit (:val ast))]
 
     ;; deftype — generates struct type, constructor, and protocol impls
     (= op :deftype)
@@ -1479,22 +1200,16 @@
           tag (:tag ast)
           impls (:impls ast)
           munged (munge-name type-name)]
-      ;; Register in emitter's *user-types* (may already be set from main.clj)
       (set! *user-types* (assoc *user-types* type-name {:tag tag :fields fields :kind :deftype}))
-      ;; Emit constructor function: ->TypeName
       (let [constructor-sym (or (:constructor-name ast) (symbol (str "->" (name type-name))))
             constructor-munged (munge-name constructor-sym)
             param-decls (str-join " " (mapv (fn [f] (str "(param $" (munge-name f) " anyref)")) fields))
             field-args (str-join " " (mapv (fn [f] (str "(local.get $" (munge-name f) ")")) fields))]
-        ;; Internal constructor ($__type_id discriminator is first field)
         (add-function! (str "(func $" constructor-munged "_internal " param-decls " (result anyref)\n"
                             "    (struct.new $" munged " (i32.const " tag ") " field-args "))"))
-        ;; Track internal name
         (set! *internal-fn-names* (assoc *internal-fn-names* constructor-munged (str constructor-munged "_internal")))
-        ;; Non-exported alias (deftype constructors return structs, not i32)
         (add-function! (str "(func $" constructor-munged " " param-decls " (result anyref)\n"
                             "    (call $" constructor-munged "_internal " field-args "))")))
-      ;; Emit protocol impls (same as extend-type, with multi-arity support)
       (doseq [{:keys [method impl params]} impls]
         (let [method-info (get *protocol-methods* method)
               multi-arity? (and method-info (:arities method-info) (> (count (:arities method-info)) 1))
@@ -1507,63 +1222,63 @@
                          [tag method])]
           (emit-closure-function fn-name params (:body impl) (or (:captures impl) []))
           (set! *protocol-impls* (assoc *protocol-impls* impl-key fn-name))))
-      ;; deftype produces no runtime code
-      "(ref.null none)")
+      [:ref.null :none])
 
     ;; instance? check
     (= op :instance?)
     (let [type-sym (:type ast)
           val-code (emit (:val ast))
-          ;; Check user types first
           user-type (get *user-types* type-sym)]
       (if user-type
-        ;; User-defined type — use type_tag for reliable dispatch (structural typing makes ref.test unreliable)
-        (str "(call $bool (i32.eq (call $type_tag " val-code ") (i32.const " (:tag user-type) ")))")
-        ;; Built-in type — use type_tag for colliding types, ref.test for unique ones
+        [:call "$bool" [:i32.eq [:call "$type_tag" val-code] [:i32.const (:tag user-type)]]]
         (case type-sym
-          (Number Integer) (str "(call $bool (ref.test (ref i31) " val-code "))")
-          ;; Boolean/Keyword/Symbol all have (i32,i32) — collide structurally, use type_tag
-          Keyword (str "(call $bool (i32.eq (call $type_tag " val-code ") (i32.const 2)))")
-          String (str "(call $bool (ref.test (ref $String) " val-code "))")
-          Symbol (str "(call $bool (i32.eq (call $type_tag " val-code ") (i32.const 4)))")
-          Float (str "(call $bool (ref.test (ref $Float) " val-code "))")
-          (Cons List ISeq) (str "(call $bool (ref.test (ref $Cons) " val-code "))")
-          (Vector PersistentVector) (str "(call $bool (ref.test (ref $Vector) " val-code "))")
-          ;; HashMap/HashSet both have (i32,i32,anyref) — collide structurally, use type_tag
-          (HashMap PersistentHashMap) (str "(call $bool (i32.or (i32.eq (call $type_tag " val-code ") (i32.const 8)) (i32.eq (call $type_tag " val-code ") (i32.const 19))))")
-          (HashSet PersistentHashSet) (str "(call $bool (i32.eq (call $type_tag " val-code ") (i32.const 9)))")
-          Atom (str "(call $bool (ref.test (ref $Atom) " val-code "))")
-          Boolean (str "(call $bool (i32.eq (call $type_tag " val-code ") (i32.const 14)))")
-          ;; Default: always false
-          "(global.get $__false)")))
+          (Number Integer) [:call "$bool" [:ref.test [:ref :i31] val-code]]
+          Keyword [:call "$bool" [:i32.eq [:call "$type_tag" val-code] [:i32.const 2]]]
+          String [:call "$bool" [:ref.test [:ref "$String"] val-code]]
+          Symbol [:call "$bool" [:i32.eq [:call "$type_tag" val-code] [:i32.const 4]]]
+          Float [:call "$bool" [:ref.test [:ref "$Float"] val-code]]
+          (Cons List ISeq) [:call "$bool" [:ref.test [:ref "$Cons"] val-code]]
+          (Vector PersistentVector) [:call "$bool" [:ref.test [:ref "$Vector"] val-code]]
+          (HashMap PersistentHashMap) [:call "$bool" [:i32.or [:i32.eq [:call "$type_tag" val-code] [:i32.const 8]] [:i32.eq [:call "$type_tag" val-code] [:i32.const 19]]]]
+          (HashSet PersistentHashSet) [:call "$bool" [:i32.eq [:call "$type_tag" val-code] [:i32.const 9]]]
+          Atom [:call "$bool" [:ref.test [:ref "$Atom"] val-code]]
+          Boolean [:call "$bool" [:i32.eq [:call "$type_tag" val-code] [:i32.const 14]]]
+          [:global.get "$__false"])))
 
     ;; Field access: (.-field obj)
     (= op :field-access)
     (let [field-name (:field ast)
           target-code (emit (:target ast))
-          ;; Find all user types that have this field
           matching-types (for [[type-name {:keys [tag fields]}] *user-types*
                                :let [field-idx (.indexOf (mapv name fields) field-name)]
                                :when (>= field-idx 0)]
                            {:type-name type-name :tag tag :field-idx field-idx :fields fields})]
       (if (= 1 (count matching-types))
-        ;; Single type — simple cast + get ($__type_id is first field, user fields start at index 1)
         (let [{:keys [type-name field-idx]} (first matching-types)
               munged-type (munge-name type-name)]
-          (str "(struct.get $" munged-type " " (inc field-idx)
-               " (ref.cast (ref $" munged-type ") " target-code "))"))
-        ;; Multiple types — chain of type_tag checks (ref.test unreliable due to structural typing)
+          [:struct.get (str "$" munged-type) (inc field-idx)
+           [:ref.cast [:ref (str "$" munged-type)] target-code]])
         (reduce (fn [else-code {:keys [type-name tag field-idx]}]
                   (let [munged-type (munge-name type-name)]
-                    (str "(if (result anyref) (i32.eq (call $type_tag " target-code ") (i32.const " tag "))\n"
-                         "          (then (struct.get $" munged-type " " (inc field-idx)
-                         " (ref.cast (ref $" munged-type ") " target-code ")))\n"
-                         "          (else " else-code "))")))
-                "(unreachable)"
+                    [:if [:result :anyref] [:i32.eq [:call "$type_tag" target-code] [:i32.const tag]]
+                     [:then [:struct.get (str "$" munged-type) (inc field-idx)
+                             [:ref.cast [:ref (str "$" munged-type)] target-code]]]
+                     [:else else-code]]))
+                [:unreachable]
                 (reverse matching-types))))
 
     :else
     (throw (ex-info (str "Unknown AST op: " op) {:ast ast}))))
+
+(defn emit-str
+  "Emit an AST node to a WAT string. Bridge from IR to string world.
+   Runs optimization passes on the IR before serializing."
+  [ast]
+  (let [ir (emit ast)]
+    (cond
+      (nil? ir) nil
+      (string? ir) ir
+      :else (w/serialize (opt/optimize ir)))))
 
 ;; ============================================
 ;; Builtin Wrapper Generation
@@ -1591,7 +1306,7 @@
                   :fn {:op :builtin :name builtin-name}
                   :args (vec (for [i (range arity)]
                                {:op :local :name (symbol (str "arg" i))}))}
-        call-code (emit call-ast)
+        call-code (emit-str call-ast)
         ;; Function definition
         func-def (str "(func " func-name " (type " func-type ") " param-decls " (result anyref)\n    " call-code ")")
         ;; Global declaration - initialized in $start
@@ -1817,7 +1532,8 @@
   (str "(module"
        "\n  ;; WASI imports for printing
   (import \"wasi_snapshot_preview1\" \"fd_write\" (func $fd_write (param i32 i32 i32 i32) (result i32)))"
-       "\n  (memory (export \"memory\") 1)"
+       "__HOST_IMPORTS__"
+       "\n  (memory (export \"memory\") 16)"
        "
   ;; ==========================================
   ;; WasmGC Type Definitions
@@ -3514,7 +3230,10 @@
             (br $loop2)))
         (return (local.get $acc))))
     (local.get $acc))
+")
 
+(defn emit-prelude-2a []
+  "
   ;; ==========================================
   ;; Persistent HashMap Operations (HAMT-backed)
   ;; ==========================================
@@ -3630,8 +3349,9 @@
       (else (global.get $__true))))
 
   (func $map_QMARK_ (param $val anyref) (result anyref)
-    (call $bool (i32.or (i32.eq (call $type_tag (local.get $val)) (i32.const 8))
-                        (i32.eq (call $type_tag (local.get $val)) (i32.const 19)))))
+    (call $bool (i32.or (i32.or (i32.eq (call $type_tag (local.get $val)) (i32.const 8))
+                                (i32.eq (call $type_tag (local.get $val)) (i32.const 19)))
+                        __USER_MAP__)))
 
   (func $keys (param $m anyref) (result anyref)
     (if (result anyref) (ref.is_null (local.get $m))
@@ -5127,11 +4847,12 @@
 
   ;; counted?: check if value supports O(1) count (vector, map, set)
   (func $counted_QMARK_ (param $val anyref) (result anyref)
-    (call $bool (i32.or (i32.or (i32.or
+    (call $bool (i32.or (i32.or (i32.or (i32.or
       (ref.test (ref $Vector) (local.get $val))
       (i32.eq (call $type_tag (local.get $val)) (i32.const 8)))
       (i32.eq (call $type_tag (local.get $val)) (i32.const 19)))
-      (i32.eq (call $type_tag (local.get $val)) (i32.const 9)))))
+      (i32.eq (call $type_tag (local.get $val)) (i32.const 9)))
+      __USER_COUNTED__)))
 
   ;; indexed?: check if value supports indexed access (vector)
   (func $indexed_QMARK_ (param $val anyref) (result anyref)
@@ -7527,16 +7248,43 @@
               "(i32.const 31)"
               (reverse (map gen-hash type-entries))))))
 
+(defn- emit-user-predicate-checks
+  "Generate i32 check expression for user types that extend a given protocol method.
+   Returns an i32 expression, or (i32.const 0) if no user types match.
+   Only includes user-defined type tags (>= 20) to avoid false positives with builtins."
+  [method-name]
+  (let [;; Find user type tags (>= 20) that implement the given method
+        user-tags (->> (keys *protocol-impls*)
+                       (filter (fn [k] (= (nth k 1) method-name)))
+                       (map first)
+                       (filter #(>= % 20))
+                       distinct
+                       vec)]
+    (if (empty? user-tags)
+      "(i32.const 0)"
+      (reduce (fn [acc tag]
+                (str "(i32.or " acc " (i32.eq (call $type_tag (local.get $val)) (i32.const " tag ")))"))
+              (str "(i32.eq (call $type_tag (local.get $val)) (i32.const " (first user-tags) "))")
+              (rest user-tags)))))
+
 (defn emit-prelude []
-  (let [base (str (emit-prelude-1) (emit-user-type-defs) (emit-prelude-2) (emit-prelude-transient) (emit-prelude-2b) (emit-prelude-3) (emit-prelude-3b) (emit-prelude-3c))]
-    ;; Replace all user-type placeholders
+  (let [host-import-section (if (seq *host-imports*)
+                              (str "\n  ;; Host imports\n  " (str-join "\n  " *host-imports*))
+                              "")
+        base (str (emit-prelude-1) (emit-user-type-defs) (emit-prelude-2) (emit-prelude-2a) (emit-prelude-transient) (emit-prelude-2b) (emit-prelude-3) (emit-prelude-3b) (emit-prelude-3c))]
+    ;; Replace all placeholders
     (-> base
+        (string/replace "__HOST_IMPORTS__" host-import-section)
         (string/replace "__USER_TYPE_TAGS__"
                         (if (empty? *user-types*) "(i32.const -1)" (emit-user-type-tag-branches)))
         (string/replace "__USER_TYPE_EQ__"
                         (emit-user-type-eq-code))
         (string/replace "__USER_TYPE_HASH__"
-                        (emit-user-type-hash-code)))))
+                        (emit-user-type-hash-code))
+        (string/replace "__USER_COUNTED__"
+                        (emit-user-predicate-checks (symbol "-count")))
+        (string/replace "__USER_MAP__"
+                        (emit-user-predicate-checks (symbol "-assoc"))))))
 
 (defn emit-module [ast-forms]
   (binding [*functions* []
@@ -7546,27 +7294,38 @@
             *loop-counter* 0
             *closure-funcs* []
             *emitted-fn-names* #{"$float_QMARK_"}
+            *host-imports* []
+            *host-import-fns* #{}
             *protocols* {}
             *protocol-methods* {}
             *protocol-impls* {}]
   ;; Pre-scan: populate *internal-fn-names* for all exported functions
   ;; so cross-namespace calls can resolve to _internal names regardless of emit order
     (doseq [form ast-forms]
-      (when (and (= (:op form) :def) (= (:op (:init form)) :fn))
-        (let [arities (get-in form [:init :arities])
-              fname (:name form)
-              munged (munge-name fname)]
-          (if (and arities (> (count arities) 1))
-          ;; Multi-arity: register each arity's internal name
-            (doseq [arity-info arities]
-              (let [arity-suffix (if (:variadic? arity-info)
-                                   "_variadic"
-                                   (str "_arity" (:arity arity-info)))
-                    full-munged (str munged arity-suffix)]
-                (set! *internal-fn-names* (assoc *internal-fn-names* full-munged (str full-munged "_internal")))))
-          ;; Single arity: register standard internal name
-            (set! *internal-fn-names* (assoc *internal-fn-names* munged (str munged "_internal")))))))
-    (let [init-code (into [] (filter some? (map emit ast-forms)))
+      (when (= (:op form) :def)
+        (let [init-op (:op (:init form))]
+          (cond
+            ;; Host import: pre-register in *host-import-fns*
+            (= init-op :host-import)
+            (let [munged (munge-name (:name form))]
+              (set! *host-import-fns* (conj *host-import-fns* munged)))
+
+            ;; Normal function
+            (= init-op :fn)
+            (let [arities (get-in form [:init :arities])
+                  fname (:name form)
+                  munged (munge-name fname)]
+              (if (and arities (> (count arities) 1))
+                ;; Multi-arity: register each arity's internal name
+                (doseq [arity-info arities]
+                  (let [arity-suffix (if (:variadic? arity-info)
+                                       "_variadic"
+                                       (str "_arity" (:arity arity-info)))
+                        full-munged (str munged arity-suffix)]
+                    (set! *internal-fn-names* (assoc *internal-fn-names* full-munged (str full-munged "_internal")))))
+                ;; Single arity: register standard internal name
+                (set! *internal-fn-names* (assoc *internal-fn-names* munged (str munged "_internal")))))))))
+    (let [init-code (into [] (filter some? (map emit-str ast-forms)))
         ;; Generate builtin wrappers for any builtins used as values
           builtin-wrappers (when (seq *builtin-refs*)
                              (let [;; Map builtin-arities locally
@@ -7606,6 +7365,8 @@
                                             'vector-from-array 1,
                                          ;; Regex operations
                                             're-pattern 1, 'regex-pattern 1, 'regex? 1,
+                                         ;; Hash
+                                            'str-hash 1,
                                          ;; Transient operations
                                             'transient 1, 'persistent! 1,
                                             'conj! 2, 'assoc! 3, 'dissoc! 2, 'disj! 2, 'pop! 1}]
@@ -7654,8 +7415,8 @@
                                   (for [[proto-name _] *protocols*
                                         :let [;; Get all impls for methods of this protocol
                                               proto-methods (set (map :name (:methods (get *protocols* proto-name))))
-                                              proto-impls (filter (fn [[k _]]
-                                                                       (contains? proto-methods (nth k 1)))
+                                              proto-impls (filter (fn [entry]
+                                                                       (contains? proto-methods (nth (first entry) 1)))
                                                                      *protocol-impls*)]]
                                     (generate-satisfies-function proto-name proto-impls)))
         ;; Generate stubs for core protocol methods/satisfies if not already defined
@@ -7694,39 +7455,60 @@
           string-entries (sort-by val *strings*)  ;; sorted by id
           string-globals (for [[s id] string-entries]
                            (str "(global $__str_" id " (mut anyref) (ref.null none))"))
+        ;; Build a single data segment with all string bytes concatenated
+          string-data-info (if (seq string-entries)
+                             (reduce (fn [acc [s id]]
+                                       (let [bytes (.getBytes ^String s "UTF-8")
+                                             offset (:offset acc)]
+                                         (-> acc
+                                             (update :bytes (fn [b] (into (or b []) bytes)))
+                                             (assoc-in [:entries id] {:offset offset :length (count bytes)})
+                                             (assoc :offset (+ offset (count bytes))))))
+                                     {:bytes [] :entries {} :offset 0}
+                                     string-entries)
+                             {:bytes [] :entries {} :offset 0})
+          string-data-segment (when (seq string-entries)
+                                (let [all-bytes (:bytes string-data-info)]
+                                  (str "(data $__str_data \""
+                                       (apply str (map (fn [b] (format "\\%02x" (bit-and b 0xff))) all-bytes))
+                                       "\")")))
           string-init-fns (for [[s id] string-entries]
-                            (let [bytes (map int (.getBytes ^String s "UTF-8"))
-                                  len (count bytes)]
+                            (let [{:keys [offset length]} (get-in string-data-info [:entries id])]
                               (str "(func $__init_str_" id " (result anyref)\n"
-                                   "    (local $data (ref $CharArray))\n"
-                                   "    (local.set $data (array.new $CharArray (i32.const 0) (i32.const " len ")))\n"
-                                   (apply str (map-indexed
-                                               (fn [i b]
-                                                 (str "    (array.set $CharArray (local.get $data) (i32.const " i ") (i32.const " (bit-and b 0xff) "))\n"))
-                                               bytes))
-                                   "    (struct.new $String (i32.const 3) (i32.const " id ") (local.get $data)))")))
+                                   "    (struct.new $String (i32.const 3) (i32.const " id ")\n"
+                                   "      (array.new_data $CharArray $__str_data (i32.const " offset ") (i32.const " length "))))")))
           string-init-code (for [[_ id] string-entries]
                              (str "(global.set $__str_" id " (call $__init_str_" id "))"))
         ;; Generate keyword name table init
         ;; We need the keywords from the analyzer to build name strings
           kw-entries (sort-by val *keywords*)
           kw-count (count kw-entries)
+          kw-data-info (if (pos? kw-count)
+                         (reduce (fn [acc [kw id]]
+                                   (let [kw-name (if (namespace kw)
+                                                   (str (namespace kw) "/" (name kw))
+                                                   (name kw))
+                                         bytes (.getBytes ^String kw-name "UTF-8")
+                                         offset (:offset acc)]
+                                     (-> acc
+                                         (update :bytes (fn [b] (into (or b []) bytes)))
+                                         (assoc-in [:entries id] {:offset offset :length (count bytes)})
+                                         (assoc :offset (+ offset (count bytes))))))
+                                 {:bytes [] :entries {} :offset 0}
+                                 kw-entries)
+                         {:bytes [] :entries {} :offset 0})
+          kw-data-segment (when (pos? kw-count)
+                            (let [all-bytes (:bytes kw-data-info)]
+                              (str "(data $__kw_data \""
+                                   (apply str (map (fn [b] (format "\\%02x" (bit-and b 0xff))) all-bytes))
+                                   "\")")))
           kw-name-init-code (when (pos? kw-count)
                               (let [kw-init-lines
                                     (for [[kw id] kw-entries]
-                                      (let [kw-name (if (namespace kw)
-                                                      (str (namespace kw) "/" (name kw))
-                                                      (name kw))
-                                            bytes (map int (.getBytes ^String kw-name "UTF-8"))
-                                            len (count bytes)]
+                                      (let [{:keys [offset length]} (get-in kw-data-info [:entries id])]
                                         (str "(func $__init_kw_name_" id " (result anyref)\n"
-                                             "    (local $data (ref $CharArray))\n"
-                                             "    (local.set $data (array.new $CharArray (i32.const 0) (i32.const " len ")))\n"
-                                             (apply str (map-indexed
-                                                         (fn [i b]
-                                                           (str "    (array.set $CharArray (local.get $data) (i32.const " i ") (i32.const " (bit-and b 0xff) "))\n"))
-                                                         bytes))
-                                             "    (struct.new $String (i32.const 3) (i32.const " -1 ") (local.get $data)))")))]
+                                             "    (struct.new $String (i32.const 3) (i32.const " -1 ")\n"
+                                             "      (array.new_data $CharArray $__kw_data (i32.const " offset ") (i32.const " length "))))")))]
                                 {:funcs kw-init-lines
                                  :init-code (concat
                                              [(str "(global.set $__kw_names (call $array_new (i32.const " kw-count ")))")
@@ -7738,29 +7520,47 @@
           sym-count (count sym-entries)
           sym-globals (for [[_ id] sym-entries]
                         (str "(global $__sym_" id " (mut anyref) (ref.null none))"))
-          sym-init-code (when (pos? sym-count)
-                          (let [make-str-bytes (fn [s]
-                                                 (let [bytes (map int (.getBytes ^String s "UTF-8"))
-                                                       len (count bytes)]
-                                                   (str "    (local.set $data (array.new $CharArray (i32.const 0) (i32.const " len ")))\n"
-                                                        (apply str (map-indexed
-                                                                    (fn [i b]
-                                                                      (str "    (array.set $CharArray (local.get $data) (i32.const " i ") (i32.const " (bit-and b 0xff) "))\n"))
-                                                                    bytes))
-                                                        "    (struct.new $String (i32.const 3) (i32.const -1) (local.get $data))")))
-                                sym-init-fns
-                                (for [[sym id] sym-entries]
+        ;; Build data segment for symbol name/ns strings
+          sym-data-info (reduce (fn [acc [sym id]]
                                   (let [sym-name (name sym)
-                                        sym-ns (namespace sym)]
+                                        sym-ns (namespace sym)
+                                        ;; Store name bytes
+                                        name-bytes (.getBytes ^String sym-name "UTF-8")
+                                        name-offset (:offset acc)
+                                        acc (-> acc
+                                                (update :bytes (fn [b] (into (or b []) name-bytes)))
+                                                (assoc-in [:entries id :name-offset] name-offset)
+                                                (assoc-in [:entries id :name-length] (count name-bytes))
+                                                (assoc :offset (+ name-offset (count name-bytes))))]
+                                    (if sym-ns
+                                      (let [ns-bytes (.getBytes ^String sym-ns "UTF-8")
+                                            ns-offset (:offset acc)]
+                                        (-> acc
+                                            (update :bytes (fn [b] (into (or b []) ns-bytes)))
+                                            (assoc-in [:entries id :ns-offset] ns-offset)
+                                            (assoc-in [:entries id :ns-length] (count ns-bytes))
+                                            (assoc :offset (+ ns-offset (count ns-bytes)))))
+                                      acc)))
+                                {:bytes [] :entries {} :offset 0}
+                                sym-entries)
+          sym-data-segment (when (pos? sym-count)
+                             (let [all-bytes (:bytes sym-data-info)]
+                               (str "(data $__sym_data \""
+                                    (apply str (map (fn [b] (format "\\%02x" (bit-and b 0xff))) all-bytes))
+                                    "\")")))
+          sym-init-code (when (pos? sym-count)
+                          (let [sym-init-fns
+                                (for [[sym id] sym-entries]
+                                  (let [{:keys [name-offset name-length ns-offset ns-length]} (get-in sym-data-info [:entries id])
+                                        has-ns (some? ns-offset)]
                                     (str "(func $__init_sym_" id " (result anyref)\n"
-                                         "    (local $data (ref $CharArray))\n"
-                                         "    (local $name anyref)\n"
-                                         (when sym-ns "    (local $ns anyref)\n")
-                                         "    (local.set $name " (make-str-bytes sym-name) ")\n"
-                                         (when sym-ns
-                                           (str "    (local.set $ns " (make-str-bytes sym-ns) ")\n"))
-                                         "    (struct.new $Symbol (i32.const 4) (i32.const " id ") (local.get $name) "
-                                         (if sym-ns "(local.get $ns)" "(ref.null none)")
+                                         "    (struct.new $Symbol (i32.const 4) (i32.const " id ")\n"
+                                         "      (struct.new $String (i32.const 3) (i32.const -1)\n"
+                                         "        (array.new_data $CharArray $__sym_data (i32.const " name-offset ") (i32.const " name-length ")))\n"
+                                         "      " (if has-ns
+                                                    (str "(struct.new $String (i32.const 3) (i32.const -1)\n"
+                                                         "        (array.new_data $CharArray $__sym_data (i32.const " ns-offset ") (i32.const " ns-length ")))")
+                                                    "(ref.null none)")
                                          "))")))]
                             {:funcs sym-init-fns
                              :init-code (for [[_ id] sym-entries]
@@ -7869,9 +7669,16 @@
                      (str "\n\n  ;; Initialization\n  (func $start"
                           (if (seq start-locals) (str "\n    " (str-join "\n    " start-locals)) "")
                           "\n    " (str-join "\n    " all-init) ")\n  (start $start)")
-                     "")]
+                     "")
+        ;; Data segments for string/keyword/symbol byte arrays
+          data-segments (let [segs (filter some? [string-data-segment kw-data-segment sym-data-segment])]
+                          (when (seq segs)
+                            (str "\n\n  ;; Data segments for constant byte arrays\n  "
+                                 (str-join "\n  " segs))))]
+          
       (str prelude
            (if (seq all-globals) (str "\n\n  ;; Globals\n  " globals-section) "")
+           (or data-segments "")
            elem-section
            (if (seq all-functions) (str "\n\n  ;; User functions\n  " functions-section) "")
            start-fn

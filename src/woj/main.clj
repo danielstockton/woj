@@ -327,37 +327,68 @@
 ;; ============================================
 
 (defn- parse-args
-  "Parse CLI arguments. Returns {:paths [...] :input-file str}."
+  "Parse CLI arguments. Returns {:paths [...] :input-file str :emit str}."
   [args]
   (loop [args args
          paths []
-         input nil]
+         input nil
+         emit "wat"]
     (cond
       (empty? args)
-      {:paths paths :input-file input}
+      {:paths paths :input-file input :emit emit}
 
       (= (first args) "--path")
       (if (next args)
-        (recur (drop 2 args) (conj paths (second args)) input)
+        (recur (drop 2 args) (conj paths (second args)) input emit)
         (throw (ex-info "--path requires an argument" {})))
 
+      (= (first args) "--emit")
+      (if (next args)
+        (let [format (second args)]
+          (when-not (#{"wat" "wasm"} format)
+            (throw (ex-info (str "--emit must be 'wat' or 'wasm', got: " format) {})))
+          (recur (drop 2 args) paths input format))
+        (throw (ex-info "--emit requires an argument (wat or wasm)" {})))
+
       :else
-      ;; First non-flag arg is the input file
-      (recur (rest args) paths (or input (first args))))))
+      (recur (rest args) paths (or input (first args)) emit))))
+
+(defn- wat->wasm
+  "Convert WAT string to WASM binary using wasm-tools. Writes binary to stdout."
+  [wat-str]
+  (let [proc (.start (ProcessBuilder. ["wasm-tools" "parse" "-"]))
+        stdin (.getOutputStream proc)
+        stdout (.getInputStream proc)
+        stderr (.getErrorStream proc)]
+    (.write stdin (.getBytes wat-str "UTF-8"))
+    (.close stdin)
+    (let [out-bytes (.readAllBytes stdout)
+          err-bytes (.readAllBytes stderr)
+          exit (.waitFor proc)]
+      (when (not= 0 exit)
+        (binding [*out* *err*]
+          (println (str "wasm-tools error: " (String. err-bytes "UTF-8"))))
+        (System/exit 1))
+      (.write System/out out-bytes)
+      (.flush System/out))))
 
 (defn -main [& args]
   (if (empty? args)
     (do
       (println "woj - Clojure to WebAssembly compiler")
       (println "")
-      (println "Usage: clj -M:run [--path <dir>]... <input.clj>")
+      (println "Usage: clj -M:run [--path <dir>]... [--emit wat|wasm] <input.clj>")
       (println "")
-      (println "Compiles a woj source file to WAT (WebAssembly Text Format).")
+      (println "Compiles a woj source file to WAT or WASM.")
       (println "")
       (println "Options:")
-      (println "  --path <dir>  Add directory to namespace search path (repeatable)"))
-    (let [{:keys [paths input-file]} (parse-args args)]
+      (println "  --path <dir>      Add directory to namespace search path (repeatable)")
+      (println "  --emit wat|wasm   Output format (default: wat)"))
+    (let [{:keys [paths input-file emit]} (parse-args args)]
       (if input-file
-        (println (compile-file input-file paths))
+        (let [wat (compile-file input-file paths)]
+          (case emit
+            "wat" (println wat)
+            "wasm" (wat->wasm wat)))
         (binding [*out* *err*]
           (println "Error: no input file specified"))))))

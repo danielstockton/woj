@@ -20,7 +20,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEST_DIR="$PROJECT_DIR/test/clojure-test-suite/test/clojure/core_test"
 SEARCH_PATH="$PROJECT_DIR/test/clojure-test-suite/test"
-WASMTIME_FLAGS="-W gc=y -W function-references=y -W exceptions=y"
+WASMTIME_FLAGS="-W gc=y -W function-references=y -W exceptions=y -W tail-call=y"
 COMPILE_JOBS=${COMPILE_JOBS:-4}
 WASM_JOBS=${WASM_JOBS:-8}
 WASM_TIMEOUT=${WASM_TIMEOUT:-5}

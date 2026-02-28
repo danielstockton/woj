@@ -54,6 +54,9 @@ clj -M:run examples/hello.clj > output.wat
 
 # With namespace search paths (for files using :require)
 clj -M:run --path test/clojure-test-suite/test examples/multi_file.clj > output.wat
+
+# Compile directly to WASM binary (requires wasm-tools)
+clj -M:run --emit wasm examples/hello.clj > output.wasm
 ```
 
 ### Run tests
@@ -77,26 +80,26 @@ clj -M:test
 clj -M:run examples/hello.clj > output.wat
 
 # 2. Run with wasmtime (GC and function-references enabled)
-wasmtime -W gc=y -W function-references=y -W exceptions=y --invoke <function> output.wat <args>
+wasmtime -W gc=y -W function-references=y -W exceptions=y -W tail-call=y --invoke <function> output.wat <args>
 
 # Examples:
-clj -M:run examples/hello.clj > output.wat && wasmtime -W gc=y -W function-references=y -W exceptions=y --invoke double output.wat 21
+clj -M:run examples/hello.clj > output.wat && wasmtime -W gc=y -W function-references=y -W exceptions=y -W tail-call=y --invoke double output.wat 21
 # Output: 42
 
 # Vector example:
-clj -M:run examples/vectors.clj > output.wat && wasmtime -W gc=y -W function-references=y -W exceptions=y --invoke test-count output.wat
+clj -M:run examples/vectors.clj > output.wat && wasmtime -W gc=y -W function-references=y -W exceptions=y -W tail-call=y --invoke test-count output.wat
 # Output: 3
 
 # Map example:
-clj -M:run examples/maps.clj > output.wat && wasmtime -W gc=y -W function-references=y -W exceptions=y --invoke test-get-a output.wat
+clj -M:run examples/maps.clj > output.wat && wasmtime -W gc=y -W function-references=y -W exceptions=y -W tail-call=y --invoke test-get-a output.wat
 # Output: 100
 
 # Closure example:
-clj -M:run examples/closures.clj > output.wat && wasmtime -W gc=y -W function-references=y -W exceptions=y --invoke test-basic output.wat
+clj -M:run examples/closures.clj > output.wat && wasmtime -W gc=y -W function-references=y -W exceptions=y -W tail-call=y --invoke test-basic output.wat
 # Output: 15
 ```
 
-Note: wasmtime can parse WAT directly with full WasmGC support. The `-W function-references=y` flag is required for closures, and `-W exceptions=y` is required for try/catch/throw. The older wat2wasm (wabt) has limited GC support.
+Note: wasmtime can parse WAT directly with full WasmGC support. The `-W function-references=y` flag is required for closures, `-W exceptions=y` for try/catch/throw, and `-W tail-call=y` for general tail call optimization. The older wat2wasm (wabt) has limited GC support.
 
 **For browser deployment**, use `wasm-tools` to convert WAT to WASM:
 ```bash
@@ -177,14 +180,15 @@ wasm-tools parse file.wat -o file.wasm
 ```bash
 echo '(defn smoke [] (+ 20 22))' > /tmp/s.clj
 clj -M:run /tmp/s.clj > /tmp/s.wat 2>/dev/null
-wasmtime -W gc=y -W function-references=y -W exceptions=y --invoke smoke /tmp/s.wat
+wasmtime -W gc=y -W function-references=y -W exceptions=y -W tail-call=y --invoke smoke /tmp/s.wat
 # Expected: 42
 ```
 
 **Some compat test files have no usable entry point.** Tests like `nil_qmark`, `true_qmark`, `false_qmark`, `contains_qmark`, `empty_qmark` have no `deftest` and rely on `run-tests` (the no-op stub). They need `deftest` wrappers added. Other tests (`eq`, `cons`, `conj`, `assoc`, `dissoc`, `get`, `keys`, `vals`) have pre-existing `invoke3` cast failures from `are` macro calling 2-arity builtins through 3-arity reduce paths.
 
 ## Known Limitations
-- wabt 1.0.39 doesn't support WasmGC (use wasmtime directly with `-W gc=y -W function-references=y -W exceptions=y`)
+- wabt 1.0.39 doesn't support WasmGC (use wasmtime directly with `-W gc=y -W function-references=y -W exceptions=y -W tail-call=y`)
+- `--emit wasm` requires `wasm-tools` (install: `cargo install wasm-tools`)
 - Source locations in errors require metadata from reader (not available with standard read-string)
 - Max 10-arity closures (can add more types if needed)
 - Captured values are copied at closure creation (immutable capture)
@@ -328,7 +332,9 @@ The `test/clojure/` directory contains tests imported from the official Clojure 
 - [x] Transient collections: `transient`/`persistent!`, `assoc!`, `conj!`, `disj!`, `pop!` (vectors, maps, sets)
 - [x] VectorSeq: lazy O(1) `first`/`rest` over vectors without allocating Cons cells
 - [x] Tree-shaking: unused core.clj definitions removed from output (95% size reduction for simple programs)
-- [x] Integer type propagation: unboxed `i32` arithmetic when types are statically known
+- [x] Integer type propagation: unboxed `i32` arithmetic when types are statically known; propagates through `if`, `let`, and `do`
+- [x] General tail call optimization: `return_call`/`return_call_ref` for calls in tail position; enables mutual recursion without stack overflow
+- [x] Binary WASM output: `--emit wasm` flag to compile directly to WASM binary via wasm-tools
 - [x] Protocol dispatch tables: O(1) array-indexed dispatch instead of O(N) if/else chains
 - [x] `br_on_cast_fail` optimization: eliminates redundant `ref.test`/`ref.cast` pairs throughout runtime
 - [x] Transducers: `transduce`, `into` with xf, `eduction`, `sequence`; `map`/`filter`/`take`/`drop`/`take-while`/`drop-while`/`keep`/`mapcat`/`remove`/`distinct`/`dedupe`/`partition-all`/`interpose` return transducers when called without collection

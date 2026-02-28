@@ -2114,8 +2114,8 @@
 (defn into-array [type-or-coll coll-or-nil]
   (if (nil? coll-or-nil) type-or-coll coll-or-nil))
 
-;; make-array: create Java array (returns empty vector in woj)
-(defn make-array [type size] [])
+;; make-array: create native array (woj builtin takes 1 arg: size)
+(defn make-array [size] [])
 
 ;; class stub
 (defn class [x] nil)

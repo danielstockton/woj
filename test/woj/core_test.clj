@@ -116,7 +116,7 @@
             emitter/*capture-indices* nil
             emitter/*emitted-fn-names* #{}]
     (let [ast {:op :const :val 42 :type :int}
-          result (emitter/emit ast)]
+          result (emitter/emit-str ast)]
       ;; Constants are now boxed (ref.i31 wrapping i32.const)
       (assert (str-contains? result "i32.const"))
       (assert (str-contains? result "42"))
@@ -136,7 +136,7 @@
                :fn {:op :builtin :name '+}
                :args [{:op :const :val 1 :type :int}
                       {:op :const :val 2 :type :int}]}
-          result (emitter/emit ast)]
+          result (emitter/emit-str ast)]
       ;; + now generates a call to polymorphic $add
       (assert (str-contains? result "call $add"))
       (println "  PASS: emit arithmetic with polymorphic add"))))

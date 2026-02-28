@@ -144,7 +144,9 @@
    ;; Atom watches and validators
    'add-watch 3, 'remove-watch 2, 'set-validator! 2,
    ;; Regex
-   're-pattern 1, 'regex-pattern 1, 'regex? 1})
+   're-pattern 1, 'regex-pattern 1, 'regex? 1,
+   ;; Hash
+   'str-hash 1})
 
 ;; ============================================
 ;; Gensym support for macros
@@ -389,40 +391,58 @@
   (when (< (count form) 2)
     (throw-error "def requires a name" form))
   (let [bare-name (second form)
+        bare-meta (meta bare-name)
         ;; When loading a namespace, prefix the def name to avoid cross-namespace collisions
         name (if *ns-prefix*
-               (symbol (str *ns-prefix* bare-name))
+               (with-meta (symbol (str *ns-prefix* bare-name)) bare-meta)
                bare-name)
+        ;; Check for host import metadata (^{:host ["module" "name"]})
+        host-spec (:host bare-meta)
         ;; Support (def x) without init - defaults to nil
-        init (if (> (count form) 2) (nth form 2) nil)]
-    ;; Add to globals BEFORE analyzing body (enables recursion)
-    (set! *globals* (conj *globals* name))
-    ;; Pre-register in *direct-fn-globals* if init is a fn literal,
-    ;; so recursive self-references used as values (e.g. (map f ...)) get :fn-global ops
-    (when (and (seq? init) (contains? #{'fn 'fn*} (first init)))
-      (set! *direct-fn-globals* (assoc *direct-fn-globals* name
-                                       {:arities #{} :variadic? true :min-arity 0})))
-    (let [init-ast (analyze init)
-          is-direct-fn (= :fn (:op init-ast))]
-      ;; If init is not a direct fn literal, it's a callable value (could be closure)
-      (if is-direct-fn
-        ;; Store arity info: {:arities #{1 2 3} :variadic? bool :min-arity n}
-        (let [arities (or (:arities init-ast) [{:arity (count (:params init-ast))
-                                                :variadic? (:variadic? init-ast)}])
-              fixed-arities (set (map :arity (filter (complement :variadic?) arities)))
-              variadic? (some :variadic? arities)
-              min-arity (if (seq arities)
-                          (apply min (map :arity arities))
-                          0)
-              variadic-arity (when variadic?
-                               (:arity (first (filter :variadic? arities))))]
+        init-form (if (> (count form) 2) (nth form 2) nil)]
+    (if host-spec
+      ;; Host import: produce :host-import AST node
+      ;; init-form is (fn [params] ...) from defn macro expansion
+      (let [params (when (and (seq? init-form) (= 'fn (first init-form)))
+                     (second init-form))
+            arity (if params (count params) 0)]
+        (set! *globals* (conj *globals* name))
+        {:op :def :name name
+         :init {:op :host-import
+                :module (nth host-spec 0)
+                :import-name (nth host-spec 1)
+                :params (vec (or params []))
+                :arity arity}})
+      ;; Normal def
+      (do
+        ;; Add to globals BEFORE analyzing body (enables recursion)
+        (set! *globals* (conj *globals* name))
+        ;; Pre-register in *direct-fn-globals* if init is a fn literal,
+        ;; so recursive self-references used as values (e.g. (map f ...)) get :fn-global ops
+        (when (and (seq? init-form) (contains? #{'fn 'fn*} (first init-form)))
           (set! *direct-fn-globals* (assoc *direct-fn-globals* name
-                                           {:arities fixed-arities
-                                            :variadic? variadic?
-                                            :min-arity min-arity
-                                            :variadic-arity variadic-arity})))
-        (set! *callable-globals* (conj *callable-globals* name)))
-      {:op :def :name name :init init-ast})))
+                                           {:arities #{} :variadic? true :min-arity 0})))
+        (let [init-ast (analyze init-form)
+              is-direct-fn (= :fn (:op init-ast))]
+          ;; If init is not a direct fn literal, it's a callable value (could be closure)
+          (if is-direct-fn
+            ;; Store arity info: {:arities #{1 2 3} :variadic? bool :min-arity n}
+            (let [arities (or (:arities init-ast) [{:arity (count (:params init-ast))
+                                                    :variadic? (:variadic? init-ast)}])
+                  fixed-arities (set (map :arity (filter (complement :variadic?) arities)))
+                  variadic? (some :variadic? arities)
+                  min-arity (if (seq arities)
+                              (apply min (map :arity arities))
+                              0)
+                  variadic-arity (when variadic?
+                                   (:arity (first (filter :variadic? arities))))]
+              (set! *direct-fn-globals* (assoc *direct-fn-globals* name
+                                               {:arities fixed-arities
+                                                :variadic? variadic?
+                                                :min-arity min-arity
+                                                :variadic-arity variadic-arity})))
+            (set! *callable-globals* (conj *callable-globals* name)))
+          {:op :def :name name :init init-ast})))))
 
 ;; ============================================
 ;; Destructuring support
@@ -813,10 +833,13 @@
       (if (empty? pairs)
         (let [body-ast (if (= 1 (count body-forms))
                          (analyze (first body-forms))
-                         {:op :do :exprs (into [] (map analyze body-forms))})
-              result {:op :let
-                      :bindings analyzed-bindings
-                      :body body-ast}]
+                         (let [analyzed (into [] (map analyze body-forms))]
+                           (cond-> {:op :do :exprs analyzed}
+                             (:num-type (peek analyzed)) (assoc :num-type (:num-type (peek analyzed))))))
+              result (cond-> {:op :let
+                              :bindings analyzed-bindings
+                              :body body-ast}
+                       (:num-type body-ast) (assoc :num-type (:num-type body-ast)))]
           (set! *env* old-env)
           result)
         (let [pair (first pairs)
@@ -835,11 +858,18 @@
     (throw-error (str "if takes at most 3 arguments (test, then, else), got " (dec (count form))) form))
   (let [test (nth form 1)
         then (nth form 2)
-        else (if (> (count form) 3) (nth form 3) 0)]
-    {:op :if
-     :test (analyze test)
-     :then (analyze then)
-     :else (analyze else)}))
+        else (if (> (count form) 3) (nth form 3) 0)
+        then-ast (analyze then)
+        else-ast (analyze else)
+        result (cond-> {:op :if
+                        :test (analyze test)
+                        :then then-ast
+                        :else else-ast}
+                 ;; Propagate :num-type when both branches agree
+                 (and (= :i32 (:num-type then-ast))
+                      (= :i32 (:num-type else-ast)))
+                 (assoc :num-type :i32))]
+    result))
 
 (defn analyze-loop [form]
   (when (< (count form) 2)
@@ -931,7 +961,10 @@
                   (concat leading [last-expr])))]
     (if (empty? exprs)
       {:op :const :val 0 :type :nil}
-      {:op :do :exprs (into [] (map analyze exprs))})))
+      (let [analyzed (into [] (map analyze exprs))
+            last-ast (peek analyzed)]
+        (cond-> {:op :do :exprs analyzed}
+          (:num-type last-ast) (assoc :num-type (:num-type last-ast)))))))
 
 (defn analyze-when [form]
   (let [test (nth form 1)
@@ -1668,7 +1701,9 @@
     ;; Atom watches and validators
     'add-watch 'remove-watch 'set-validator!
     ;; Regex
-    're-pattern 'regex-pattern 'regex?})
+    're-pattern 'regex-pattern 'regex?
+    ;; Hash
+    'str-hash})
 
 (defn expand-variadic-assoc
   "Expand (assoc m k1 v1 k2 v2 ...) into nested assoc calls."
@@ -2285,7 +2320,7 @@
             *protocol-methods* {}
             *protocol-impls* {}
             *user-types* {}
-            *next-type-tag* 19
+            *next-type-tag* 20
             *ns-aliases* {}
             *loaded-namespaces* #{}
             *loading-namespaces* #{}
