@@ -149,6 +149,69 @@
    'str-hash 1})
 
 ;; ============================================
+;; Effect analysis - pure (side-effect-free) builtins
+;; ============================================
+
+(def pure-builtins
+  "Builtins that have no side effects. Calls to these can be eliminated if the result is unused."
+  #{'inc 'dec 'not 'neg? 'pos? 'zero? 'NaN?
+    'first 'rest 'nil? 'cons? 'count 'vector? 'map?
+    'list? 'keyword? 'keyword 'keyword2 'number? 'integer? 'fn?
+    'coll? 'sequential? 'associative? 'counted? 'indexed?
+    'true? 'false? 'some?
+    'string? 'symbol? 'float? 'symbol 'symbol2 'namespace
+    'seq 'seq? 'seqable? 'empty?
+    'set? 'empty-hash-set
+    'keys 'vals
+    'atom? 'reduced? 'reduced
+    'name 'subs 'str1 'str-concat 'pr-str1 'char
+    'to-float 'to-int 'math-floor 'math-ceil 'math-sqrt 'math-abs 'math-round
+    'num 'type
+    '+ '- '* '/ '= 'not= '< '> '<= '>=
+    'and 'or 'cons 'nth 'conj 'get 'contains?
+    'dissoc 'disj 'set-conj
+    'assoc 'assoc-map
+    'empty-vector 'empty-hash-map 'make-array-map
+    'bit-and 'bit-or 'bit-xor 'bit-not
+    'bit-shift-left 'bit-shift-right 'unsigned-bit-shift-right 'bit-test
+    'compare
+    'str-index-of 'str-to-lower 'str-to-upper
+    'str-starts-with 'str-ends-with 'str-trim
+    'str-replace 'str-split
+    'alength 'aget
+    'with-meta 'meta
+    're-pattern 'regex-pattern 'regex?
+    'str-hash
+    'deref})
+
+(defn pure-ast?
+  "Returns true if the AST node is guaranteed side-effect-free.
+   Conservative: returns false for anything uncertain."
+  [ast]
+  (case (:op ast)
+    (:const :nil :keyword :string :float :symbol :local :captured) true
+    :call (and (= :builtin (get-in ast [:fn :op]))
+               (contains? pure-builtins (get-in ast [:fn :name]))
+               (every? pure-ast? (:args ast)))
+    :if (and (pure-ast? (:test ast))
+             (pure-ast? (:then ast))
+             (pure-ast? (:else ast)))
+    :do (every? pure-ast? (:exprs ast))
+    :let (and (every? (fn [b] (pure-ast? (:init b))) (:bindings ast))
+              (pure-ast? (:body ast)))
+    false))
+
+(defn eliminate-dead-exprs
+  "Given a vector of analyzed AST nodes (a do-body), remove pure non-tail expressions."
+  [analyzed]
+  (if (> (count analyzed) 1)
+    (let [leading (butlast analyzed)
+          last-ast (last analyzed)
+          kept (filterv (complement pure-ast?) leading)]
+      (conj kept last-ast))
+    analyzed))
+
+;; ============================================
 ;; Gensym support for macros
 ;; ============================================
 
@@ -341,7 +404,14 @@
       {:op :captured :name sym :index idx}
       (if-let [info (get *env* sym)]
         (cond-> {:op :local :name sym}
-          (:num-type info) (assoc :num-type (:num-type info)))
+          (:num-type info) (assoc :num-type (:num-type info))
+          (:narrowed-type info) (assoc :narrowed-type (:narrowed-type info))
+          ;; integer narrowing implies i32 num-type for unboxed arithmetic
+          (and (= :integer (:narrowed-type info)) (nil? (:num-type info)))
+          (assoc :num-type :i32)
+          ;; float narrowing implies f64 num-type
+          (and (= :float (:narrowed-type info)) (nil? (:num-type info)))
+          (assoc :num-type :f64))
       ;; When in a namespace, try the prefixed version of the symbol first
         (let [ns-sym (when *ns-prefix* (symbol (str *ns-prefix* sym)))]
           (if-let [resolved (or (when (and ns-sym (contains? *globals* ns-sym)) ns-sym)
@@ -577,6 +647,9 @@
    Returns [new-params wrapper-bindings] where wrapper-bindings
    should be wrapped in a let around the body."
   [params]
+  (when (symbol? params)
+    (throw (ex-info (str "expand-fn-destructuring got a symbol instead of params vector: " params)
+                    {:params params})))
   (loop [ps params
          new-params []
          bindings []]
@@ -713,7 +786,12 @@
     (set! *capture-map* nil)
     (let [body-ast-pass1 (if (= 1 (count body-forms))
                            (analyze (first body-forms))
-                           {:op :do :exprs (into [] (map analyze body-forms))})
+                           (let [analyzed (eliminate-dead-exprs (into [] (map analyze body-forms)))
+                                 last-ast (peek analyzed)]
+                             (if (= 1 (count analyzed))
+                               last-ast
+                               (cond-> {:op :do :exprs analyzed}
+                                 (:num-type last-ast) (assoc :num-type (:num-type last-ast))))))
           ;; Compute free variables in body (excluding params and fn-name for self-reference)
           fv-exclude (cond-> (set all-params)
                        fn-name (conj fn-name))
@@ -729,7 +807,12 @@
           (when loop-bound? (set! *loop-bindings* (vec all-params)))  ;; Re-set for second pass
           (let [body-ast (if (= 1 (count body-forms))
                            (analyze (first body-forms))
-                           {:op :do :exprs (into [] (map analyze body-forms))})]
+                           (let [analyzed (eliminate-dead-exprs (into [] (map analyze body-forms)))
+                                 last-ast (peek analyzed)]
+                             (if (= 1 (count analyzed))
+                               last-ast
+                               (cond-> {:op :do :exprs analyzed}
+                                 (:num-type last-ast) (assoc :num-type (:num-type last-ast))))))]
             (set! *env* old-env)
             (set! *enclosing-locals* old-enclosing)
             (set! *capture-map* old-capture-map)
@@ -851,24 +934,78 @@
           (recur (rest pairs)
                  (conj analyzed-bindings {:name name :init init-ast})))))))
 
+;; Flow-sensitive type narrowing: predicate → narrowed type tag
+(def predicate->type
+  "Map from type predicate names to narrowed type keywords."
+  {'integer? :integer, 'number? :integer, 'nil? :nil,
+   'vector? :vector, 'map? :map, 'set? :set,
+   'string? :string, 'keyword? :keyword, 'symbol? :symbol,
+   'float? :float, 'fn? :fn, 'cons? :cons, 'list? :cons,
+   'seq? :seq, 'lazy-seq? :lazy-seq, 'atom? :atom})
+
+(defn- extract-type-facts
+  "Extract type facts from an if-test form (before analysis).
+   Returns {:positive {sym type ...} :negative {sym type ...}}
+   where :positive applies in then-branch, :negative in else-branch."
+  [test-form]
+  (cond
+    ;; (pred? x) where pred? is a type predicate and x is a symbol
+    (and (seq? test-form) (= 2 (count test-form))
+         (symbol? (first test-form))
+         (contains? predicate->type (first test-form))
+         (symbol? (second test-form)))
+    (let [narrowed-type (get predicate->type (first test-form))
+          sym (second test-form)]
+      {:positive {sym narrowed-type} :negative {}})
+
+    ;; (not (nil? x)) → positive: non-nil in then, nil in else
+    (and (seq? test-form) (= 2 (count test-form))
+         (= 'not (first test-form))
+         (seq? (second test-form))
+         (= 2 (count (second test-form)))
+         (= 'nil? (first (second test-form)))
+         (symbol? (second (second test-form))))
+    (let [sym (second (second test-form))]
+      {:positive {sym :non-nil} :negative {sym :nil}})
+
+    :else {:positive {} :negative {}}))
+
+(defn- apply-type-facts
+  "Temporarily enrich *env* with type narrowing facts for a set of symbols."
+  [facts]
+  (doseq [[sym narrowed-type] facts]
+    (when-let [info (get *env* sym)]
+      (set! *env* (assoc *env* sym (assoc info :narrowed-type narrowed-type))))))
+
 (defn analyze-if [form]
   (when (< (count form) 3)
     (throw-error (str "if requires at least 2 arguments (test and then), got " (dec (count form))) form))
   (when (> (count form) 4)
     (throw-error (str "if takes at most 3 arguments (test, then, else), got " (dec (count form))) form))
-  (let [test (nth form 1)
-        then (nth form 2)
-        else (if (> (count form) 3) (nth form 3) 0)
-        then-ast (analyze then)
-        else-ast (analyze else)
+  (let [test-form (nth form 1)
+        then-form (nth form 2)
+        else-form (if (> (count form) 3) (nth form 3) 0)
+        test-ast (analyze test-form)
+        {:keys [positive negative]} (extract-type-facts test-form)
+        ;; Analyze then-branch with positive type facts
+        saved-env *env*
+        _ (when (seq positive) (apply-type-facts positive))
+        then-ast (analyze then-form)
+        _ (set! *env* saved-env)
+        ;; Analyze else-branch with negative type facts
+        _ (when (seq negative) (apply-type-facts negative))
+        else-ast (analyze else-form)
+        _ (set! *env* saved-env)
         result (cond-> {:op :if
-                        :test (analyze test)
+                        :test test-ast
                         :then then-ast
                         :else else-ast}
-                 ;; Propagate :num-type when both branches agree
-                 (and (= :i32 (:num-type then-ast))
-                      (= :i32 (:num-type else-ast)))
-                 (assoc :num-type :i32))]
+                 ;; Propagate :num-type when both branches have numeric types
+                 (and (#{:i32 :f64} (:num-type then-ast))
+                      (#{:i32 :f64} (:num-type else-ast)))
+                 (assoc :num-type (if (and (= :i32 (:num-type then-ast))
+                                           (= :i32 (:num-type else-ast)))
+                                    :i32 :f64)))]
     result))
 
 (defn analyze-loop [form]
@@ -962,9 +1099,12 @@
     (if (empty? exprs)
       {:op :const :val 0 :type :nil}
       (let [analyzed (into [] (map analyze exprs))
-            last-ast (peek analyzed)]
-        (cond-> {:op :do :exprs analyzed}
-          (:num-type last-ast) (assoc :num-type (:num-type last-ast)))))))
+            cleaned (eliminate-dead-exprs analyzed)
+            last-ast (peek cleaned)]
+        (if (= 1 (count cleaned))
+          last-ast
+          (cond-> {:op :do :exprs cleaned}
+            (:num-type last-ast) (assoc :num-type (:num-type last-ast))))))))
 
 (defn analyze-when [form]
   (let [test (nth form 1)
@@ -1009,9 +1149,15 @@
   (let [name (second form)
         ;; Skip optional docstring
         has-docstring (string? (nth form 2 nil))
-        params (if has-docstring (nth form 3) (nth form 2))
-        body (drop (if has-docstring 4 3) form)]
-    (analyze (list 'def name (cons 'fn (cons params body))))))
+        rest-forms (drop (if has-docstring 3 2) form)
+        first-form (first rest-forms)]
+    (if (and (seq? first-form) (vector? (first first-form)))
+      ;; Multi-arity: (defn name ([x] ...) ([x y] ...))
+      (analyze (list 'def name (cons 'fn rest-forms)))
+      ;; Single-arity: (defn name [params] body...)
+      (let [params first-form
+            body (rest rest-forms)]
+        (analyze (list 'def name (cons 'fn (cons params body))))))))
 
 ;; ============================================
 ;; clojure.test support
@@ -1725,15 +1871,17 @@
   #{'+ '- '* '/ 'inc 'dec})
 
 (defn- annotate-num-type
-  "If a call AST represents an arithmetic op where all args are :num-type :i32,
-   annotate the result with :num-type :i32."
+  "If a call AST represents an arithmetic op with known numeric types,
+   annotate the result: all i32 → :i32, any f64 (or mixed) → :f64."
   [call-ast]
   (let [fn-name (when (= :builtin (get-in call-ast [:fn :op]))
                   (get-in call-ast [:fn :name]))]
     (if (and fn-name
              (contains? i32-propagating-ops fn-name)
-             (every? #(= :i32 (:num-type %)) (:args call-ast)))
-      (assoc call-ast :num-type :i32)
+             (every? #(#{:i32 :f64} (:num-type %)) (:args call-ast)))
+      (if (every? #(= :i32 (:num-type %)) (:args call-ast))
+        (assoc call-ast :num-type :i32)
+        (assoc call-ast :num-type :f64))
       call-ast)))
 
 (def ^:private variadic-arithmetic
@@ -1867,6 +2015,67 @@
         (= (count args) 2) (analyze (list 'get (first args) fn-expr (second args)))
         :else (throw-error (str "Keywords as functions take 1 or 2 arguments, got " (count args)) form))
 
+      ;; Inline identity: (identity x) → x
+      (and (= fn-expr 'identity) (= (count args) 1))
+      (analyze (first args))
+
+      ;; Inline next: (next coll) → (seq (rest coll))
+      (and (= fn-expr 'next) (= (count args) 1))
+      (analyze (list 'seq (list 'rest (first args))))
+
+      ;; Inline second: (second coll) → (first (rest coll))
+      (and (= fn-expr 'second) (= (count args) 1))
+      (analyze (list 'first (list 'rest (first args))))
+
+      ;; Inline ffirst: (ffirst coll) → (first (first coll))
+      (and (= fn-expr 'ffirst) (= (count args) 1))
+      (analyze (list 'first (list 'first (first args))))
+
+      ;; Inline comp (0-2 args): (comp) → identity, (comp f) → f, (comp f g) → (fn [x] (f (g x)))
+      (and (= fn-expr 'comp) (<= (count args) 2))
+      (cond
+        (= (count args) 0) (analyze 'identity)
+        (= (count args) 1) (analyze (first args))
+        :else (let [f-sym (woj-gensym "comp_f__") g-sym (woj-gensym "comp_g__") x-sym (woj-gensym "comp_x__")]
+                (analyze (list 'let [f-sym (first args) g-sym (second args)]
+                               (list 'fn [x-sym] (list f-sym (list g-sym x-sym)))))))
+
+      ;; Inline complement: (complement f) → (fn ([x] (not (f x))) ([x y] (not (f x y))))
+      (and (= fn-expr 'complement) (= (count args) 1))
+      (let [f-sym (woj-gensym "compl__") x-sym (woj-gensym "compl_x__") y-sym (woj-gensym "compl_y__")]
+        (analyze (list 'let [f-sym (first args)]
+                       (list 'fn (list [x-sym] (list 'not (list f-sym x-sym)))
+                                 (list [x-sym y-sym] (list 'not (list f-sym x-sym y-sym)))))))
+
+      ;; Inline constantly: (constantly x) → (fn ([] x) ([_] x) ([_ _] x) ([_ _ _] x))
+      (and (= fn-expr 'constantly) (= (count args) 1))
+      (let [v-sym (woj-gensym "const__") a (woj-gensym "c_") b (woj-gensym "c_") c (woj-gensym "c_")]
+        (analyze (list 'let [v-sym (first args)]
+                       (list 'fn (list [] v-sym)
+                                 (list [a] v-sym)
+                                 (list [a b] v-sym)
+                                 (list [a b c] v-sym)))))
+
+      ;; Inline not-empty: (not-empty coll) → (if (empty? coll) nil coll)
+      (and (= fn-expr 'not-empty) (= (count args) 1))
+      (let [c-sym (woj-gensym "ne__")]
+        (analyze (list 'let [c-sym (first args)]
+                       (list 'if (list 'empty? c-sym) nil c-sym))))
+
+      ;; Inline update (3 args): (update m k f) → (assoc m k (f (get m k)))
+      (and (= fn-expr 'update) (= (count args) 3))
+      (let [m-sym (woj-gensym "upd_m__") k-sym (woj-gensym "upd_k__")]
+        (analyze (list 'let [m-sym (first args) k-sym (second args)]
+                       (list 'assoc m-sym k-sym (list (nth args 2) (list 'get m-sym k-sym))))))
+
+      ;; Inline mapv: (mapv f coll) → (into [] (map f coll))
+      (and (= fn-expr 'mapv) (= (count args) 2))
+      (analyze (list 'into [] (list 'map (first args) (second args))))
+
+      ;; Inline filterv: (filterv pred coll) → (into [] (filter pred coll))
+      (and (= fn-expr 'filterv) (= (count args) 2))
+      (analyze (list 'into [] (list 'filter (first args) (second args))))
+
       ;; Check if this is a protocol method call
       (and (symbol? fn-expr) (contains? *protocol-methods* fn-expr))
       (analyze-protocol-call fn-expr args form)
@@ -1925,7 +2134,7 @@
 
 (defn analyze-float [f]
   "Analyze a float literal."
-  {:op :float :val f})
+  {:op :float :val f :num-type :f64})
 
 (defn analyze-ratio [r]
   "Analyze a ratio literal - convert to float for now (woj doesn't support ratios)."

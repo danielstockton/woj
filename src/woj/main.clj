@@ -353,24 +353,49 @@
       :else
       (recur (rest args) paths (or input (first args)) emit))))
 
-(defn- wat->wasm
-  "Convert WAT string to WASM binary using wasm-tools. Writes binary to stdout."
-  [wat-str]
-  (let [proc (.start (ProcessBuilder. ["wasm-tools" "parse" "-"]))
+(defn- run-process
+  "Run a process with binary stdin/stdout. Returns output bytes or exits on error."
+  [cmd input-bytes error-prefix]
+  (let [proc (.start (ProcessBuilder. (vec cmd)))
         stdin (.getOutputStream proc)
         stdout (.getInputStream proc)
         stderr (.getErrorStream proc)]
-    (.write stdin (.getBytes wat-str "UTF-8"))
-    (.close stdin)
+    (when input-bytes
+      (.write stdin ^bytes input-bytes)
+      (.close stdin))
     (let [out-bytes (.readAllBytes stdout)
           err-bytes (.readAllBytes stderr)
           exit (.waitFor proc)]
       (when (not= 0 exit)
         (binding [*out* *err*]
-          (println (str "wasm-tools error: " (String. err-bytes "UTF-8"))))
+          (println (str error-prefix (String. err-bytes "UTF-8"))))
         (System/exit 1))
-      (.write System/out out-bytes)
-      (.flush System/out))))
+      out-bytes)))
+
+(defn- optimize-wasm
+  "Run wasm-opt -O3 on WASM binary. Returns optimized bytes, or original if wasm-opt unavailable."
+  [wasm-bytes]
+  (try
+    (run-process ["wasm-opt" "-O3"
+                  "--enable-gc" "--enable-reference-types"
+                  "--enable-tail-call" "--enable-exception-handling"
+                  "--enable-bulk-memory"
+                  "-" "-o" "-"]
+                 wasm-bytes "wasm-opt error: ")
+    (catch java.io.IOException _
+      (binding [*out* *err*]
+        (println "wasm-opt not found, skipping optimization (install: brew install binaryen)"))
+      wasm-bytes)))
+
+(defn- wat->wasm
+  "Convert WAT string to optimized WASM binary using wasm-tools + wasm-opt. Writes binary to stdout."
+  [wat-str]
+  (let [wasm-bytes (run-process ["wasm-tools" "parse" "-"]
+                                (.getBytes wat-str "UTF-8")
+                                "wasm-tools error: ")
+        optimized (optimize-wasm wasm-bytes)]
+    (.write System/out ^bytes optimized)
+    (.flush System/out)))
 
 (defn -main [& args]
   (if (empty? args)

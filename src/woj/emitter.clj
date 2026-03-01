@@ -22,6 +22,7 @@
 (def ^:dynamic *direct-fn-globals* {})  ;; map of name -> arity for direct functions
 (def ^:dynamic *fn-refs* #{})  ;; direct function globals used as values (need wrappers)
 (def ^:dynamic *closure-funcs* [])  ;; closure function names that need elem declarations
+(def ^:dynamic *lifted-fn-inits* [])  ;; init code for hoisted non-capturing fn globals
 (def ^:dynamic *builtin-refs* #{})  ;; builtins used as values (need wrapper closures)
 (def ^:dynamic *emitted-fn-names* #{})  ;; track emitted function names to prevent duplicates
 (def ^:dynamic *strings* {})  ;; string -> id mapping for interning (from analyzer)
@@ -40,7 +41,7 @@
 (def ^:dynamic *user-types* {})
 
 ;; Forward declarations
-(declare emit emit-str)
+(declare emit emit-str emit-call-node emit-call-dispatch)
 
 ;; Tail call optimization
 (def ^:dynamic *tail-position* false)  ;; true when emitting code in tail position of a function  ;; type-name -> {:tag N, :fields [...], :kind :deftype/:defrecord}
@@ -390,6 +391,58 @@
     :else
     (emit-unbox (emit ast))))
 
+(defn- emit-f64-raw
+  "Emit an expression as raw f64, avoiding boxing/unboxing when possible."
+  [ast]
+  (cond
+    ;; Float constant
+    (= (:op ast) :float)
+    [:f64.const (:val ast)]
+
+    ;; Int constant promoted to f64
+    (and (= (:op ast) :const) (= (:type ast) :int))
+    [:f64.const (double (:val ast))]
+
+    ;; Typed arithmetic call with f64 result
+    (and (= (:op ast) :call) (= :f64 (:num-type ast)))
+    (let [fn-name (get-in ast [:fn :name])
+          args (:args ast)]
+      (case fn-name
+        (+ - * /)
+        (let [wasm-op (case fn-name + :f64.add - :f64.sub * :f64.mul / :f64.div)]
+          [wasm-op (emit-f64-raw (first args)) (emit-f64-raw (second args))])
+        inc [:f64.add (emit-f64-raw (first args)) [:f64.const 1.0]]
+        dec [:f64.sub (emit-f64-raw (first args)) [:f64.const 1.0]]
+        ;; fallback: emit normally and extract f64
+        [:struct.get "$Float" "$val" [:ref.cast [:ref "$Float"] (emit ast)]]))
+
+    ;; Local with known f64 type
+    (and (= (:op ast) :local) (= :f64 (:num-type ast)))
+    [:struct.get "$Float" "$val" [:ref.cast [:ref "$Float"] [:local.get (str "$" (munge-name (:name ast)))]]]
+
+    ;; i32 promoted to f64
+    (= :i32 (:num-type ast))
+    [:f64.convert_i32_s (emit-i32-raw ast)]
+
+    ;; if with f64 result
+    (and (= (:op ast) :if) (= :f64 (:num-type ast)))
+    [:if [:result :f64] [:call "$truthy" (emit (:test ast))]
+     [:then (emit-f64-raw (:then ast))]
+     [:else (emit-f64-raw (:else ast))]]
+
+    ;; do/let with f64 result: emit normally and extract
+    (and (#{:do :let} (:op ast)) (= :f64 (:num-type ast)))
+    [:struct.get "$Float" "$val" [:ref.cast [:ref "$Float"] (emit ast)]]
+
+    ;; Fallback: emit normally and extract f64
+    :else
+    [:struct.get "$Float" "$val" [:ref.cast [:ref "$Float"] (emit ast)]]))
+
+(defn- emit-f64-box
+  "Box an f64 value into a $Float struct."
+  [f64-ir]
+  [:struct.new "$Float" [:i32.const 5] f64-ir])
+
 ;; Emit a comparison call directly as i32, skipping $Boolean boxing/unboxing
 (defn- emit-comparison-as-i32 [ast]
   (let [fn-name (get-in ast [:fn :name])
@@ -404,25 +457,36 @@
              [:i32.eqz [:call "$eq" (emit (first args)) (emit (second args))]])
       ;; All others return $Boolean - extract the val field directly
       (< > <= >=)
-      (if (every? #(= :i32 (:num-type %)) args)
+      (cond
+        (every? #(= :i32 (:num-type %)) args)
         (let [wasm-op (case fn-name < :i32.lt_s > :i32.gt_s <= :i32.le_s >= :i32.ge_s)]
           [wasm-op (emit-i32-raw (first args)) (emit-i32-raw (second args))])
+        (every? #(#{:i32 :f64} (:num-type %)) args)
+        (let [wasm-op (case fn-name < :f64.lt > :f64.gt <= :f64.le >= :f64.ge)]
+          [wasm-op (emit-f64-raw (first args)) (emit-f64-raw (second args))])
+        :else
         (let [a (emit (first args))
               b (emit (second args))
               cmp-fn (str "$cmp_" (case fn-name < "lt" > "gt" <= "le" >= "ge"))]
           [:struct.get "$Boolean" "$val" [:ref.cast [:ref "$Boolean"] [:call cmp-fn a b]]]))
       neg?
-      (if (= :i32 (:num-type (first args)))
-        [:i32.lt_s (emit-i32-raw (first args)) [:i32.const 0]]
-        [:struct.get "$Boolean" "$val" [:ref.cast [:ref "$Boolean"] [:call "$cmp_lt" (emit (first args)) [:ref.i31 [:i32.const 0]]]]])
+      (let [a (first args)]
+        (cond
+          (= :i32 (:num-type a)) [:i32.lt_s (emit-i32-raw a) [:i32.const 0]]
+          (= :f64 (:num-type a)) [:f64.lt (emit-f64-raw a) [:f64.const 0.0]]
+          :else [:struct.get "$Boolean" "$val" [:ref.cast [:ref "$Boolean"] [:call "$cmp_lt" (emit a) [:ref.i31 [:i32.const 0]]]]]))
       pos?
-      (if (= :i32 (:num-type (first args)))
-        [:i32.gt_s (emit-i32-raw (first args)) [:i32.const 0]]
-        [:struct.get "$Boolean" "$val" [:ref.cast [:ref "$Boolean"] [:call "$cmp_gt" (emit (first args)) [:ref.i31 [:i32.const 0]]]]])
+      (let [a (first args)]
+        (cond
+          (= :i32 (:num-type a)) [:i32.gt_s (emit-i32-raw a) [:i32.const 0]]
+          (= :f64 (:num-type a)) [:f64.gt (emit-f64-raw a) [:f64.const 0.0]]
+          :else [:struct.get "$Boolean" "$val" [:ref.cast [:ref "$Boolean"] [:call "$cmp_gt" (emit a) [:ref.i31 [:i32.const 0]]]]]))
       zero?
-      (if (= :i32 (:num-type (first args)))
-        [:i32.eqz (emit-i32-raw (first args))]
-        [:struct.get "$Boolean" "$val" [:ref.cast [:ref "$Boolean"] [:call "$zero_QMARK_" (emit (first args))]]])
+      (let [a (first args)]
+        (cond
+          (= :i32 (:num-type a)) [:i32.eqz (emit-i32-raw a)]
+          (= :f64 (:num-type a)) [:f64.eq (emit-f64-raw a) [:f64.const 0.0]]
+          :else [:struct.get "$Boolean" "$val" [:ref.cast [:ref "$Boolean"] [:call "$zero_QMARK_" (emit a)]]]))
       NaN?
       [:struct.get "$Boolean" "$val" [:ref.cast [:ref "$Boolean"] [:call "$is_nan" (emit (first args))]]]
       ;; Fallback - shouldn't happen but just in case
@@ -441,6 +505,417 @@
   (if (comparison-call? ast)
     (emit-comparison-as-i32 ast)
     [:call "$truthy" (emit ast)]))
+
+
+(defn- emit-call-node
+  "Handle all :call AST nodes. Extracted from emit to avoid paren hook issues."
+  [{:keys [] :as ast}]
+  (let [fn-ast (:fn ast)
+        fn-ast-op (:op fn-ast)
+        call-args (:args ast)]
+    ;; IIFE elimination: ((fn [x y] body) a b) -> (let [x a, y b] body)
+    (if (and (= fn-ast-op :fn)
+             (not (:is-closure fn-ast))
+             (nil? (:arities fn-ast))
+             (not (:has-recur fn-ast))
+             (= (count (:params fn-ast)) (count call-args)))
+      (emit {:op :let
+             :bindings (mapv (fn [p a] {:name p :init a}) (:params fn-ast) call-args)
+             :body (:body fn-ast)})
+      ;; Normal call dispatch
+      (let [fn-name (when (#{:builtin :global :fn-global} fn-ast-op) (:name fn-ast))
+            tail? *tail-position*
+            call-prefix (if tail? "return_call" "call")]
+        (binding [*tail-position* false]
+          (emit-call-dispatch ast fn-ast fn-ast-op fn-name call-args call-prefix))))))
+
+(defn- emit-call-dispatch
+  "Dispatch a non-IIFE call to the appropriate handler."
+  [ast fn-ast fn-ast-op fn-name call-args call-prefix]
+  (cond
+    ;; Arithmetic: use inline ops when types are known, else call runtime
+    (contains? arithmetic-builtins fn-name)
+    (case (:num-type ast)
+      :i32 (emit-box (emit-i32-raw ast))
+      :f64 (emit-f64-box (emit-f64-raw ast))
+      (case fn-name
+        (+ - * /)
+        (let [op-name (case fn-name + "$add" - "$sub" * "$mul" / "$div")]
+          [:call op-name (emit (first call-args)) (emit (second call-args))])
+        inc [:call "$inc" (emit (first call-args))]
+        dec [:call "$dec" (emit (first call-args))]))
+
+    ;; Comparisons: compare, return $Boolean
+    (contains? comparison-builtins fn-name)
+    (case fn-name
+      (= not=)
+      (let [a (emit (first call-args))
+            b (emit (second call-args))]
+        (case fn-name
+          = (emit-bool [:call "$eq" a b])
+          not= (emit-bool [:i32.eqz [:call "$eq" a b]])))
+      (< > <= >=)
+      (cond
+        (every? #(= :i32 (:num-type %)) call-args)
+        (let [wasm-op (case fn-name < :i32.lt_s > :i32.gt_s <= :i32.le_s >= :i32.ge_s)]
+          (emit-bool [wasm-op (emit-i32-raw (first call-args)) (emit-i32-raw (second call-args))]))
+        (every? #(#{:i32 :f64} (:num-type %)) call-args)
+        (let [wasm-op (case fn-name < :f64.lt > :f64.gt <= :f64.le >= :f64.ge)]
+          (emit-bool [wasm-op (emit-f64-raw (first call-args)) (emit-f64-raw (second call-args))]))
+        :else
+        (let [cmp-fn (str "$cmp_" (case fn-name < "lt" > "gt" <= "le" >= "ge"))]
+          [:call cmp-fn (emit (first call-args)) (emit (second call-args))]))
+      neg?
+      (let [a (first call-args)]
+        (cond
+          (= :i32 (:num-type a)) (emit-bool [:i32.lt_s (emit-i32-raw a) [:i32.const 0]])
+          (= :f64 (:num-type a)) (emit-bool [:f64.lt (emit-f64-raw a) [:f64.const 0.0]])
+          :else [:call "$cmp_lt" (emit a) [:ref.i31 [:i32.const 0]]]))
+      pos?
+      (let [a (first call-args)]
+        (cond
+          (= :i32 (:num-type a)) (emit-bool [:i32.gt_s (emit-i32-raw a) [:i32.const 0]])
+          (= :f64 (:num-type a)) (emit-bool [:f64.gt (emit-f64-raw a) [:f64.const 0.0]])
+          :else [:call "$cmp_gt" (emit a) [:ref.i31 [:i32.const 0]]]))
+      zero?
+      (let [a (first call-args)]
+        (cond
+          (= :i32 (:num-type a)) (emit-bool [:i32.eqz (emit-i32-raw a)])
+          (= :f64 (:num-type a)) (emit-bool [:f64.eq (emit-f64-raw a) [:f64.const 0.0]])
+          :else [:call "$zero_QMARK_" (emit a)]))
+      NaN?
+      [:call "$is_nan" (emit (first call-args))])
+
+    ;; Boolean ops: use $truthy for polymorphic truthiness
+    (contains? boolean-builtins fn-name)
+    (case fn-name
+      not (emit-bool [:i32.eqz [:call "$truthy" (emit (first call-args))]])
+      and
+      (let [a (emit (first call-args))
+            b (emit (second call-args))]
+        [:if [:result :anyref] [:call "$truthy" a]
+         [:then b]
+         [:else a]])
+      or
+      (let [a (emit (first call-args))
+            b (emit (second call-args))]
+        [:if [:result :anyref] [:call "$truthy" a]
+         [:then a]
+         [:else b]]))
+
+    ;; List operations - work directly with anyref
+    (contains? list-builtins fn-name)
+    (into [:call (str "$" (munge-name fn-name))] (map emit call-args))
+
+    ;; Vector operations
+    (contains? vector-builtins fn-name)
+    (let [arg0 (first call-args)
+          narrowed (:narrowed-type arg0)]
+      (case fn-name
+        nth (if (= :vector narrowed)
+              [:call "$vector_nth" (emit arg0) (emit-unbox (emit (second call-args)))]
+              [:call "$nth_polymorphic" (emit arg0) (emit-unbox (emit (second call-args)))])
+        count (case narrowed
+                :vector (emit-box [:call "$vector_count" (emit arg0)])
+                :string (emit-box [:call "$str_codepoint_count" (emit arg0)])
+                :map (emit-box [:struct.get "$HashMap" "$count" [:ref.cast [:ref "$HashMap"] (emit arg0)]])
+                :set (emit-box [:struct.get "$HashSet" "$count" [:ref.cast [:ref "$HashSet"] (emit arg0)]])
+                (emit-box [:call "$count_internal" (emit arg0)]))
+        conj
+        (let [[base elements] (collect-conj-chain ast)]
+          (reduce (fn [acc elem-ast]
+                    [:call "$conj" acc (emit elem-ast)])
+                  (emit base)
+                  elements))
+        vector? [:call "$vector_QMARK_" (emit arg0)]
+        empty-vector [:call "$empty_vector"]))
+
+    ;; Polymorphic operations (work on multiple types)
+    (contains? polymorphic-builtins fn-name)
+    (case fn-name
+      assoc [:call "$assoc" (emit (first call-args)) (emit (second call-args)) (emit (nth call-args 2))])
+
+    ;; Reduce operations
+    (contains? reduce-builtins fn-name)
+    (case fn-name
+      reduce
+      (if (= (count call-args) 2)
+        [:call "$reduce_no_init" (emit (first call-args)) (emit (second call-args))]
+        [:call "$reduce" (emit (first call-args)) (emit (second call-args)) (emit (nth call-args 2))])
+      reduce-kv [:call "$reduce_kv" (emit (first call-args)) (emit (second call-args)) (emit (nth call-args 2))]
+      reduced [:call "$reduced" (emit (first call-args))]
+      reduced? [:call "$bool" [:call "$reduced_QMARK_" (emit (first call-args))]])
+
+    ;; Lazy sequence operations
+    (contains? lazy-seq-builtins fn-name)
+    (case fn-name
+      make-lazy-seq [:call "$make_lazy_seq" (emit (first call-args))]
+      lazy-seq? [:call "$lazy_seq_QMARK_" (emit (first call-args))]
+      lazy-seq-realized? [:call "$lazy_seq_realized_QMARK_" (emit (first call-args))])
+
+    ;; String operations
+    (contains? string-builtins fn-name)
+    (case fn-name
+      str1 [:call "$str1" (emit (first call-args))]
+      str-concat [:call "$str_concat" (emit (first call-args)) (emit (second call-args))]
+      name [:call "$name_fn" (emit (first call-args))]
+      subs [:call "$subs" (emit (first call-args)) (emit-unbox (emit (second call-args))) (emit-unbox (emit (nth call-args 2)))]
+      string->mem! (emit-box [:call "$string__GT_mem_BANG_" (emit (first call-args)) (emit-unbox (emit (second call-args)))])
+      mem->string [:call "$mem__GT_string" (emit-unbox (emit (first call-args))) (emit-unbox (emit (second call-args)))]
+      pr-str1 [:call "$pr_str1" (emit (first call-args))]
+      char [:call "$char_from_code" (emit-unbox (emit (first call-args)))]
+      str-hash (emit-box [:call "$str_hash" (emit (first call-args))]))
+
+    ;; Float operation builtins
+    (contains? float-op-builtins fn-name)
+    (let [v (emit (first call-args))]
+      (case fn-name
+        to-float [:struct.new "$Float" [:i32.const 5] [:call "$to_f64" v]]
+        to-int [:if [:result :anyref] [:ref.test [:ref :i31] v]
+                [:then v]
+                [:else [:ref.i31 [:i32.trunc_sat_f64_s [:f64.trunc [:call "$to_f64" v]]]]]]
+        math-floor [:struct.new "$Float" [:i32.const 5] [:f64.floor [:call "$to_f64" v]]]
+        math-ceil [:struct.new "$Float" [:i32.const 5] [:f64.ceil [:call "$to_f64" v]]]
+        math-sqrt [:struct.new "$Float" [:i32.const 5] [:f64.sqrt [:call "$to_f64" v]]]
+        math-abs [:struct.new "$Float" [:i32.const 5] [:f64.abs [:call "$to_f64" v]]]
+        math-round [:struct.new "$Float" [:i32.const 5] [:f64.nearest [:call "$to_f64" v]]]))
+
+    ;; Exception builtins
+    (contains? exception-builtins fn-name)
+    (case fn-name
+      ex-info [:struct.new "$ExceptionInfo" [:i32.const 100]
+               (emit (first call-args)) (emit (second call-args))
+               (if (>= (count call-args) 3) (emit (nth call-args 2)) [:ref.null :none])]
+      ex-data [:struct.get "$ExceptionInfo" "$data" [:ref.cast [:ref "$ExceptionInfo"] (emit (first call-args))]]
+      ex-message [:struct.get "$ExceptionInfo" "$message" [:ref.cast [:ref "$ExceptionInfo"] (emit (first call-args))]]
+      ex-cause [:struct.get "$ExceptionInfo" "$cause" [:ref.cast [:ref "$ExceptionInfo"] (emit (first call-args))]])
+
+    ;; String primitives
+    (contains? #{'str-index-of 'str-to-lower 'str-to-upper 'str-starts-with 'str-ends-with 'str-trim 'str-replace 'str-split} fn-name)
+    (case fn-name
+      str-index-of [:call "$str_index_of" (emit (first call-args)) (emit (second call-args))]
+      str-to-lower [:call "$str_to_lower" (emit (first call-args))]
+      str-to-upper [:call "$str_to_upper" (emit (first call-args))]
+      str-starts-with [:call "$str_starts_with" (emit (first call-args)) (emit (second call-args))]
+      str-ends-with [:call "$str_ends_with" (emit (first call-args)) (emit (second call-args))]
+      str-trim [:call "$str_trim" (emit (first call-args))]
+      str-replace [:call "$str_replace" (emit (first call-args)) (emit (second call-args)) (emit (nth call-args 2))]
+      str-split [:call "$str_split" (emit (first call-args)) (emit (second call-args))])
+
+    ;; Print operations (WASI fd_write)
+    (contains? #{'print! 'pr! 'print-str!} fn-name)
+    (case fn-name
+      print! [:call "$print_BANG_" (emit (first call-args))]
+      pr! [:call "$pr_BANG_" (emit (first call-args))]
+      print-str! [:call "$print_str_BANG_" (emit (first call-args))])
+
+    ;; Metadata operations
+    (contains? metadata-builtins fn-name)
+    (case fn-name
+      with-meta [:call "$with_meta_" (emit (first call-args)) (emit (second call-args))]
+      meta [:call "$meta_" (emit (first call-args))])
+
+    ;; Atom watch/validator operations
+    (contains? atom-watch-builtins fn-name)
+    (case fn-name
+      add-watch [:call "$add_watch" (emit (first call-args)) (emit (second call-args)) (emit (nth call-args 2))]
+      remove-watch [:call "$remove_watch" (emit (first call-args)) (emit (second call-args))]
+      set-validator! [:call "$set_validator_BANG_" (emit (first call-args)) (emit (second call-args))])
+
+    ;; Regex
+    (= fn-name 're-pattern)
+    [:struct.new "$Regex" [:i32.const 98] (emit (first call-args))]
+
+    ;; Bit operations: native WASM i32 instructions
+    (contains? bit-builtins fn-name)
+    (case fn-name
+      bit-and (emit-box [:i32.and (emit-unbox (emit (first call-args))) (emit-unbox (emit (second call-args)))])
+      bit-or (emit-box [:i32.or (emit-unbox (emit (first call-args))) (emit-unbox (emit (second call-args)))])
+      bit-xor (emit-box [:i32.xor (emit-unbox (emit (first call-args))) (emit-unbox (emit (second call-args)))])
+      bit-not (emit-box [:i32.xor (emit-unbox (emit (first call-args))) [:i32.const -1]])
+      bit-shift-left (emit-box [:i32.shl (emit-unbox (emit (first call-args))) (emit-unbox (emit (second call-args)))])
+      bit-shift-right (emit-box [:i32.shr_s (emit-unbox (emit (first call-args))) (emit-unbox (emit (second call-args)))])
+      unsigned-bit-shift-right (emit-box [:i32.shr_u (emit-unbox (emit (first call-args))) (emit-unbox (emit (second call-args)))])
+      bit-test [:call "$bool" [:i32.and [:i32.shr_u (emit-unbox (emit (first call-args))) (emit-unbox (emit (second call-args)))] [:i32.const 1]]])
+
+    ;; Compare: three-way comparison returning -1/0/1
+    (contains? compare-builtins fn-name)
+    [:call "$__compare" (emit (first call-args)) (emit (second call-args))]
+
+    ;; Array operations: native WasmGC array instructions
+    (contains? array-op-builtins fn-name)
+    (case fn-name
+      make-array [:array.new_default "$AnyArray" (emit-unbox (emit (first call-args)))]
+      aget [:array.get "$AnyArray" [:ref.cast [:ref "$AnyArray"] (emit (first call-args))] (emit-unbox (emit (second call-args)))]
+      aset [:call "$__aset" (emit (first call-args)) (emit-unbox (emit (second call-args))) (emit (nth call-args 2))]
+      alength (emit-box [:array.len [:ref.cast [:ref "$AnyArray"] (emit (first call-args))]])
+      aclone [:call "$__aclone" (emit (first call-args))]
+      acopy [:block [:result :anyref]
+             [:array.copy "$AnyArray" "$AnyArray"
+              [:ref.cast [:ref "$AnyArray"] (emit (nth call-args 2))] (emit-unbox (emit (nth call-args 3)))
+              [:ref.cast [:ref "$AnyArray"] (emit (first call-args))] (emit-unbox (emit (second call-args)))
+              (emit-unbox (emit (nth call-args 4)))]
+             [:ref.null :none]]
+      object-array [:call "$__object_array" (emit (first call-args))]
+      array? [:call "$bool" [:ref.test [:ref "$AnyArray"] (emit (first call-args))]]
+      vector-from-array [:call "$vector_from_array" (emit (first call-args))])
+
+    ;; Transient collection operations
+    (contains? transient-builtins fn-name)
+    (case fn-name
+      transient    [:call "$transient" (emit (first call-args))]
+      persistent!  [:call "$persistent_BANG_" (emit (first call-args))]
+      conj!        [:call "$conj_BANG_" (emit (first call-args)) (emit (second call-args))]
+      assoc!       [:call "$assoc_BANG_" (emit (first call-args)) (emit (second call-args)) (emit (nth call-args 2))]
+      dissoc!      [:call "$dissoc_BANG_" (emit (first call-args)) (emit (second call-args))]
+      disj!        [:call "$disj_BANG_" (emit (first call-args)) (emit (second call-args))]
+      pop!         [:call "$pop_BANG_" (emit (first call-args))])
+
+    ;; Map operations
+    (contains? map-builtins fn-name)
+    (case fn-name
+      get (if (= (count call-args) 3)
+            [:call "$hash_map_get_default" (emit (first call-args)) (emit (second call-args)) (emit (nth call-args 2))]
+            [:call "$hash_map_get" (emit (first call-args)) (emit (second call-args))])
+      contains? [:call "$contains_QMARK_" (emit (first call-args)) (emit (second call-args))]
+      map? [:call "$map_QMARK_" (emit (first call-args))]
+      empty-hash-map [:call "$empty_hash_map"]
+      assoc-map [:call "$hash_map_assoc" (emit (first call-args)) (emit (second call-args)) (emit (nth call-args 2))]
+      make-array-map [:call "$make_array_map" (emit (first call-args)) (emit-unbox (emit (second call-args)))]
+      dissoc [:call "$dissoc" (emit (first call-args)) (emit (second call-args))]
+      keys [:call "$keys" (emit (first call-args))]
+      vals [:call "$vals" (emit (first call-args))])
+
+    ;; Set operations
+    (contains? set-builtins fn-name)
+    (case fn-name
+      set? [:call "$set_QMARK_" (emit (first call-args))]
+      empty-hash-set [:call "$empty_hash_set"]
+      set-conj [:call "$set_conj" (emit (first call-args)) (emit (second call-args))]
+      disj [:call "$disj" (emit (first call-args)) (emit (second call-args))])
+
+    ;; Seq operations
+    (contains? seq-builtins fn-name)
+    (let [arg0 (first call-args)
+          narrowed (:narrowed-type arg0)]
+      (case fn-name
+        seq [:call "$seq" (emit arg0)]
+        seq? [:call "$seq_QMARK_" (emit arg0)]
+        seqable? [:call "$seqable_QMARK_" (emit arg0)]
+        empty? (case narrowed
+                 :vector [:call "$bool" [:i32.eqz [:call "$vector_count" (emit arg0)]]]
+                 :map [:call "$bool" [:i32.eqz [:struct.get "$HashMap" "$count" [:ref.cast [:ref "$HashMap"] (emit arg0)]]]]
+                 :set [:call "$bool" [:i32.eqz [:struct.get "$HashSet" "$count" [:ref.cast [:ref "$HashSet"] (emit arg0)]]]]
+                 [:call "$empty_QMARK_" (emit arg0)])))
+
+    ;; Atom operations
+    (contains? atom-builtins fn-name)
+    (case fn-name
+      atom [:call "$atom" (emit (first call-args))]
+      deref [:call "$deref" (emit (first call-args))]
+      atom? [:call "$atom_QMARK_" (emit (first call-args))]
+      reset! [:call "$reset_BANG_" (emit (first call-args)) (emit (second call-args))]
+      swap!
+      (let [a (emit (first call-args))
+            f (emit (second call-args))
+            extra-args (drop 2 call-args)]
+        (if (empty? extra-args)
+          [:call "$swap_BANG_" a f]
+          (into [:call (str "$swap_BANG_" (inc (count extra-args))) a f]
+                (map emit extra-args)))))
+
+    ;; User-defined function call (callable global - may hold closure)
+    (= fn-ast-op :global)
+    (let [munged (munge-name fn-name)
+          emitted-args (into [] (map emit call-args))
+          arity (count emitted-args)]
+      (cond
+        ;; Host import: unbox args to i32, box i32 result
+        (contains? *host-import-fns* munged)
+        (emit-box (into [:call (str "$" munged)] (map emit-unbox emitted-args)))
+        ;; Callable global (closure) - use invokeN
+        (contains? *callable-globals* fn-name)
+        (into [(keyword call-prefix) (str "$invoke" arity) [:global.get (str "$" munged)]] emitted-args)
+        ;; Direct function - use internal name if available
+        :else
+        (let [call-name (get *internal-fn-names* munged munged)]
+          (into [(keyword call-prefix) (str "$" call-name)] emitted-args))))
+
+    ;; Direct function global - always a direct call
+    (= fn-ast-op :fn-global)
+    (let [munged (munge-name fn-name)
+          emitted-args (into [] (map emit call-args))
+          arg-count (count emitted-args)
+          fn-info (or (get *direct-fn-globals* fn-name) (:fn-info fn-ast))
+          fixed-arities (or (:arities fn-info) #{})
+          variadic? (:variadic? fn-info)
+          min-arity (or (:min-arity fn-info) 0)
+          is-true-multi-arity (> (count fixed-arities) 1)
+          has-variadic-alongside-fixed (and variadic? (seq fixed-arities))
+          is-multi-arity (or is-true-multi-arity has-variadic-alongside-fixed)
+          has-exact-match (contains? fixed-arities arg-count)
+          build-rest-list (fn [rest-args]
+                            (if (empty? rest-args)
+                              [:ref.null :none]
+                              (reduce (fn [acc arg] [:call "$cons" arg acc])
+                                      [:ref.null :none]
+                                      (reverse rest-args))))]
+      (cond
+        ;; Multi-arity with exact match
+        (and is-multi-arity has-exact-match)
+        (into [(keyword call-prefix) (str "$" munged "_arity" arg-count "_internal")] emitted-args)
+
+        ;; Multi-arity with variadic (no exact match)
+        (and is-multi-arity variadic? (not has-exact-match))
+        (let [variadic-min (if (seq fixed-arities)
+                             (apply max (filter #(<= % arg-count) (conj fixed-arities min-arity)))
+                             min-arity)
+              required-args (take variadic-min emitted-args)
+              rest-args (drop variadic-min emitted-args)]
+          (into [(keyword call-prefix) (str "$" munged "_variadic_internal")]
+                (concat required-args [(build-rest-list rest-args)])))
+
+        ;; Single variadic function
+        variadic?
+        (let [required-args (take min-arity emitted-args)
+              rest-args (drop min-arity emitted-args)
+              call-name (get *internal-fn-names* munged munged)]
+          (into [(keyword call-prefix) (str "$" call-name)]
+                (concat required-args [(build-rest-list rest-args)])))
+
+        ;; Regular single-arity function
+        :else
+        (let [call-name (get *internal-fn-names* munged munged)]
+          (into [(keyword call-prefix) (str "$" call-name)] emitted-args))))
+
+    ;; Builtin not in special categories - legacy call
+    (= fn-ast-op :builtin)
+    (let [emitted-args (into [] (map emit call-args))
+          munged (munge-name fn-name)
+          call-name (get *internal-fn-names* munged munged)]
+      (into [(keyword call-prefix) (str "$" call-name)] emitted-args))
+
+    ;; Calling a local variable - must be a closure, use invokeN
+    (= fn-ast-op :local)
+    (let [emitted-args (into [] (map emit call-args))
+          arity (count emitted-args)]
+      (into [(keyword call-prefix) (str "$invoke" arity) [:local.get (str "$" (munge-name (:name fn-ast)))]]
+            emitted-args))
+
+    ;; Calling a captured variable - must be a closure, use invokeN
+    (= fn-ast-op :captured)
+    (let [emitted-args (into [] (map emit call-args))
+          arity (count emitted-args)]
+      (into [(keyword call-prefix) (str "$invoke" arity) (emit fn-ast)]
+            emitted-args))
+
+    ;; Calling the result of another expression (e.g., ((constantly x)))
+    :else
+    (let [emitted-args (into [] (map emit call-args))
+          arity (count emitted-args)]
+      (into [(keyword call-prefix) (str "$invoke" arity) (emit fn-ast)]
+            emitted-args))))
+
 
 (defn emit [{:keys [op] :as ast}]
   (cond
@@ -489,390 +964,7 @@
     [:call "$array_get" [:local.get *closure-env-param*] [:i32.const (:index ast)]]
 
     (= op :call)
-    (let [fn-ast (:fn ast)
-          fn-name (when (#{:builtin :global :fn-global} (:op fn-ast)) (:name fn-ast))
-          ;; Capture tail position and clear for argument evaluation
-          tail? *tail-position*
-          call-prefix (if tail? "return_call" "call")]
-      (binding [*tail-position* false]
-       (cond
-        ;; Arithmetic: use inline i32 ops when types are known, else call runtime
-        (contains? arithmetic-builtins fn-name)
-        (if (= :i32 (:num-type ast))
-          (emit-box (emit-i32-raw ast))
-          (let [args (:args ast)]
-            (case fn-name
-              (+ - * /)
-              (let [op-name (case fn-name + "$add" - "$sub" * "$mul" / "$div")]
-                [:call op-name (emit (first args)) (emit (second args))])
-              inc [:call "$inc" (emit (first args))]
-              dec [:call "$dec" (emit (first args))])))
-
-;; Comparisons: compare, return $Boolean
-        (contains? comparison-builtins fn-name)
-        (let [args (:args ast)]
-          (case fn-name
-            (= not=)
-            (let [a (emit (first args))
-                  b (emit (second args))]
-              (case fn-name
-                = (emit-bool [:call "$eq" a b])
-                not= (emit-bool [:i32.eqz [:call "$eq" a b]])))
-            (< > <= >=)
-            (if (every? #(= :i32 (:num-type %)) args)
-              (let [wasm-op (case fn-name < :i32.lt_s > :i32.gt_s <= :i32.le_s >= :i32.ge_s)]
-                (emit-bool [wasm-op (emit-i32-raw (first args)) (emit-i32-raw (second args))]))
-              (let [cmp-fn (str "$cmp_" (case fn-name < "lt" > "gt" <= "le" >= "ge"))]
-                [:call cmp-fn (emit (first args)) (emit (second args))]))
-            neg?
-            (let [a (first args)]
-              (if (= :i32 (:num-type a))
-                (emit-bool [:i32.lt_s (emit-i32-raw a) [:i32.const 0]])
-                [:call "$cmp_lt" (emit a) [:ref.i31 [:i32.const 0]]]))
-            pos?
-            (let [a (first args)]
-              (if (= :i32 (:num-type a))
-                (emit-bool [:i32.gt_s (emit-i32-raw a) [:i32.const 0]])
-                [:call "$cmp_gt" (emit a) [:ref.i31 [:i32.const 0]]]))
-            zero?
-            (let [a (first args)]
-              (if (= :i32 (:num-type a))
-                (emit-bool [:i32.eqz (emit-i32-raw a)])
-                [:call "$zero_QMARK_" (emit a)]))
-            NaN?
-            [:call "$is_nan" (emit (first args))]))
-
-;; Boolean ops: use $truthy for polymorphic truthiness
-        (contains? boolean-builtins fn-name)
-        (let [args (:args ast)]
-          (case fn-name
-            not (emit-bool [:i32.eqz [:call "$truthy" (emit (first args))]])
-            and
-            (let [a (emit (first args))
-                  b (emit (second args))]
-              [:if [:result :anyref] [:call "$truthy" a]
-               [:then b]
-               [:else a]])
-            or
-            (let [a (emit (first args))
-                  b (emit (second args))]
-              [:if [:result :anyref] [:call "$truthy" a]
-               [:then a]
-               [:else b]])))
-
-;; List operations - work directly with anyref
-        (contains? list-builtins fn-name)
-        (into [:call (str "$" (munge-name fn-name))] (map emit (:args ast)))
-
-        ;; Vector operations
-        (contains? vector-builtins fn-name)
-        (let [args (:args ast)]
-          (case fn-name
-            nth [:call "$nth_polymorphic" (emit (first args)) (emit-unbox (emit (second args)))]
-            count (emit-box [:call "$count_internal" (emit (first args))])
-            conj
-            (let [[base elements] (collect-conj-chain ast)]
-              (reduce (fn [acc elem-ast]
-                        [:call "$conj" acc (emit elem-ast)])
-                      (emit base)
-                      elements))
-            vector? [:call "$vector_QMARK_" (emit (first args))]
-            empty-vector [:call "$empty_vector"]))
-
-        ;; Polymorphic operations (work on multiple types)
-        (contains? polymorphic-builtins fn-name)
-        (let [args (:args ast)]
-          (case fn-name
-            assoc [:call "$assoc" (emit (first args)) (emit (second args)) (emit (nth args 2))]))
-
-        ;; Reduce operations
-        (contains? reduce-builtins fn-name)
-        (let [args (:args ast)]
-          (case fn-name
-            reduce
-            (if (= (count args) 2)
-              [:call "$reduce_no_init" (emit (first args)) (emit (second args))]
-              [:call "$reduce" (emit (first args)) (emit (second args)) (emit (nth args 2))])
-            reduce-kv [:call "$reduce_kv" (emit (first args)) (emit (second args)) (emit (nth args 2))]
-            reduced [:call "$reduced" (emit (first args))]
-            reduced? [:call "$bool" [:call "$reduced_QMARK_" (emit (first args))]]))
-
-        ;; Lazy sequence operations
-        (contains? lazy-seq-builtins fn-name)
-        (let [args (:args ast)]
-          (case fn-name
-            make-lazy-seq [:call "$make_lazy_seq" (emit (first args))]
-            lazy-seq? [:call "$lazy_seq_QMARK_" (emit (first args))]
-            lazy-seq-realized? [:call "$lazy_seq_realized_QMARK_" (emit (first args))]))
-
-        ;; String operations
-        (contains? string-builtins fn-name)
-        (let [args (:args ast)]
-          (case fn-name
-            str1 [:call "$str1" (emit (first args))]
-            str-concat [:call "$str_concat" (emit (first args)) (emit (second args))]
-            name [:call "$name_fn" (emit (first args))]
-            subs [:call "$subs" (emit (first args)) (emit-unbox (emit (second args))) (emit-unbox (emit (nth args 2)))]
-            string->mem! (emit-box [:call "$string__GT_mem_BANG_" (emit (first args)) (emit-unbox (emit (second args)))])
-            mem->string [:call "$mem__GT_string" (emit-unbox (emit (first args))) (emit-unbox (emit (second args)))]
-            pr-str1 [:call "$pr_str1" (emit (first args))]
-            char [:call "$char_from_code" (emit-unbox (emit (first args)))]
-            str-hash (emit-box [:call "$str_hash" (emit (first args))])))
-
-        ;; Float operation builtins
-        (contains? float-op-builtins fn-name)
-        (let [args (:args ast)
-              v (emit (first args))]
-          (case fn-name
-            to-float [:struct.new "$Float" [:i32.const 5] [:call "$to_f64" v]]
-            to-int [:if [:result :anyref] [:ref.test [:ref :i31] v]
-                    [:then v]
-                    [:else [:ref.i31 [:i32.trunc_sat_f64_s [:f64.trunc [:call "$to_f64" v]]]]]]
-            math-floor [:struct.new "$Float" [:i32.const 5] [:f64.floor [:call "$to_f64" v]]]
-            math-ceil [:struct.new "$Float" [:i32.const 5] [:f64.ceil [:call "$to_f64" v]]]
-            math-sqrt [:struct.new "$Float" [:i32.const 5] [:f64.sqrt [:call "$to_f64" v]]]
-            math-abs [:struct.new "$Float" [:i32.const 5] [:f64.abs [:call "$to_f64" v]]]
-            math-round [:struct.new "$Float" [:i32.const 5] [:f64.nearest [:call "$to_f64" v]]]))
-
-        ;; Exception builtins
-        (contains? exception-builtins fn-name)
-        (let [args (:args ast)]
-          (case fn-name
-            ex-info [:struct.new "$ExceptionInfo" [:i32.const 100]
-                     (emit (first args)) (emit (second args))
-                     (if (>= (count args) 3) (emit (nth args 2)) [:ref.null :none])]
-            ex-data [:struct.get "$ExceptionInfo" "$data" [:ref.cast [:ref "$ExceptionInfo"] (emit (first args))]]
-            ex-message [:struct.get "$ExceptionInfo" "$message" [:ref.cast [:ref "$ExceptionInfo"] (emit (first args))]]
-            ex-cause [:struct.get "$ExceptionInfo" "$cause" [:ref.cast [:ref "$ExceptionInfo"] (emit (first args))]]))
-
-        ;; String primitives
-        (contains? #{'str-index-of 'str-to-lower 'str-to-upper 'str-starts-with 'str-ends-with 'str-trim 'str-replace 'str-split} fn-name)
-        (let [args (:args ast)]
-          (case fn-name
-            str-index-of [:call "$str_index_of" (emit (first args)) (emit (second args))]
-            str-to-lower [:call "$str_to_lower" (emit (first args))]
-            str-to-upper [:call "$str_to_upper" (emit (first args))]
-            str-starts-with [:call "$str_starts_with" (emit (first args)) (emit (second args))]
-            str-ends-with [:call "$str_ends_with" (emit (first args)) (emit (second args))]
-            str-trim [:call "$str_trim" (emit (first args))]
-            str-replace [:call "$str_replace" (emit (first args)) (emit (second args)) (emit (nth args 2))]
-            str-split [:call "$str_split" (emit (first args)) (emit (second args))]))
-
-        ;; Print operations (WASI fd_write)
-        (contains? #{'print! 'pr! 'print-str!} fn-name)
-        (case fn-name
-          print! [:call "$print_BANG_" (emit (first (:args ast)))]
-          pr! [:call "$pr_BANG_" (emit (first (:args ast)))]
-          print-str! [:call "$print_str_BANG_" (emit (first (:args ast)))])
-
-        ;; Metadata operations
-        (contains? metadata-builtins fn-name)
-        (case fn-name
-          with-meta [:call "$with_meta_" (emit (first (:args ast))) (emit (second (:args ast)))]
-          meta [:call "$meta_" (emit (first (:args ast)))])
-
-        ;; Atom watch/validator operations
-        (contains? atom-watch-builtins fn-name)
-        (let [args (:args ast)]
-          (case fn-name
-            add-watch [:call "$add_watch" (emit (first args)) (emit (second args)) (emit (nth args 2))]
-            remove-watch [:call "$remove_watch" (emit (first args)) (emit (second args))]
-            set-validator! [:call "$set_validator_BANG_" (emit (first args)) (emit (second args))]))
-
-        ;; Regex
-        (= fn-name 're-pattern)
-        [:struct.new "$Regex" [:i32.const 98] (emit (first (:args ast)))]
-
-        ;; Bit operations: native WASM i32 instructions
-        (contains? bit-builtins fn-name)
-        (let [args (:args ast)]
-          (case fn-name
-            bit-and (emit-box [:i32.and (emit-unbox (emit (first args))) (emit-unbox (emit (second args)))])
-            bit-or (emit-box [:i32.or (emit-unbox (emit (first args))) (emit-unbox (emit (second args)))])
-            bit-xor (emit-box [:i32.xor (emit-unbox (emit (first args))) (emit-unbox (emit (second args)))])
-            bit-not (emit-box [:i32.xor (emit-unbox (emit (first args))) [:i32.const -1]])
-            bit-shift-left (emit-box [:i32.shl (emit-unbox (emit (first args))) (emit-unbox (emit (second args)))])
-            bit-shift-right (emit-box [:i32.shr_s (emit-unbox (emit (first args))) (emit-unbox (emit (second args)))])
-            unsigned-bit-shift-right (emit-box [:i32.shr_u (emit-unbox (emit (first args))) (emit-unbox (emit (second args)))])
-            bit-test [:call "$bool" [:i32.and [:i32.shr_u (emit-unbox (emit (first args))) (emit-unbox (emit (second args)))] [:i32.const 1]]]))
-
-        ;; Compare: three-way comparison returning -1/0/1
-        (contains? compare-builtins fn-name)
-        [:call "$__compare" (emit (first (:args ast))) (emit (second (:args ast)))]
-
-        ;; Array operations: native WasmGC array instructions
-        (contains? array-op-builtins fn-name)
-        (let [args (:args ast)]
-          (case fn-name
-            make-array [:array.new_default "$AnyArray" (emit-unbox (emit (first args)))]
-            aget [:array.get "$AnyArray" [:ref.cast [:ref "$AnyArray"] (emit (first args))] (emit-unbox (emit (second args)))]
-            aset [:call "$__aset" (emit (first args)) (emit-unbox (emit (second args))) (emit (nth args 2))]
-            alength (emit-box [:array.len [:ref.cast [:ref "$AnyArray"] (emit (first args))]])
-            aclone [:call "$__aclone" (emit (first args))]
-            acopy [:block [:result :anyref]
-                   [:array.copy "$AnyArray" "$AnyArray"
-                    [:ref.cast [:ref "$AnyArray"] (emit (nth args 2))] (emit-unbox (emit (nth args 3)))
-                    [:ref.cast [:ref "$AnyArray"] (emit (first args))] (emit-unbox (emit (second args)))
-                    (emit-unbox (emit (nth args 4)))]
-                   [:ref.null :none]]
-            object-array [:call "$__object_array" (emit (first args))]
-            array? [:call "$bool" [:ref.test [:ref "$AnyArray"] (emit (first args))]]
-            vector-from-array [:call "$vector_from_array" (emit (first args))]))
-
-        ;; Transient collection operations
-        (contains? transient-builtins fn-name)
-        (let [args (:args ast)]
-          (case fn-name
-            transient    [:call "$transient" (emit (first args))]
-            persistent!  [:call "$persistent_BANG_" (emit (first args))]
-            conj!        [:call "$conj_BANG_" (emit (first args)) (emit (second args))]
-            assoc!       [:call "$assoc_BANG_" (emit (first args)) (emit (second args)) (emit (nth args 2))]
-            dissoc!      [:call "$dissoc_BANG_" (emit (first args)) (emit (second args))]
-            disj!        [:call "$disj_BANG_" (emit (first args)) (emit (second args))]
-            pop!         [:call "$pop_BANG_" (emit (first args))]))
-
-        ;; Map operations
-        (contains? map-builtins fn-name)
-        (let [args (:args ast)]
-          (case fn-name
-            get (if (= (count args) 3)
-                  [:call "$hash_map_get_default" (emit (first args)) (emit (second args)) (emit (nth args 2))]
-                  [:call "$hash_map_get" (emit (first args)) (emit (second args))])
-            contains? [:call "$contains_QMARK_" (emit (first args)) (emit (second args))]
-            map? [:call "$map_QMARK_" (emit (first args))]
-            empty-hash-map [:call "$empty_hash_map"]
-            assoc-map [:call "$hash_map_assoc" (emit (first args)) (emit (second args)) (emit (nth args 2))]
-            make-array-map [:call "$make_array_map" (emit (first args)) (emit-unbox (emit (second args)))]
-            dissoc [:call "$dissoc" (emit (first args)) (emit (second args))]
-            keys [:call "$keys" (emit (first args))]
-            vals [:call "$vals" (emit (first args))]))
-
-        ;; Set operations
-        (contains? set-builtins fn-name)
-        (let [args (:args ast)]
-          (case fn-name
-            set? [:call "$set_QMARK_" (emit (first args))]
-            empty-hash-set [:call "$empty_hash_set"]
-            set-conj [:call "$set_conj" (emit (first args)) (emit (second args))]
-            disj [:call "$disj" (emit (first args)) (emit (second args))]))
-
-        ;; Seq operations
-        (contains? seq-builtins fn-name)
-        (let [args (:args ast)]
-          (case fn-name
-            seq [:call "$seq" (emit (first args))]
-            seq? [:call "$seq_QMARK_" (emit (first args))]
-            seqable? [:call "$seqable_QMARK_" (emit (first args))]
-            empty? [:call "$empty_QMARK_" (emit (first args))]))
-
-        ;; Atom operations
-        (contains? atom-builtins fn-name)
-        (let [args (:args ast)]
-          (case fn-name
-            atom [:call "$atom" (emit (first args))]
-            deref [:call "$deref" (emit (first args))]
-            atom? [:call "$atom_QMARK_" (emit (first args))]
-            reset! [:call "$reset_BANG_" (emit (first args)) (emit (second args))]
-            swap!
-            (let [a (emit (first args))
-                  f (emit (second args))
-                  extra-args (drop 2 args)]
-              (if (empty? extra-args)
-                [:call "$swap_BANG_" a f]
-                (into [:call (str "$swap_BANG_" (inc (count extra-args))) a f]
-                      (map emit extra-args))))))
-
-        ;; User-defined function call (callable global - may hold closure)
-        (= (:op fn-ast) :global)
-        (let [munged (munge-name fn-name)
-              emitted-args (into [] (map emit (:args ast)))
-              arity (count emitted-args)]
-          (cond
-            ;; Host import: unbox args to i32, box i32 result
-            (contains? *host-import-fns* munged)
-            (emit-box (into [:call (str "$" munged)] (map emit-unbox emitted-args)))
-            ;; Callable global (closure) - use invokeN
-            (contains? *callable-globals* fn-name)
-            (into [(keyword call-prefix) (str "$invoke" arity) [:global.get (str "$" munged)]] emitted-args)
-            ;; Direct function - use internal name if available
-            :else
-            (let [call-name (get *internal-fn-names* munged munged)]
-              (into [(keyword call-prefix) (str "$" call-name)] emitted-args))))
-
-        ;; Direct function global - always a direct call
-        (= (:op fn-ast) :fn-global)
-        (let [munged (munge-name fn-name)
-              emitted-args (into [] (map emit (:args ast)))
-              arg-count (count emitted-args)
-              fn-info (or (get *direct-fn-globals* fn-name) (:fn-info fn-ast))
-              fixed-arities (or (:arities fn-info) #{})
-              variadic? (:variadic? fn-info)
-              min-arity (or (:min-arity fn-info) 0)
-              is-true-multi-arity (> (count fixed-arities) 1)
-              has-variadic-alongside-fixed (and variadic? (seq fixed-arities))
-              is-multi-arity (or is-true-multi-arity has-variadic-alongside-fixed)
-              has-exact-match (contains? fixed-arities arg-count)
-              build-rest-list (fn [rest-args]
-                                (if (empty? rest-args)
-                                  [:ref.null :none]
-                                  (reduce (fn [acc arg] [:call "$cons" arg acc])
-                                          [:ref.null :none]
-                                          (reverse rest-args))))]
-          (cond
-            ;; Multi-arity with exact match
-            (and is-multi-arity has-exact-match)
-            (into [(keyword call-prefix) (str "$" munged "_arity" arg-count "_internal")] emitted-args)
-
-            ;; Multi-arity with variadic (no exact match)
-            (and is-multi-arity variadic? (not has-exact-match))
-            (let [variadic-min (if (seq fixed-arities)
-                                 (apply max (filter #(<= % arg-count) (conj fixed-arities min-arity)))
-                                 min-arity)
-                  required-args (take variadic-min emitted-args)
-                  rest-args (drop variadic-min emitted-args)]
-              (into [(keyword call-prefix) (str "$" munged "_variadic_internal")]
-                    (concat required-args [(build-rest-list rest-args)])))
-
-            ;; Single variadic function
-            variadic?
-            (let [required-args (take min-arity emitted-args)
-                  rest-args (drop min-arity emitted-args)
-                  call-name (get *internal-fn-names* munged munged)]
-              (into [(keyword call-prefix) (str "$" call-name)]
-                    (concat required-args [(build-rest-list rest-args)])))
-
-            ;; Regular single-arity function
-            :else
-            (let [call-name (get *internal-fn-names* munged munged)]
-              (into [(keyword call-prefix) (str "$" call-name)] emitted-args))))
-
-        ;; Builtin not in special categories - legacy call
-        (= (:op fn-ast) :builtin)
-        (let [emitted-args (into [] (map emit (:args ast)))
-              munged (munge-name fn-name)
-              call-name (get *internal-fn-names* munged munged)]
-          (into [(keyword call-prefix) (str "$" call-name)] emitted-args))
-
-        ;; Calling a local variable - must be a closure, use invokeN
-        (= (:op fn-ast) :local)
-        (let [emitted-args (into [] (map emit (:args ast)))
-              arity (count emitted-args)]
-          (into [(keyword call-prefix) (str "$invoke" arity) [:local.get (str "$" (munge-name (:name fn-ast)))]]
-                emitted-args))
-
-        ;; Calling a captured variable - must be a closure, use invokeN
-        (= (:op fn-ast) :captured)
-        (let [emitted-args (into [] (map emit (:args ast)))
-              arity (count emitted-args)]
-          (into [(keyword call-prefix) (str "$invoke" arity) (emit fn-ast)]
-                emitted-args))
-
-        ;; Calling the result of another expression (e.g., ((constantly x)))
-        :else
-        (let [emitted-args (into [] (map emit (:args ast)))
-              arity (count emitted-args)]
-          (into [(keyword call-prefix) (str "$invoke" arity) (emit fn-ast)]
-                emitted-args)))))
+    (emit-call-node ast)
 
     ;; if: unbox test for conditional, branches return anyref
     (= op :if)
@@ -924,7 +1016,7 @@
     (let [arities (:arities ast)
           multi-arity? (and arities (> (count arities) 1))
           ;; Helper to build env-init IR for captured variables
-          build-env-init (fn [captures]
+                    build-env-init (fn [captures]
                            (if (empty? captures)
                              [:call "$array_new" [:i32.const 0]]
                              (let [env-size (count captures)
@@ -1025,8 +1117,19 @@
                   closure-type (str "$Closure" arity)]
               [:struct.new closure-type [:i32.const 11] [:ref.func fn-name] (build-env-init captures)])
             (let [fn-name (emit-closure-function (str "fn" (inc counter)) params (:body ast) []
-                                                 :has-recur (:has-recur ast) :self-name self-name)]
-              [:struct.new (str "$Closure" arity) [:i32.const 11] [:ref.func fn-name] [:call "$array_new" [:i32.const 0]]])))))
+                                                 :has-recur (:has-recur ast) :self-name self-name)
+                  closure-type (str "$Closure" arity)
+                  global-name (str "$__lifted_fn" (inc counter))]
+              ;; Hoist non-capturing fn to a global singleton initialized in $start
+              (set! *globals-emit* (conj *globals-emit*
+                                         (str "(global " global-name " (mut anyref) (ref.null none))")))
+              (set! *lifted-fn-inits*
+                    (conj *lifted-fn-inits*
+                          (str "(global.set " global-name
+                               " (struct.new " closure-type
+                               " (i32.const 11) (ref.func " fn-name
+                               ") (call $array_new (i32.const 0))))")))
+              [:global.get global-name])))))
 
     (= op :do)
     (let [tail? *tail-position*
@@ -7298,7 +7401,8 @@
             *host-import-fns* #{}
             *protocols* {}
             *protocol-methods* {}
-            *protocol-impls* {}]
+            *protocol-impls* {}
+            *lifted-fn-inits* []]
   ;; Pre-scan: populate *internal-fn-names* for all exported functions
   ;; so cross-namespace calls can resolve to _internal names regardless of emit order
     (doseq [form ast-forms]
@@ -7415,9 +7519,7 @@
                                   (for [[proto-name _] *protocols*
                                         :let [;; Get all impls for methods of this protocol
                                               proto-methods (set (map :name (:methods (get *protocols* proto-name))))
-                                              proto-impls (filter (fn [entry]
-                                                                       (contains? proto-methods (nth (first entry) 1)))
-                                                                     *protocol-impls*)]]
+                                              proto-impls (filter (fn [entry] (contains? proto-methods (nth (first entry) 1))) *protocol-impls*)]]
                                     (generate-satisfies-function proto-name proto-impls)))
         ;; Generate stubs for core protocol methods/satisfies if not already defined
         ;; These are needed because the WAT prelude references them unconditionally
@@ -7659,6 +7761,7 @@
           all-init (concat
                     builtin-init-code fn-init-code proto-init-code
                     dispatch-table-init-code
+                    *lifted-fn-inits*
                     string-init-code
                     (:init-code kw-name-init-code)
                     (:init-code sym-init-code)

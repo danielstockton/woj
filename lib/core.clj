@@ -651,13 +651,10 @@
      m1
      (if (nil? m1)
        m2
-       (let [ks (keys m2)]
-         (loop [result m1 remaining ks]
-           (if (nil? remaining)
-             result
-             (let [k (first remaining)]
-               (recur (assoc result k (get m2 k))
-                      (rest remaining)))))))))
+       (persistent!
+        (reduce-kv (fn [r k v] (assoc! r k v))
+                   (transient m1)
+                   m2)))))
   ([m1 m2 & more]
    (reduce merge (merge m1 m2) more)))
 
@@ -681,13 +678,10 @@
 
 ;; select-keys: returns a map with only the specified keys
 (defn select-keys [m ks]
-  (loop [result {} remaining ks]
-    (if (nil? remaining)
-      result
-      (let [k (first remaining)]
-        (if (contains? m k)
-          (recur (assoc result k (get m k)) (rest remaining))
-          (recur result (rest remaining)))))))
+  (persistent!
+   (reduce (fn [r k] (if (contains? m k) (assoc! r k (get m k)) r))
+           (transient {})
+           ks)))
 
 ;; get-in: get nested value
 (defn get-in
@@ -729,37 +723,27 @@
 
 ;; set: convert collection to set
 (defn set [coll]
-  (loop [result (hash-set) remaining (seq coll)]
-    (if (nil? remaining)
-      result
-      (recur (set-conj result (first remaining)) (next remaining)))))
+  (persistent!
+   (reduce conj! (transient (hash-set)) (seq coll))))
 
 ;; union: union of two sets
 (defn union [s1 s2]
-  (loop [result s1 remaining (seq s2)]
-    (if (nil? remaining)
-      result
-      (recur (set-conj result (first remaining)) (next remaining)))))
+  (persistent!
+   (reduce conj! (transient s1) (seq s2))))
 
 ;; intersection: intersection of two sets
 (defn intersection [s1 s2]
-  (loop [result (hash-set) remaining (seq s1)]
-    (if (nil? remaining)
-      result
-      (let [elem (first remaining)]
-        (if (contains? s2 elem)
-          (recur (set-conj result elem) (rest remaining))
-          (recur result (rest remaining)))))))
+  (persistent!
+   (reduce (fn [r elem] (if (contains? s2 elem) (conj! r elem) r))
+           (transient (hash-set))
+           (seq s1))))
 
 ;; difference: elements in s1 but not in s2
 (defn difference [s1 s2]
-  (loop [result (hash-set) remaining (seq s1)]
-    (if (nil? remaining)
-      result
-      (let [elem (first remaining)]
-        (if (contains? s2 elem)
-          (recur result (rest remaining))
-          (recur (set-conj result elem) (rest remaining)))))))
+  (persistent!
+   (reduce (fn [r elem] (if (contains? s2 elem) r (conj! r elem)))
+           (transient (hash-set))
+           (seq s1))))
 
 ;; subset?: is s1 a subset of s2?
 (defn subset? [s1 s2]
@@ -922,12 +906,12 @@
 
 ;; zipmap: create a map from keys and values sequences
 (defn zipmap [keys vals]
-  (loop [result {} ks keys vs vals]
+  (loop [result (transient {}) ks (seq keys) vs (seq vals)]
     (if (or (nil? ks) (nil? vs))
-      result
-      (recur (assoc result (first ks) (first vs))
-             (rest ks)
-             (rest vs)))))
+      (persistent! result)
+      (recur (assoc! result (first ks) (first vs))
+             (next ks)
+             (next vs)))))
 
 ;; doall: force realization of lazy sequences, returns the collection
 (defn doall [coll]
@@ -1396,20 +1380,22 @@
 
 ;; group-by: group elements by function
 (defn group-by [f coll]
-  (reduce
-   (fn [m x]
-     (let [k (f x)]
-       (assoc m k (conj (get m k []) x))))
-   {}
-   coll))
+  (persistent!
+   (reduce
+    (fn [m x]
+      (let [k (f x)]
+        (assoc! m k (conj (get m k []) x))))
+    (transient {})
+    coll)))
 
 ;; frequencies: count occurrences
 (defn frequencies [coll]
-  (reduce
-   (fn [m x]
-     (assoc m x (inc (get m x 0))))
-   {}
-   coll))
+  (persistent!
+   (reduce
+    (fn [m x]
+      (assoc! m x (inc (get m x 0))))
+    (transient {})
+    coll)))
 
 ;; iterate: defined above with lazy-seq
 
