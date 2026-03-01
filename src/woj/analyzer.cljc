@@ -4,6 +4,41 @@
             [clojure.walk :as walk]))
 
 ;; ============================================
+;; Portable helpers (no JVM interop)
+;; ============================================
+
+(defn- tree-seq-walk
+  "Portable tree-seq: eager depth-first walk collecting all nodes."
+  [branch? children root]
+  (loop [stack (list root)
+         result []]
+    (if (empty? stack)
+      result
+      (let [node (first stack)
+            rst (rest stack)]
+        (if (branch? node)
+          (recur (concat (children node) rst)
+                 (conj result node))
+          (recur rst (conj result node)))))))
+
+(defn- vec-index-of
+  "Like .indexOf on a vector — returns index of first occurrence, or -1."
+  [v item]
+  (let [cnt (count v)]
+    (loop [i 0]
+      (cond
+        (>= i cnt) -1
+        (= (nth v i) item) i
+        :else (recur (inc i))))))
+
+(defn- upper-case-char?
+  "True if the first character of s is A-Z."
+  [s]
+  (when (and s (pos? (count s)))
+    (let [cp (int (first s))]
+      (and (>= cp 65) (<= cp 90)))))
+
+;; ============================================
 ;; Dynamic vars for analysis state
 ;; ============================================
 
@@ -25,6 +60,7 @@
 (def ^:dynamic *macros* {})  ;; macro-name -> macro-fn (Clojure functions for compile-time expansion)
 (def ^:dynamic *builtin-refs* #{})  ;; builtins used as values (not in call position)
 (def ^:dynamic *gensym-counter* (atom 0))  ;; for generating unique symbols in macros
+(def ^:dynamic *dynamic-globals* #{})  ;; set of globals declared with ^:dynamic
 
 ;; ============================================
 ;; Namespace / require support
@@ -37,6 +73,7 @@
 (def ^:dynamic *ns-read-fn* nil)          ;; (fn [source-str] forms-vec)
 (def ^:dynamic *ns-prefix* nil)           ;; when loading a ns, prefix for defs (e.g. "laced_types_counter__")
 (def ^:dynamic *ns-prefix-map* {})        ;; ns-name-str -> prefix string
+(def ^:dynamic *ns-refers* {})            ;; sym -> prefixed-sym (from :refer)
 
 ;; ============================================
 ;; Protocol support
@@ -111,6 +148,7 @@
    'reduce 3, 'reduce-kv 3, 'reduced 1, 'reduced? 1,
    ;; String operations
    'str1 1, 'str-concat 2, 'name 1, 'subs 3, 'string->mem! 2, 'mem->string 2, 'pr-str1 1, 'char 1,
+   'codepoint-at 2, 'char-from-codepoint 1,
    ;; Float operations
    'to-float 1, 'to-int 1, 'math-floor 1, 'math-ceil 1, 'math-sqrt 1, 'math-abs 1, 'math-round 1,
    ;; Numeric
@@ -129,6 +167,7 @@
    'compare 2,
    ;; Print operations
    'print! 1, 'pr! 1, 'print-str! 1,
+   'wasi-slurp 1, 'wasi-stderr 1, 'wasi-args 0,
    ;; String primitives
    'str-index-of 2, 'str-to-lower 1, 'str-to-upper 1,
    'str-starts-with 2, 'str-ends-with 2, 'str-trim 1,
@@ -146,7 +185,12 @@
    ;; Regex
    're-pattern 1, 'regex-pattern 1, 'regex? 1,
    ;; Hash
-   'str-hash 1})
+   'str-hash 1,
+   ;; Memory operations
+   'mem-write-byte! 2, 'mem-read-byte 1,
+   'mem-write-i32-be! 2, 'mem-read-i32-be 1,
+   'mem-write-f64-be! 2, 'mem-read-f64-be 1,
+   'mem-hash 2})
 
 ;; ============================================
 ;; Effect analysis - pure (side-effect-free) builtins
@@ -164,7 +208,7 @@
     'set? 'empty-hash-set
     'keys 'vals
     'atom? 'reduced? 'reduced
-    'name 'subs 'str1 'str-concat 'pr-str1 'char
+    'name 'subs 'str1 'str-concat 'pr-str1 'char 'codepoint-at 'char-from-codepoint
     'to-float 'to-int 'math-floor 'math-ceil 'math-sqrt 'math-abs 'math-round
     'num 'type
     '+ '- '* '/ '= 'not= '< '> '<= '>=
@@ -384,16 +428,16 @@
         name-part (name sym)]
     (or
      ;; Fully qualified Java class (has dots)
-     (and (string? s) (.contains s "."))
+     (and (string? s) (clojure.string/includes? s "."))
      ;; Simple capitalized name (Object, String, etc.)
      (and (not ns-part)
           (string? s)
           (not (empty? s))
-          (Character/isUpperCase (first s)))
+          (let [cp (int (first s))] (and (>= cp 65) (<= cp 90))))
      ;; Java static field/method: Classname/FIELD or Classname/method
      (and ns-part
           (not (empty? ns-part))
-          (Character/isUpperCase (first ns-part))))))
+          (let [cp (int (first ns-part))] (and (>= cp 65) (<= cp 90)))))))
 
 (defn analyze-symbol [sym]
   ;; Handle macro-only special symbols (return nil outside macros)
@@ -415,7 +459,9 @@
       ;; When in a namespace, try the prefixed version of the symbol first
         (let [ns-sym (when *ns-prefix* (symbol (str *ns-prefix* sym)))]
           (if-let [resolved (or (when (and ns-sym (contains? *globals* ns-sym)) ns-sym)
-                                (when (contains? *globals* sym) sym))]
+                                (when (contains? *globals* sym) sym)
+                                (when-let [referred (get *ns-refers* sym)]
+                                  (when (contains? *globals* referred) referred)))]
         ;; Distinguish between direct functions and other globals
             (if-let [fn-info (get *direct-fn-globals* resolved)]
               {:op :fn-global :name resolved :fn-info fn-info}  ;; Direct function, needs special handling
@@ -460,16 +506,26 @@
 (defn analyze-def [form]
   (when (< (count form) 2)
     (throw-error "def requires a name" form))
-  (let [bare-name (second form)
-        bare-meta (meta bare-name)
+  (let [raw-name (second form)
+        bare-meta (meta raw-name)
+        ;; Strip metadata/WithMeta wrapper to get a plain symbol
+        ;; (bootstrap reader wraps ^:foo symbols in WithMeta structs)
+        bare-name (symbol (name raw-name))
         ;; When loading a namespace, prefix the def name to avoid cross-namespace collisions
         name (if *ns-prefix*
-               (with-meta (symbol (str *ns-prefix* bare-name)) bare-meta)
+               (symbol (str *ns-prefix* bare-name))
                bare-name)
+        ;; Track dynamic vars
+        _ (when (:dynamic bare-meta)
+            (set! *dynamic-globals* (conj *dynamic-globals* name)))
         ;; Check for host import metadata (^{:host ["module" "name"]})
         host-spec (:host bare-meta)
-        ;; Support (def x) without init - defaults to nil
-        init-form (if (> (count form) 2) (nth form 2) nil)]
+        ;; Support (def x), (def x val), and (def x "docstring" val)
+        has-docstring (and (> (count form) 3) (string? (nth form 2)))
+        init-form (cond
+                    has-docstring (nth form 3)
+                    (> (count form) 2) (nth form 2)
+                    :else nil)]
     (if host-spec
       ;; Host import: produce :host-import AST node
       ;; init-form is (fn [params] ...) from defn macro expansion
@@ -710,7 +766,7 @@
    Returns {:params [...] :rest-param sym-or-nil :variadic? bool}"
   [params]
   (let [params-vec (vec params)
-        amp-idx (.indexOf params-vec '&)]
+        amp-idx (vec-index-of params-vec '&)]
     (if (neg? amp-idx)
       {:params params-vec :rest-param nil :variadic? false}
       {:params (vec (take amp-idx params-vec))
@@ -772,11 +828,11 @@
         param-env (cond-> (into {} (map (fn [p] [p {:kind :local}]) all-params))
                     fn-name (assoc fn-name {:kind :local}))
         ;; Current env's locals become enclosing locals for nested fn
-        current-locals (set (keys (filter (fn [[_ v]] (= (:kind v) :local)) *env*)))
+        current-locals (into #{} (keep (fn [[k v]] (when (= (:kind v) :local) k))) *env*)
         ;; Include this fn's params (and fn-name if any) in enclosing locals for nested functions
         params-set (cond-> (set all-params)
                      fn-name (conj fn-name))
-        loop-bound? (thread-bound? #'*loop-bindings*)
+        loop-bound? #?(:woj (some? *loop-bindings*) :clj (thread-bound? #'*loop-bindings*))
         old-loop-bindings (when loop-bound? *loop-bindings*)]
     (set! *env* (merge *env* param-env))
     (set! *enclosing-locals* (into (into *enclosing-locals* current-locals) params-set))
@@ -797,7 +853,8 @@
                        fn-name (conj fn-name))
           fv (free-vars body-ast-pass1 fv-exclude)
           ;; Filter to only locals available for capture (not globals)
-          captures (vec (sort (filter #(contains? *enclosing-locals* %) fv)))
+          ;; Also filter nil and empty-named symbols (can occur in woj runtime)
+          captures (vec (sort (filter (fn [sym] (and (some? sym) (symbol? sym) (seq (name sym)) (contains? *enclosing-locals* sym))) fv)))
           is-closure (seq captures)]
       (if is-closure
         ;; Second pass: re-analyze with capture map to generate :captured nodes
@@ -930,7 +987,7 @@
               init (second pair)
               init-ast (analyze init)]
           (set! *env* (assoc *env* name (cond-> {:kind :local}
-                                                 (:num-type init-ast) (assoc :num-type (:num-type init-ast)))))
+                                                (:num-type init-ast) (assoc :num-type (:num-type init-ast)))))
           (recur (rest pairs)
                  (conj analyzed-bindings {:name name :init init-ast})))))))
 
@@ -1037,7 +1094,7 @@
                                    (if (symbol? pattern)
                                      []
                                      (let [;; Find the corresponding tmp symbol
-                                           idx (.indexOf (mapv first (partition 2 raw-bindings)) pattern)
+                                           idx (vec-index-of (mapv first (partition 2 raw-bindings)) pattern)
                                            tmp (nth (take-nth 2 new-bindings) idx)]
                                        [pattern tmp])))
                                  pairs))
@@ -1068,7 +1125,7 @@
                   init (second pair)
                   init-ast (analyze init)]
               (set! *env* (assoc *env* name (cond-> {:kind :local}
-                                                     (:num-type init-ast) (assoc :num-type (:num-type init-ast)))))
+                                                    (:num-type init-ast) (assoc :num-type (:num-type init-ast)))))
               (recur (rest ps)
                      (conj analyzed-bindings {:name name :init init-ast})
                      (conj binding-names name)))))))))
@@ -1134,6 +1191,61 @@
          :then {:op :const :val 0 :type :nil}
          :else body-ast}))))
 
+(defn analyze-binding [form]
+  ;; (binding [*x* val1 *y* val2] body...)
+  ;; Expands to:
+  ;;   (let [save0 *x* save1 *y*]
+  ;;     (set! *x* val1)
+  ;;     (set! *y* val2)
+  ;;     (let [result (try body
+  ;;                    (catch __binding_exn__
+  ;;                      (set! *x* save0) (set! *y* save1)
+  ;;                      (throw __binding_exn__)))]
+  ;;       (set! *x* save0) (set! *y* save1)
+  ;;       result))
+  (let [bindings (second form)
+        body-forms (rest (rest form))]
+    (when-not (vector? bindings)
+      (throw-error "binding requires a vector of bindings" form))
+    (when (odd? (count bindings))
+      (throw-error "binding requires an even number of forms in bindings" form))
+    (let [pairs (partition 2 bindings)
+          counter @*gensym-counter*
+          _ (swap! *gensym-counter* + (count pairs) 2)
+          ;; Generate save symbols for each binding
+          save-syms (mapv (fn [i] (symbol (str "__binding_save_" (+ counter i)))) (range (count pairs)))
+          exn-sym (symbol (str "__binding_exn_" (+ counter (count pairs))))
+          result-sym (symbol (str "__binding_result_" (+ counter (count pairs) 1)))
+          ;; Build the let bindings: [save0 *x* save1 *y*]
+          pairs-vec (vec pairs)
+          let-bindings (vec (mapcat (fn [i] (let [save-sym (nth save-syms i)
+                                                  [var-sym _] (nth pairs-vec i)]
+                                              [save-sym var-sym]))
+                                    (range (count pairs-vec))))
+          ;; Build set! forms for new values
+          set-forms (map (fn [[var-sym val-form]] (list 'set! var-sym val-form)) pairs)
+          ;; Build restore set! forms
+          restore-forms (mapv (fn [i] (let [save-sym (nth save-syms i)
+                                            [var-sym _] (nth pairs-vec i)]
+                                        (list 'set! var-sym save-sym)))
+                              (range (count pairs-vec)))
+          ;; Build catch body: restore then rethrow
+          catch-body (concat restore-forms [(list 'throw exn-sym)])
+          ;; Build try/catch
+          body-expr (if (= 1 (count body-forms))
+                      (first body-forms)
+                      (cons 'do body-forms))
+          try-form (list 'try body-expr
+                         (list* 'catch exn-sym catch-body))
+          ;; After try: restore on normal path and return result
+          inner-let-bindings [result-sym try-form]
+          inner-body (concat restore-forms [result-sym])
+          inner-let (list* 'let inner-let-bindings inner-body)
+          ;; Full expansion
+          full-body (concat set-forms [inner-let])
+          expanded (list 'let let-bindings (cons 'do full-body))]
+      (analyze expanded))))
+
 (defn analyze-set! [form]
   (when (not= (count form) 3)
     (throw-error (str "set! requires exactly 2 arguments (target and value), got " (dec (count form))) form))
@@ -1141,9 +1253,21 @@
         val-form (nth form 2)]
     (when-not (symbol? target)
       (throw-error "set! target must be a symbol" form))
-    (when-not (contains? *globals* target)
-      (throw-error (str "set! target must be a global: " target) form))
-    {:op :set! :name target :val (analyze val-form)}))
+    ;; Resolve target through namespace prefix/aliases if needed
+    (let [;; If target has a namespace (e.g., analyzer/*ns-load-fn*), resolve via aliases
+          alias-resolved (when (namespace target)
+                           (let [ns-str (namespace target)
+                                 full-ns (get *ns-aliases* ns-str)
+                                 prefix (when full-ns (get *ns-prefix-map* full-ns))]
+                             (when prefix
+                               (symbol (str prefix (name target))))))
+          ns-target (when *ns-prefix* (symbol (str *ns-prefix* target)))
+          resolved (or (when (and alias-resolved (contains? *globals* alias-resolved)) alias-resolved)
+                       (when (and ns-target (contains? *globals* ns-target)) ns-target)
+                       (when (contains? *globals* target) target))]
+      (when-not resolved
+        (throw-error (str "set! target must be a global: " target) form))
+      {:op :set! :name resolved :val (analyze val-form)})))
 
 (defn analyze-defn [form]
   (let [name (second form)
@@ -1312,7 +1436,14 @@
           (when-let [parsed (parse-require-spec spec)]
             (load-namespace! (:ns-name parsed))
             (when-let [alias (:as parsed)]
-              (set! *ns-aliases* (assoc *ns-aliases* alias (:ns-name parsed)))))))))
+              (set! *ns-aliases* (assoc *ns-aliases* alias (:ns-name parsed))))
+            ;; Handle :refer — make symbols available without namespace prefix
+            (when-let [refers (:refer parsed)]
+              (let [prefix (ns-name->prefix (:ns-name parsed))]
+                (doseq [sym refers]
+                  (let [prefixed (symbol (str prefix sym))]
+                    (when (contains? *globals* prefixed)
+                      (set! *ns-refers* (assoc *ns-refers* (symbol (name sym)) prefixed))))))))))))
   {:op :const :val 0 :type :nil})
 
 (defn analyze-throw
@@ -1389,12 +1520,14 @@
         ;; We wrap the body to provide gensym, &env, &form as local bindings
         ;; &env and &form are nil since we don't have Clojure's macro environment
         gensym-fn woj-gensym
-        macro-fn (eval `(fn ~params
-                          (let [~'gensym ~gensym-fn
-                                ~'&env nil
-                                ~'&form nil]
-                            ~@body)))]
-    (set! *macros* (assoc *macros* name macro-fn))
+        macro-fn #?(:woj nil  ;; No eval in WASM — macros are handled as special forms by the analyzer
+                    :clj (eval `(fn ~params
+                                      (let [~'gensym ~gensym-fn
+                                            ~'&env nil
+                                            ~'&form nil]
+                                        ~@body))))]
+    (when macro-fn
+      (set! *macros* (assoc *macros* name macro-fn)))
     ;; defmacro produces no runtime code
     {:op :const :val 0 :type :nil}))
 
@@ -1605,7 +1738,7 @@
                             ;; (fn [this] (let [x (.-x this) y (.-y this)] x))
                             ;; When _ is used as this-param, replace with a gensym.
                             raw-this (first params)
-                            this-param (if (= raw-this '_) (gensym "this__") raw-this)
+                            this-param (if (= raw-this '_) (woj-gensym "this__") raw-this)
                             actual-params (if (= raw-this '_)
                                             (vec (cons this-param (rest params)))
                                             params)
@@ -1644,8 +1777,8 @@
   (let [name-sym (second form)
         fields (nth form 2)
         ;; Build the ILookup -lookup method: (cond (= key :f1) (.-f1 this) ... :else nil)
-        this-sym (gensym "this__")
-        key-sym (gensym "key__")
+        this-sym (woj-gensym "this__")
+        key-sym (woj-gensym "key__")
         cond-clauses (mapcat (fn [field]
                                [(list '= key-sym (keyword field))
                                 (list (symbol (str ".-" field)) this-sym)])
@@ -1654,9 +1787,9 @@
         lookup-method (list '-lookup (vector this-sym key-sym) (apply list cond-form))
         ;; Build the IAssociative -assoc method:
         ;; Convert record to a hash-map of its fields, then assoc the new k/v
-        assoc-this (gensym "this__")
-        assoc-key (gensym "key__")
-        assoc-val (gensym "val__")
+        assoc-this (woj-gensym "this__")
+        assoc-key (woj-gensym "key__")
+        assoc-val (woj-gensym "val__")
         map-form (apply list 'hash-map
                         (mapcat (fn [field]
                                   [(keyword field)
@@ -1821,8 +1954,9 @@
     'make-lazy-seq 'lazy-seq? 'lazy-seq-realized?
     ;; String operations
     'str1 'str-concat 'name 'subs 'string->mem! 'mem->string 'pr-str1 'char
+    'codepoint-at 'char-from-codepoint
     ;; Float operations
-    'to-float 'to-int 'math-floor 'math-ceil 'math-sqrt 'math-abs 'math-round
+    'to-float 'to-int 'math-floor 'math-ceil 'math-sqrt 'math-abs 'math-round 'math-random
     ;; Exception operations
     'ex-info 'ex-data 'ex-message 'ex-cause
     ;; Type predicates
@@ -1838,6 +1972,8 @@
     'type
     ;; Print operations (WASI fd_write)
     'print! 'pr! 'print-str!
+    ;; WASI file I/O
+    'wasi-slurp 'wasi-stderr 'wasi-args
     ;; String primitives for clojure.string
     'str-index-of 'str-to-lower 'str-to-upper
     'str-starts-with 'str-ends-with 'str-trim
@@ -1849,7 +1985,16 @@
     ;; Regex
     're-pattern 'regex-pattern 'regex?
     ;; Hash
-    'str-hash})
+    'str-hash
+    ;; Memory operations
+    'mem-write-byte! 'mem-read-byte
+    'mem-write-i32-be! 'mem-read-i32-be
+    'mem-write-f64-be! 'mem-read-f64-be
+    'mem-hash
+    ;; StringBuffer operations (mutable growable byte buffer)
+    'string-buffer 'sb-append! 'sb-append-char! 'sb->string
+    ;; Timing
+    'now-ms})
 
 (defn expand-variadic-assoc
   "Expand (assoc m k1 v1 k2 v2 ...) into nested assoc calls."
@@ -1926,6 +2071,14 @@
       ;; Handle variadic assoc expansion
       (and (= fn-expr 'assoc) (> (count args) 3))
       (analyze (expand-variadic-assoc form))
+
+      ;; Handle variadic dissoc: (dissoc m k1 k2 k3) → (dissoc (dissoc (dissoc m k1) k2) k3)
+      (and (= fn-expr 'dissoc) (> (count args) 2))
+      (analyze (reduce (fn [acc k] (list 'dissoc acc k)) (first args) (rest args)))
+
+      ;; Handle variadic disj: (disj s v1 v2 v3) → (disj (disj (disj s v1) v2) v3)
+      (and (= fn-expr 'disj) (> (count args) 2))
+      (analyze (reduce (fn [acc v] (list 'disj acc v)) (first args) (rest args)))
 
       ;; Handle multi-arg apply: (apply f x y args) → (apply f (cons x (cons y (seq args))))
       (and (= fn-expr 'apply) (> (count args) 2))
@@ -2076,6 +2229,17 @@
       (and (= fn-expr 'filterv) (= (count args) 2))
       (analyze (list 'into [] (list 'filter (first args) (second args))))
 
+      ;; Inline str (0-6 args): avoid multi-arity dispatch + StringBuffer overhead
+      ;; (str) → "", (str x) → (str1-or-pr x), (str a b) → (str-concat (str1-or-pr a) (str1-or-pr b))
+      (and (= fn-expr 'str) (<= (count args) 6))
+      (cond
+        (= (count args) 0) (analyze "")
+        (= (count args) 1) (analyze (list 'str1-or-pr (first args)))
+        :else (let [syms (mapv (fn [_] (woj-gensym "str__")) args)
+                    bindings (vec (interleave syms (map (fn [a] (list 'str1-or-pr a)) args)))
+                    chained (reduce (fn [acc s] (list 'str-concat acc s)) (first syms) (rest syms))]
+                (analyze (list 'let bindings chained))))
+
       ;; Check if this is a protocol method call
       (and (symbol? fn-expr) (contains? *protocol-methods* fn-expr))
       (analyze-protocol-call fn-expr args form)
@@ -2143,7 +2307,7 @@
 (defn analyze-bigint [n]
   "Analyze a BigInt literal - treat as regular integer if small enough, else float."
   (let [v (long n)]
-    (if (and (>= v Integer/MIN_VALUE) (<= v Integer/MAX_VALUE))
+    (if (and (>= v -2147483648) (<= v 2147483647))
       {:op :const :val (int v) :type :int}
       {:op :float :val (double n)})))
 
@@ -2205,22 +2369,22 @@
 
 ;; True special forms that must be in the compiler
 (def special-forms
-  #{'def 'fn 'let 'if 'loop 'recur 'do 'set! 'defmacro})
+  #{'def 'fn 'let 'if 'loop 'recur 'do 'set! 'defmacro 'binding})
 
 (defn analyze [form]
   (let [ast (cond
               (integer? form) (analyze-const form)
-              (ratio? form) (analyze-ratio form)
+              #?@(:clj [(ratio? form) (analyze-ratio form)])
               (instance? clojure.lang.BigInt form) (analyze-bigint form)
               (decimal? form) (analyze-bigdec form)
               (float? form) (analyze-float form)
-              (instance? java.util.regex.Pattern form) (analyze (list 're-pattern (.pattern ^java.util.regex.Pattern form)))
-              (instance? java.util.UUID form) {:op :const :val 0 :type :nil}  ;; UUID stub
+              #?@(:clj [(instance? java.util.regex.Pattern form) (analyze (list 're-pattern (.pattern ^java.util.regex.Pattern form)))])
+              (instance? java.util.UUID form) {:op :const :val 0 :type :nil}
               (= form true) (analyze-bool true)
               (= form false) (analyze-bool false)
               (nil? form) (analyze-nil)
               (string? form) (analyze-string form)
-              (char? form) (analyze-char form)
+              #?@(:clj [(char? form) (analyze-char form)])
               (keyword? form) (analyze-keyword form)
               (symbol? form) (analyze-symbol form)
               (map? form) (analyze-map-literal form)
@@ -2243,6 +2407,7 @@
                   (= op 'recur) (analyze-recur form)
                   (= op 'do) (analyze-do form)
                   (= op 'set!) (analyze-set! form)
+                  (= op 'binding) (analyze-binding form)
 
                   ;; Forward declarations
                   (= op 'declare)
@@ -2286,7 +2451,7 @@
                         ;; Collect symbols from method bodies only
                         body-syms (->> method-forms
                                        (mapcat #(drop 2 %))
-                                       (tree-seq coll? seq)
+                                       (tree-seq-walk coll? seq)
                                        (filter symbol?)
                                        set)
                         ;; Captures = body syms that are locals in env, not method params
@@ -2321,6 +2486,235 @@
                   (= op 'list) (analyze-list form)
                   (= op 'vector) (analyze-vector-literal form)
                   (= op 'hash-map) (analyze-hash-map-literal form)
+                  ;; hash-set macro: (hash-set e1 e2) -> (set-conj (set-conj (empty-hash-set) e1) e2)
+                  (= op 'hash-set)
+                  (analyze (reduce (fn [acc elem] (list 'set-conj acc elem))
+                                   '(empty-hash-set)
+                                   (rest form)))
+                  ;; lazy-seq macro: (lazy-seq body...) -> (make-lazy-seq (fn [] (do body...)))
+                  (= op 'lazy-seq)
+                  (let [body (rest form)]
+                    (analyze (list 'make-lazy-seq
+                                   (if (= (count body) 1)
+                                     (list 'fn [] (first body))
+                                     (list 'fn [] (cons 'do body))))))
+                  ;; comment: evaluates to nil
+                  (= op 'comment) {:op :nil}
+                  ;; array-map: just expands to hash-map
+                  (= op 'array-map) (analyze (cons 'hash-map (rest form)))
+                  ;; var: returns nil stub
+                  (= op 'var) {:op :nil}
+                  ;; when-var-exists: just evaluate body
+                  (= op 'when-var-exists) (analyze (cons 'do (rest (rest form))))
+                  ;; Stubs for JVM-only macros
+                  (contains? #{'with-out-str 'with-precision 'bound-fn 'bound-fn* 'future 'use-fixtures 'definterface} op)
+                  {:op :nil}
+                  ;; delay: (delay body) -> (let [r (atom nil) d (atom false)] (fn [] (when (not @d) (reset! r (do body)) (reset! d true)) @r))
+                  (= op 'delay)
+                  (let [r (woj-gensym "delay_r_")
+                        d (woj-gensym "delay_d_")]
+                    (analyze (list 'let [r '(atom nil) d '(atom false)]
+                               (list 'fn []
+                                 (list 'when (list 'not (list 'deref d))
+                                   (list 'reset! r (if (> (count form) 2)
+                                                     (cons 'do (rest form))
+                                                     (second form)))
+                                   (list 'reset! d true))
+                                 (list 'deref r)))))
+                  ;; lazy-cat: (lazy-cat c1 c2) -> (lazy-seq (concat c1 (lazy-seq (concat c2 nil))))
+                  (= op 'lazy-cat)
+                  (let [colls (rest form)]
+                    (if (empty? colls)
+                      {:op :nil}
+                      (analyze (reduce (fn [acc c] (list 'lazy-seq (list 'concat c acc)))
+                                       nil
+                                       (reverse colls)))))
+                  ;; assert: (assert expr) -> (when (not expr) (throw (ex-info "Assert failed" {})))
+                  (= op 'assert)
+                  (let [expr (second form)
+                        msg (if (> (count form) 2) (nth form 2) (str "Assert failed: " (pr-str expr)))]
+                    (analyze (list 'when (list 'not expr) (list 'throw (list 'ex-info msg {})))))
+                  ;; doto: (doto x (f a) (g b)) -> (let [v x] (f v a) (g v b) v)
+                  (= op 'doto)
+                  (let [g (woj-gensym "doto_")
+                        forms (rest (rest form))]
+                    (analyze (list 'let [g (second form)]
+                               (cons 'do (concat
+                                          (map (fn [f] (if (seq? f) (concat (list (first f) g) (rest f)) (list f g))) forms)
+                                          [g])))))
+
+                  ;; if-not: (if-not test then else) -> (if test else then)
+                  (= op 'if-not)
+                  (let [test (second form) then (nth form 2) else (nth form 3 nil)]
+                    (analyze (list 'if test else then)))
+                  ;; if-let: (if-let [b test] then else)
+                  (= op 'if-let)
+                  (let [bindings (second form) then (nth form 2) else (nth form 3 nil)
+                        binding (first bindings) test (second bindings)
+                        temp (woj-gensym "iflet_")]
+                    (analyze (list 'let [temp test] (list 'if temp (list 'let [binding temp] then) else))))
+                  ;; when-let: (when-let [b test] body...)
+                  (= op 'when-let)
+                  (let [bindings (second form) body (rest (rest form))
+                        binding (first bindings) test (second bindings)
+                        temp (woj-gensym "wlet_")]
+                    (analyze (list 'let [temp test] (list 'when temp (cons 'let (cons [binding temp] body))))))
+                  ;; when-first: (when-first [b coll] body...)
+                  (= op 'when-first)
+                  (let [bindings (second form) body (rest (rest form))
+                        binding (first bindings) coll (second bindings)
+                        s (woj-gensym "wf_")]
+                    (analyze (list 'let [s (list 'seq coll)] (list 'when s (cons 'let (cons [binding (list 'first s)] body))))))
+                  ;; if-some: (if-some [b test] then else) - tests for non-nil
+                  (= op 'if-some)
+                  (let [bindings (second form) then (nth form 2) else (nth form 3 nil)
+                        binding (first bindings) test (second bindings)
+                        temp (woj-gensym "ifsome_")]
+                    (analyze (list 'let [temp test] (list 'if (list 'some? temp) (list 'let [binding temp] then) else))))
+                  ;; when-some: (when-some [b test] body...)
+                  (= op 'when-some)
+                  (let [bindings (second form) body (rest (rest form))
+                        binding (first bindings) test (second bindings)
+                        temp (woj-gensym "wsome_")]
+                    (analyze (list 'let [temp test] (list 'when (list 'some? temp) (cons 'let (cons [binding temp] body))))))
+                  ;; dotimes: (dotimes [i n] body...)
+                  (= op 'dotimes)
+                  (let [bindings (second form) body (rest (rest form))
+                        binding (first bindings) n (second bindings)
+                        limit (woj-gensym "limit_")]
+                    (analyze (list 'let [limit n]
+                               (cons 'loop (cons [binding 0])
+                                 (concat [(list 'when (list '< binding limit))]
+                                         body
+                                         [(list 'recur (list 'inc binding))])))))
+                  ;; while: (while test body...)
+                  (= op 'while)
+                  (analyze (cons 'loop (cons [] (concat [(list 'when (second form))] (rest (rest form)) ['(recur)]))))
+                  ;; some->: thread-first with nil short-circuit
+                  (= op 'some->)
+                  (let [expr (second form) forms (rest (rest form))]
+                    (if (empty? forms)
+                      (analyze expr)
+                      (let [temp (woj-gensym "some_")]
+                        (analyze (list 'let [temp expr]
+                                   (list 'if (list 'nil? temp) nil
+                                     (cons 'some-> (cons (cons '-> (cons temp [(first forms)])) (rest forms)))))))))
+                  ;; some->>: thread-last with nil short-circuit
+                  (= op 'some->>)
+                  (let [expr (second form) forms (rest (rest form))]
+                    (if (empty? forms)
+                      (analyze expr)
+                      (let [temp (woj-gensym "some_")]
+                        (analyze (list 'let [temp expr]
+                                   (list 'if (list 'nil? temp) nil
+                                     (cons 'some->> (cons (cons '->> (cons temp [(first forms)])) (rest forms)))))))))
+                  ;; as->: (as-> expr name form1 form2 ...)
+                  (= op 'as->)
+                  (let [expr (second form) name (nth form 2) forms (rest (rest (rest form)))]
+                    (if (empty? forms)
+                      (analyze expr)
+                      (analyze (list 'let [name expr] (cons 'as-> (cons (first forms) (cons name (rest forms))))))))
+                  ;; cond->: conditional thread-first
+                  (= op 'cond->)
+                  (let [expr (second form) clauses (rest (rest form))]
+                    (if (empty? clauses)
+                      (analyze expr)
+                      (let [test (first clauses) step (second clauses) rest-clauses (drop 2 clauses)
+                            temp (woj-gensym "cond_")]
+                        (analyze (list 'let [temp expr]
+                                   (cons 'cond-> (cons (list 'if test (list '-> temp step) temp) rest-clauses)))))))
+                  ;; cond->>: conditional thread-last
+                  (= op 'cond->>)
+                  (let [expr (second form) clauses (rest (rest form))]
+                    (if (empty? clauses)
+                      (analyze expr)
+                      (let [test (first clauses) step (second clauses) rest-clauses (drop 2 clauses)
+                            temp (woj-gensym "cond_")]
+                        (analyze (list 'let [temp expr]
+                                   (cons 'cond->> (cons (list 'if test (list '->> temp step) temp) rest-clauses)))))))
+                  ;; case: (case expr val1 result1 val2 result2 default)
+                  (= op 'case)
+                  (let [expr (second form) clauses (rest (rest form))
+                        has-default (odd? (count clauses))
+                        default (if has-default (last clauses) nil)
+                        pairs (partition 2 (if has-default (butlast clauses) clauses))
+                        temp (woj-gensym "case_")
+                        cond-clauses (mapcat (fn [[v r]]
+                                               (if (and (seq? v) (not (empty? v)))
+                                                 ;; Multi-alternative: (val1 val2 ...) means match any
+                                                 [(cons 'or (map (fn [alt] (list '= temp (list 'quote alt))) v)) r]
+                                                 [(list '= temp (list 'quote v)) r]))
+                                             pairs)]
+                    (analyze (list 'let [temp expr]
+                               (if (seq cond-clauses)
+                                 (cons 'cond (concat cond-clauses [:else default]))
+                                 default))))
+                  ;; condp: (condp pred expr clause...)
+                  (= op 'condp)
+                  (let [pred (second form) expr (nth form 2)
+                        clauses (drop 3 form)
+                        pred-sym (woj-gensym "cpred_") expr-sym (woj-gensym "cexpr_")]
+                    (letfn [(process [cls]
+                              (cond
+                                (empty? cls) nil
+                                (= (count cls) 1) (first cls)
+                                (and (>= (count cls) 3) (= (second cls) :>>))
+                                (let [test (first cls) rfn (nth cls 2) rest-cls (drop 3 cls)
+                                      temp (woj-gensym "ctemp_")]
+                                  (list 'let [temp (list pred-sym test expr-sym)]
+                                    (list 'if temp (list rfn temp) (process rest-cls))))
+                                :else
+                                (let [test (first cls) result (second cls) rest-cls (drop 2 cls)]
+                                  (list 'if (list pred-sym test expr-sym) result (process rest-cls)))))]
+                      (analyze (list 'let [expr-sym expr pred-sym pred] (process clauses)))))
+                  ;; doseq: (doseq [x coll ...] body...) - simple single-binding version + :when/:let/:while
+                  (= op 'doseq)
+                  (let [bindings (second form) body (rest (rest form))]
+                    (if (empty? bindings)
+                      (analyze (cons 'do (concat body [nil])))
+                      (let [first-elem (first bindings)]
+                        (cond
+                          (= first-elem :when)
+                          (analyze (list 'when (second bindings) (cons 'doseq (cons (vec (drop 2 bindings)) body))))
+                          (= first-elem :let)
+                          (analyze (list 'let (second bindings) (cons 'doseq (cons (vec (drop 2 bindings)) body))))
+                          (= first-elem :while)
+                          (analyze (list 'if (second bindings) (cons 'doseq (cons (vec (drop 2 bindings)) body)) :doseq-while-stop))
+                          :else
+                          (let [binding first-elem coll (second bindings)
+                                rest-bindings (drop 2 bindings)
+                                remaining (woj-gensym "rem_")
+                                has-while (some #{:while} rest-bindings)]
+                            (if has-while
+                              (let [result (woj-gensym "res_")]
+                                (analyze (list 'loop [remaining (list 'seq coll)]
+                                           (list 'when remaining
+                                             (list 'let [binding (list 'first remaining)
+                                                         result (cons 'doseq (cons (vec rest-bindings) body))]
+                                               (list 'when (list 'not= result :doseq-while-stop)
+                                                 (list 'recur (list 'next remaining))))))))
+                              (analyze (list 'loop [remaining (list 'seq coll)]
+                                         (list 'when remaining
+                                           (list 'let [binding (list 'first remaining)]
+                                             (cons 'doseq (cons (vec rest-bindings) body))
+                                             (list 'recur (list 'next remaining))))))))))))
+                  ;; for: (for [x coll ...] body) - list comprehension
+                  (= op 'for)
+                  (let [bindings (second form) body (nth form 2)]
+                    (letfn [(process [bs]
+                              (cond
+                                (empty? bs) (list 'list body)
+                                (= (first bs) :let)
+                                (list 'let (second bs) (process (vec (drop 2 bs))))
+                                (= (first bs) :when)
+                                (list 'if (second bs) (process (vec (drop 2 bs))) nil)
+                                (= (first bs) :while)
+                                (list 'if (second bs) (process (vec (drop 2 bs))) nil)
+                                :else
+                                (let [binding (first bs) coll (second bs)
+                                      rest-bs (vec (drop 2 bs))]
+                                  (list 'mapcat (list 'fn [binding] (process rest-bs)) coll))))]
+                      (analyze (process bindings))))
 
                   ;; clojure.test support (also handle namespace-qualified like t/deftest)
                   (or (= op 'deftest) (and (symbol? op) (= (name op) "deftest")))
@@ -2449,7 +2843,7 @@
                   ;; Handle clojure.test qualified names (t/is, t/deftest, etc.)
                   (and (symbol? op)
                        (namespace op)
-                       (#{"deftest" "is" "are" "testing" "thrown?"} (name op)))
+                       (#{"deftest" "is" "are" "testing" "thrown?" "when-var-exists"} (name op)))
                   (analyze (cons (symbol (name op)) (rest form)))
 
                   ;; Handle namespace-aliased calls (e.g., ct/insert -> laced_causal_tree__insert)
@@ -2487,7 +2881,7 @@
                   (and (symbol? op)
                        (let [n (name op)]
                          (and (> (count n) 2)
-                              (.startsWith n ".-"))))
+                              (str/starts-with? n ".-"))))
                   (let [field-name (subs (name op) 2)
                         target (analyze (second form))]
                     {:op :field-access :field field-name :target target})
@@ -2496,8 +2890,8 @@
                   (and (symbol? op)
                        (let [n (name op)]
                          (and (> (count n) 1)
-                              (.endsWith n ".")
-                              (Character/isUpperCase (first n)))))
+                              (str/ends-with? n ".")
+                              (upper-case-char? n))))
                   (let [type-name (symbol (subs (name op) 0 (dec (count (name op)))))
                         ctor (symbol (str "->" type-name))]
                     (analyze (cons ctor (rest form))))
@@ -2537,16 +2931,83 @@
             *ns-load-fn* *ns-load-fn*
             *ns-read-fn* *ns-read-fn*
             *ns-prefix* nil
-            *ns-prefix-map* {}]
+            *ns-prefix-map* {}
+            *ns-refers* {}
+            *dynamic-globals* #{}]
     (let [result (into [] (map analyze forms))]
       {:ast (into *ns-asts* result)
        :keywords *keywords*
+       :keyword-count *keyword-counter*
        :strings *strings*
+       :string-count *string-counter*
        :symbols *symbols*
+       :symbol-count *symbol-counter*
        :callable-globals *callable-globals*
        :direct-fn-globals *direct-fn-globals*
+       :fn-refs *fn-refs*
        :builtin-refs *builtin-refs*
+       :macros *macros*
+       :globals *globals*
        :protocols *protocols*
        :protocol-methods *protocol-methods*
        :protocol-impls *protocol-impls*
-       :user-types *user-types*})))
+       :user-types *user-types*
+       :next-type-tag *next-type-tag*
+       :dynamic-globals *dynamic-globals*})))
+
+(defn analyze-forms-continuing
+  "Analyze forms continuing from a snapshot's analyzer state.
+   initial-state is a map with keys matching analyze-forms output."
+  [forms initial-state]
+  (reset! *gensym-counter* 0)
+  (binding [*globals* (or (:globals initial-state) #{})
+            *env* {}
+            *keywords* (or (:keywords initial-state) {})
+            *keyword-counter* (or (:keyword-count initial-state) 0)
+            *strings* (or (:strings initial-state) {})
+            *string-counter* (or (:string-count initial-state) 0)
+            *symbols* (or (:symbols initial-state) {})
+            *symbol-counter* (or (:symbol-count initial-state) 0)
+            *loop-bindings* nil
+            *enclosing-locals* #{}
+            *capture-map* nil
+            *callable-globals* (or (:callable-globals initial-state) #{})
+            *direct-fn-globals* (or (:direct-fn-globals initial-state) {})
+            *fn-refs* (or (:fn-refs initial-state) #{})
+            *macros* (or (:macros initial-state) {})
+            *builtin-refs* (or (:builtin-refs initial-state) #{})
+            *protocols* (or (:protocols initial-state) {})
+            *protocol-methods* (or (:protocol-methods initial-state) {})
+            *protocol-impls* (or (:protocol-impls initial-state) {})
+            *user-types* (or (:user-types initial-state) {})
+            *next-type-tag* (or (:next-type-tag initial-state) 20)
+            *ns-aliases* {}
+            *loaded-namespaces* #{}
+            *loading-namespaces* #{}
+            *ns-asts* []
+            *ns-load-fn* *ns-load-fn*
+            *ns-read-fn* *ns-read-fn*
+            *ns-prefix* nil
+            *ns-prefix-map* {}
+            *ns-refers* {}
+            *dynamic-globals* (or (:dynamic-globals initial-state) #{})]
+    (let [result (into [] (map analyze forms))]
+      {:ast (into *ns-asts* result)
+       :keywords *keywords*
+       :keyword-count *keyword-counter*
+       :strings *strings*
+       :string-count *string-counter*
+       :symbols *symbols*
+       :symbol-count *symbol-counter*
+       :callable-globals *callable-globals*
+       :direct-fn-globals *direct-fn-globals*
+       :fn-refs *fn-refs*
+       :builtin-refs *builtin-refs*
+       :macros *macros*
+       :globals *globals*
+       :protocols *protocols*
+       :protocol-methods *protocol-methods*
+       :protocol-impls *protocol-impls*
+       :user-types *user-types*
+       :next-type-tag *next-type-tag*
+       :dynamic-globals *dynamic-globals*})))

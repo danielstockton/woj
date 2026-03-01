@@ -1,1643 +1,15 @@
-(ns woj.emitter
-  (:require [woj.util :refer [munge-name str-join]]
-            [woj.wasm :as w]
-            [woj.optimize :as opt]
-            [clojure.string :as string]))
-
-;; ============================================
-;; Dynamic vars for emission state
-;; ============================================
-
-(def ^:dynamic *functions* [])
-(def ^:dynamic *globals-emit* [])
-(def ^:dynamic *globals-declared* #{})
-(def ^:dynamic *fn-counter* 0)
-(def ^:dynamic *loop-counter* 0)
-(def ^:dynamic *loop-context* nil)
-(def ^:dynamic *keywords* {})  ;; keyword -> id mapping for interning
-(def ^:dynamic *internal-fn-names* {})  ;; fn-name -> internal name (for exported fns)
-(def ^:dynamic *closure-env-param* nil)  ;; env param name when inside closure function
-(def ^:dynamic *capture-indices* nil)  ;; symbol -> index in env array (when inside closure)
-(def ^:dynamic *callable-globals* #{})  ;; globals that hold callable values (need invokeN)
-(def ^:dynamic *direct-fn-globals* {})  ;; map of name -> arity for direct functions
-(def ^:dynamic *fn-refs* #{})  ;; direct function globals used as values (need wrappers)
-(def ^:dynamic *closure-funcs* [])  ;; closure function names that need elem declarations
-(def ^:dynamic *lifted-fn-inits* [])  ;; init code for hoisted non-capturing fn globals
-(def ^:dynamic *builtin-refs* #{})  ;; builtins used as values (need wrapper closures)
-(def ^:dynamic *emitted-fn-names* #{})  ;; track emitted function names to prevent duplicates
-(def ^:dynamic *strings* {})  ;; string -> id mapping for interning (from analyzer)
-(def ^:dynamic *symbols* {})  ;; symbol -> id mapping for interning (from analyzer)
-(def ^:dynamic *repl-mode* false)  ;; when true, __repl_eval returns (i32 i32) type tag + value
-(def ^:dynamic *host-imports* [])  ;; vec of {:module :name :func-name :arity} for host imports
-(def ^:dynamic *host-import-fns* #{})  ;; set of munged function names that are host imports
-
-;; Protocol support
-(def ^:dynamic *protocols* {})  ;; protocol-name -> {:methods [...]}
-(def ^:dynamic *protocol-methods* {})  ;; method-name -> {:protocol name :arity n}
-(def ^:dynamic *protocol-impls* {})  ;; [type-tag method-name] -> impl-closure-name
-(def ^:dynamic *protocol-dispatch-tables* {})  ;; method-name -> global array name
-
-;; User-defined types from deftype/defrecord
-(def ^:dynamic *user-types* {})
-
-;; Forward declarations
-(declare emit emit-str emit-call-node emit-call-dispatch)
-
-;; Tail call optimization
-(def ^:dynamic *tail-position* false)  ;; true when emitting code in tail position of a function  ;; type-name -> {:tag N, :fields [...], :kind :deftype/:defrecord}
-
-;; Max type tag for dispatch table size (nil=0 through VectorSeq=18, plus 1 for default)
-;; Computed dynamically when user types are present
-(def max-type-tag 20)
-
-(defn- compute-dispatch-table-size
-  "Compute size of dispatch tables from all known type tags.
-   Returns max-tag + 1 to accommodate array indices 0..max-tag."
-  []
-  (let [user-tags (map :tag (vals *user-types*))
-        impl-tags (map first (keys *protocol-impls*))
-        all-tags (concat [max-type-tag] user-tags impl-tags)]
-    (inc (apply max all-tags))))
-
-;; ============================================
-;; Emitter
-;; ============================================
-
-(declare emit)
-
-(defn- extract-fn-name
-  "Extract function name from a func definition string."
-  [fn-def]
-  (when-let [m (re-find #"\(func (\$[a-zA-Z0-9_>]+)" fn-def)]
-    (second m)))
-
-(defn- add-function!
-  "Add a function to *functions*. If a function with the same name already exists,
-   replace it (last def wins, matching Clojure semantics).
-   Returns true if added."
-  [fn-def]
-  (let [fn-name (extract-fn-name fn-def)]
-    (if (contains? *emitted-fn-names* fn-name)
-      (do
-        (set! *functions* (conj (into [] (remove #(= (extract-fn-name %) fn-name) *functions*)) fn-def))
-        true)
-      (do
-        (set! *emitted-fn-names* (conj *emitted-fn-names* fn-name))
-        (set! *functions* (conj *functions* fn-def))
-        true))))
-
-(defn collect-locals
-  "Collect local variable declarations from let bindings in an AST.
-   Traverses all relevant node types, stopping at :fn boundaries
-   since nested functions have their own scope.
-   All locals are now anyref for uniform value representation."
-  [ast]
-  (case (:op ast)
-    :let (concat
-          (map (fn [b] (str "(local $" (munge-name (:name b)) " anyref)")) (:bindings ast))
-          (mapcat (fn [b] (collect-locals (:init b))) (:bindings ast))
-          (collect-locals (:body ast)))
-    :loop (concat
-           (map (fn [b] (str "(local $" (munge-name (:name b)) " anyref)")) (:bindings ast))
-           (mapcat (fn [b] (collect-locals (:init b))) (:bindings ast))
-           (collect-locals (:body ast)))
-    :if (concat (collect-locals (:test ast))
-                (collect-locals (:then ast))
-                (collect-locals (:else ast)))
-    :call (concat (collect-locals (:fn ast))
-                  (mapcat collect-locals (:args ast)))
-    :protocol-call (mapcat collect-locals (:args ast))
-    :recur (mapcat collect-locals (:args ast))
-    :do (mapcat collect-locals (:exprs ast))
-    :set! (collect-locals (:val ast))
-    :throw (collect-locals (:val ast))
-    :field-access (collect-locals (:target ast))
-    :instance? (collect-locals (:val ast))
-    :try (concat
-          ;; Declare the catch binding as a local if there's a catch clause
-          (when-let [catch-clause (:catch ast)]
-            [(str "(local $" (munge-name (:binding catch-clause)) " anyref)")])
-          (collect-locals (:body ast))
-          (when-let [catch-clause (:catch ast)]
-            (collect-locals (:body catch-clause)))
-          (when-let [finally-clause (:finally ast)]
-            (collect-locals finally-clause)))
-    ;; Closures need a temp local for building the environment
-    :fn (if (:is-closure ast)
-          ["(local $__tmp_env anyref)"]
-          [])
-    ;; Leaf nodes and scope boundaries
-    (:const :local :global :fn-global :builtin :builtin-ref :nil :keyword :string :symbol :float :captured) []
-    ;; Default - shouldn't happen but safe fallback
-    []))
-
-(defn- filter-locals-against-params
-  "Remove local declarations that clash with function parameter names.
-   This happens when a loop binding shadows a parameter (e.g. (defn f [r] (loop [r r] ...)))."
-  [locals params]
-  (let [param-names (set (map (fn [p] (str "$" (munge-name p))) params))]
-    (remove (fn [local-decl]
-              (when-let [m (re-find #"\(local (\$[a-zA-Z0-9_>]+) " local-decl)]
-                (param-names (second m))))
-            locals)))
-
-(defn- emit-body-with-recur
-  "Emit body code, wrapping in a WAT loop if has-recur is true."
-  [body params has-recur]
-  (if has-recur
-    (let [counter *loop-counter*
-          _ (set! *loop-counter* (inc *loop-counter*))
-          loop-label (str "$fn_recur" counter)
-          body-code (binding [*loop-context* {:loop-label loop-label
-                                              :loop-bindings params}
-                              *tail-position* false]
-                      (emit-str body))]
-      (str "(loop " loop-label " (result anyref)\n      " body-code ")"))
-    (binding [*tail-position* true]
-      (emit-str body))))
-
-(defn- emit-function
-  "Emit a WAT function definition. Returns the function name.
-   - name: function name (symbol or string, will be munged)
-   - params: vector of parameter symbols
-   - body: body AST node
-   - export-name: if non-nil, export with this name (and unbox return to i32)
-   - has-recur: if true, wrap body in loop for tail-position recur"
-  [name params body export-name & {:keys [has-recur]}]
-  (let [munged (if (string? name) name (munge-name name))
-        fn-name (str "$" munged)
-        ;; All params are anyref internally
-        param-decls (mapv (fn [p] (str "(param $" (munge-name p) " anyref)")) params)]
-    (if export-name
-      ;; Exported functions: wrap with i32 params/result for wasmtime compatibility
-      ;; Create internal function with anyref, wrapper with i32
-      (let [internal-name (str fn-name "_internal")]
-        ;; Track internal name BEFORE emitting body (enables recursion)
-        (set! *internal-fn-names* (assoc *internal-fn-names* munged (subs internal-name 1)))
-        (let [locals (filter-locals-against-params (distinct (collect-locals body)) params)
-              body-code (emit-body-with-recur body params has-recur)
-              internal-fn (str "(func " internal-name " "
-                               (str-join " " param-decls) " (result anyref)"
-                               (if (seq locals) (str "\n    " (str-join "\n    " locals)) "")
-                               "\n    " body-code ")")
-              ;; Use a unique wrapper name to avoid collisions with builtins.
-              ;; The wrapper is only called from JS via export name, never from WAT code.
-              wrapper-name (str "$__export_" munged)
-              ;; Wrapper that boxes params and unboxes result
-              wrapper-param-decls (mapv (fn [p] (str "(param $" (munge-name p) " i32)")) params)
-              box-args (mapv (fn [p] (str "(ref.i31 (local.get $" (munge-name p) "))")) params)
-              wrapper-fn (if (and *repl-mode* (= export-name "__repl_eval"))
-                           ;; REPL mode: _start that prints result string via WASI
-                           (str "(func " wrapper-name " (export \"_start\")\n    "
-                                "(call $__repl_print_str (call " internal-name ")))")
-                           ;; Normal mode: return i32
-                           (str "(func " wrapper-name " (export \"" export-name "\") "
-                                (str-join " " wrapper-param-decls) " (result i32)\n    "
-                                "(call $unbox_i32 (call " internal-name " " (str-join " " box-args) ")))"))]
-          (add-function! internal-fn)
-          (add-function! wrapper-fn)
-          fn-name))
-      ;; Non-exported: just use anyref directly
-      (let [locals (filter-locals-against-params (distinct (collect-locals body)) params)
-            body-code (emit-body-with-recur body params has-recur)
-            fn-def (str "(func " fn-name " "
-                        (str-join " " param-decls) " (result anyref)"
-                        (if (seq locals) (str "\n    " (str-join "\n    " locals)) "")
-                        "\n    " body-code ")")]
-        (add-function! fn-def)
-        fn-name))))
-
-(defn- emit-closure-function
-  "Emit a WAT function for a closure (has env param as first argument).
-   Returns the function name.
-   - name: function name (will be munged)
-   - params: vector of user-visible parameter symbols
-   - body: body AST node
-   - captures: vector of captured variable symbols
-   - has-recur: if true, wrap body in loop for tail-position recur"
-  [name params body captures & {:keys [has-recur self-name]}]
-  (let [munged (if (string? name) name (munge-name name))
-        fn-name (str "$" munged)
-        arity (count params)
-        ;; env param is first, then user params
-        env-decl "(param $__env anyref)"
-        param-decls (mapv (fn [p] (str "(param $" (munge-name p) " anyref)")) params)
-        ;; Build capture indices map
-        capture-map (into {} (map-indexed (fn [i sym] [sym i]) captures))
-        ;; Emit body with closure context
-        locals (filter-locals-against-params
-                (distinct (binding [*capture-indices* capture-map
-                                    *closure-env-param* "$__env"]
-                            (collect-locals body)))
-                params)
-        ;; Add self-name local if present (for named fn self-reference)
-        self-local (when self-name
-                     (str "(local $" (munge-name self-name) " anyref)"))
-        all-locals (if self-local (cons self-local locals) locals)
-        ;; Generate self-reference initialization code
-        self-init (when self-name
-                    (str "(local.set $" (munge-name self-name)
-                         " (struct.new $Closure" arity
-                         " (i32.const 11) (ref.func " fn-name
-                         ") (local.get $__env)))\n    "))
-        body-code (binding [*capture-indices* capture-map
-                            *closure-env-param* "$__env"]
-                    (emit-body-with-recur body params has-recur))
-        ;; Use ClosureFuncN type
-        func-type (str "$ClosureFunc" arity)
-        fn-def (str "(func " fn-name " (type " func-type ") "
-                    env-decl " " (str-join " " param-decls) " (result anyref)"
-                    (if (seq all-locals) (str "\n    " (str-join "\n    " all-locals)) "")
-                    "\n    " (or self-init "") body-code ")")]
-    (add-function! fn-def)
-    ;; Track this closure function for elem declaration
-    (set! *closure-funcs* (conj *closure-funcs* fn-name))
-    fn-name))
-
-;; Arithmetic builtins that need unbox/rebox
-(def arithmetic-builtins #{'+ '- '* '/ 'inc 'dec})
-
-;; Comparison builtins that unbox but return boxed boolean
-(def comparison-builtins #{'= 'not= '< '> '<= '>= 'neg? 'pos? 'zero? 'NaN?})
-
-;; Boolean builtins that work on truthiness
-(def boolean-builtins #{'not 'and 'or})
-
-;; List builtins that work with anyref
-(def list-builtins #{'cons 'first 'rest 'nil? 'cons?})
-
-;; Vector builtins
-(def vector-builtins #{'nth 'count 'conj 'vector? 'empty-vector})
-
-;; Map builtins
-(def map-builtins #{'get 'contains? 'map? 'empty-hash-map 'assoc-map 'dissoc 'keys 'vals 'make-array-map})
-
-;; Set builtins
-(def set-builtins #{'set? 'empty-hash-set 'set-conj 'disj})
-
-;; Seq builtins
-(def seq-builtins #{'seq 'seq? 'seqable? 'empty?})
-
-;; Atom builtins
-(def atom-builtins #{'atom 'deref 'atom? 'reset! 'swap!})
-
-;; Polymorphic builtins (work on multiple types)
-(def polymorphic-builtins #{'assoc})
-
-;; Reduce builtins
-(def reduce-builtins #{'reduce 'reduce-kv 'reduced 'reduced?})
-
-;; Lazy sequence builtins
-(def lazy-seq-builtins #{'make-lazy-seq 'lazy-seq? 'lazy-seq-realized?})
-
-;; String builtins
-(def string-builtins #{'str1 'str-concat 'name 'subs 'string->mem! 'mem->string 'pr-str1 'char 'str-hash})
-
-;; Float operation builtins
-(def float-op-builtins #{'to-float 'to-int 'math-floor 'math-ceil 'math-sqrt 'math-abs 'math-round})
-
-;; Exception builtins
-(def exception-builtins #{'ex-info 'ex-data 'ex-message 'ex-cause})
-
-;; Bit operation builtins (native WASM i32 ops)
-(def bit-builtins #{'bit-and 'bit-or 'bit-xor 'bit-not
-                    'bit-shift-left 'bit-shift-right 'unsigned-bit-shift-right 'bit-test})
-
-;; Compare builtin (three-way comparison returning -1/0/1)
-(def compare-builtins #{'compare})
-
-;; Array builtins (native WasmGC array ops)
-(def array-op-builtins #{'make-array 'aget 'aset 'alength 'aclone 'acopy 'object-array 'array? 'vector-from-array})
-
-;; Transient collection builtins
-(def transient-builtins #{'transient 'persistent! 'conj! 'assoc! 'dissoc! 'disj! 'pop!})
-
-;; Metadata builtins
-(def metadata-builtins #{'with-meta 'meta})
-
-;; Atom watch/validator builtins
-(def atom-watch-builtins #{'add-watch 'remove-watch 'set-validator!})
-
-(defn- collect-conj-chain
-  "Iteratively collect elements from a chain of (conj (conj ... base e1) e2).
-   Returns [base-ast [e1 e2 ...]] so the emitter can process them without deep recursion."
-  [ast]
-  (loop [node ast, elements ()]
-    (if (and (= (:op node) :call)
-             (let [fn-ast (:fn node)]
-               (and (= (:op fn-ast) :builtin)
-                    (= (:name fn-ast) 'conj))))
-      (recur (first (:args node)) (cons (second (:args node)) elements))
-      [node (vec elements)])))
-
-;; Helper to unbox anyref to i32 (assumes i31ref)
-(defn- emit-unbox [code]
-  [:i31.get_s [:ref.cast [:ref :i31] code]])
-
-;; Helper to box i32 to anyref (via i31ref)
-(defn- emit-box [code]
-  [:ref.i31 code])
-
-;; Helper to emit a boolean result from an i32 expression
-;; Returns $Boolean struct (global $__true or $__false)
-(defn- emit-bool [i32-code]
-  [:if [:result :anyref] i32-code
-   [:then [:global.get "$__true"]]
-   [:else [:global.get "$__false"]]])
-
-;; Emit raw i32 value from an AST node known to have :num-type :i32
-;; This avoids box/unbox overhead for typed integer operations.
-;; Defined before emit-comparison-as-i32 which uses it.
-(defn- emit-i32-raw [ast]
-  (cond
-    ;; Integer constant: just the raw i32
-    (and (= (:op ast) :const) (= (:type ast) :int))
-    [:i32.const (:val ast)]
-
-    ;; Typed arithmetic call: emit the i32 operation directly (no boxing)
-    (and (= (:op ast) :call) (= :i32 (:num-type ast)))
-    (let [fn-name (get-in ast [:fn :name])
-          args (:args ast)]
-      (case fn-name
-        (+ - * /)
-        (let [wasm-op (case fn-name + :i32.add - :i32.sub * :i32.mul / :i32.div_s)
-              a (emit-i32-raw (first args))
-              b (emit-i32-raw (second args))]
-          [wasm-op a b])
-        inc [:i32.add (emit-i32-raw (first args)) [:i32.const 1]]
-        dec [:i32.sub (emit-i32-raw (first args)) [:i32.const 1]]
-        ;; fallback: emit normally and unbox
-        (emit-unbox (emit ast))))
-
-    ;; Local with known i32 type: unbox from i31ref
-    (and (= (:op ast) :local) (= :i32 (:num-type ast)))
-    [:i31.get_s [:ref.cast [:ref :i31] [:local.get (str "$" (munge-name (:name ast)))]]]
-
-    ;; if with i32 result: emit both branches as i32 directly
-    (and (= (:op ast) :if) (= :i32 (:num-type ast)))
-    [:if [:result :i32] [:call "$truthy" (emit (:test ast))]
-     [:then (emit-i32-raw (:then ast))]
-     [:else (emit-i32-raw (:else ast))]]
-
-    ;; do with i32 result: emit normally but unbox the final result
-    (and (= (:op ast) :do) (= :i32 (:num-type ast)))
-    (emit-unbox (emit ast))
-
-    ;; let with i32 result: emit normally but unbox the final result
-    (and (= (:op ast) :let) (= :i32 (:num-type ast)))
-    (emit-unbox (emit ast))
-
-    ;; Fallback: emit normally and unbox
-    :else
-    (emit-unbox (emit ast))))
-
-(defn- emit-f64-raw
-  "Emit an expression as raw f64, avoiding boxing/unboxing when possible."
-  [ast]
-  (cond
-    ;; Float constant
-    (= (:op ast) :float)
-    [:f64.const (:val ast)]
-
-    ;; Int constant promoted to f64
-    (and (= (:op ast) :const) (= (:type ast) :int))
-    [:f64.const (double (:val ast))]
-
-    ;; Typed arithmetic call with f64 result
-    (and (= (:op ast) :call) (= :f64 (:num-type ast)))
-    (let [fn-name (get-in ast [:fn :name])
-          args (:args ast)]
-      (case fn-name
-        (+ - * /)
-        (let [wasm-op (case fn-name + :f64.add - :f64.sub * :f64.mul / :f64.div)]
-          [wasm-op (emit-f64-raw (first args)) (emit-f64-raw (second args))])
-        inc [:f64.add (emit-f64-raw (first args)) [:f64.const 1.0]]
-        dec [:f64.sub (emit-f64-raw (first args)) [:f64.const 1.0]]
-        ;; fallback: emit normally and extract f64
-        [:struct.get "$Float" "$val" [:ref.cast [:ref "$Float"] (emit ast)]]))
-
-    ;; Local with known f64 type
-    (and (= (:op ast) :local) (= :f64 (:num-type ast)))
-    [:struct.get "$Float" "$val" [:ref.cast [:ref "$Float"] [:local.get (str "$" (munge-name (:name ast)))]]]
-
-    ;; i32 promoted to f64
-    (= :i32 (:num-type ast))
-    [:f64.convert_i32_s (emit-i32-raw ast)]
-
-    ;; if with f64 result
-    (and (= (:op ast) :if) (= :f64 (:num-type ast)))
-    [:if [:result :f64] [:call "$truthy" (emit (:test ast))]
-     [:then (emit-f64-raw (:then ast))]
-     [:else (emit-f64-raw (:else ast))]]
-
-    ;; do/let with f64 result: emit normally and extract
-    (and (#{:do :let} (:op ast)) (= :f64 (:num-type ast)))
-    [:struct.get "$Float" "$val" [:ref.cast [:ref "$Float"] (emit ast)]]
-
-    ;; Fallback: emit normally and extract f64
-    :else
-    [:struct.get "$Float" "$val" [:ref.cast [:ref "$Float"] (emit ast)]]))
-
-(defn- emit-f64-box
-  "Box an f64 value into a $Float struct."
-  [f64-ir]
-  [:struct.new "$Float" [:i32.const 5] f64-ir])
-
-;; Emit a comparison call directly as i32, skipping $Boolean boxing/unboxing
-(defn- emit-comparison-as-i32 [ast]
-  (let [fn-name (get-in ast [:fn :name])
-        args (:args ast)]
-    (case fn-name
-      ;; = and not= use $eq which already returns i32
-      = (if (every? #(= :i32 (:num-type %)) args)
-          [:i32.eq (emit-i32-raw (first args)) (emit-i32-raw (second args))]
-          [:call "$eq" (emit (first args)) (emit (second args))])
-      not= (if (every? #(= :i32 (:num-type %)) args)
-             [:i32.ne (emit-i32-raw (first args)) (emit-i32-raw (second args))]
-             [:i32.eqz [:call "$eq" (emit (first args)) (emit (second args))]])
-      ;; All others return $Boolean - extract the val field directly
-      (< > <= >=)
-      (cond
-        (every? #(= :i32 (:num-type %)) args)
-        (let [wasm-op (case fn-name < :i32.lt_s > :i32.gt_s <= :i32.le_s >= :i32.ge_s)]
-          [wasm-op (emit-i32-raw (first args)) (emit-i32-raw (second args))])
-        (every? #(#{:i32 :f64} (:num-type %)) args)
-        (let [wasm-op (case fn-name < :f64.lt > :f64.gt <= :f64.le >= :f64.ge)]
-          [wasm-op (emit-f64-raw (first args)) (emit-f64-raw (second args))])
-        :else
-        (let [a (emit (first args))
-              b (emit (second args))
-              cmp-fn (str "$cmp_" (case fn-name < "lt" > "gt" <= "le" >= "ge"))]
-          [:struct.get "$Boolean" "$val" [:ref.cast [:ref "$Boolean"] [:call cmp-fn a b]]]))
-      neg?
-      (let [a (first args)]
-        (cond
-          (= :i32 (:num-type a)) [:i32.lt_s (emit-i32-raw a) [:i32.const 0]]
-          (= :f64 (:num-type a)) [:f64.lt (emit-f64-raw a) [:f64.const 0.0]]
-          :else [:struct.get "$Boolean" "$val" [:ref.cast [:ref "$Boolean"] [:call "$cmp_lt" (emit a) [:ref.i31 [:i32.const 0]]]]]))
-      pos?
-      (let [a (first args)]
-        (cond
-          (= :i32 (:num-type a)) [:i32.gt_s (emit-i32-raw a) [:i32.const 0]]
-          (= :f64 (:num-type a)) [:f64.gt (emit-f64-raw a) [:f64.const 0.0]]
-          :else [:struct.get "$Boolean" "$val" [:ref.cast [:ref "$Boolean"] [:call "$cmp_gt" (emit a) [:ref.i31 [:i32.const 0]]]]]))
-      zero?
-      (let [a (first args)]
-        (cond
-          (= :i32 (:num-type a)) [:i32.eqz (emit-i32-raw a)]
-          (= :f64 (:num-type a)) [:f64.eq (emit-f64-raw a) [:f64.const 0.0]]
-          :else [:struct.get "$Boolean" "$val" [:ref.cast [:ref "$Boolean"] [:call "$zero_QMARK_" (emit a)]]]))
-      NaN?
-      [:struct.get "$Boolean" "$val" [:ref.cast [:ref "$Boolean"] [:call "$is_nan" (emit (first args))]]]
-      ;; Fallback - shouldn't happen but just in case
-      [:call "$truthy" (emit ast)])))
-
-;; Check if an AST node is a call to a comparison builtin
-(defn- comparison-call? [ast]
-  (and (= (:op ast) :call)
-       (= (get-in ast [:fn :op]) :builtin)
-       (contains? comparison-builtins (get-in ast [:fn :name]))))
-
-;; Emit code that evaluates to i32 (for conditionals)
-;; Optimizes comparison builtins to skip $truthy dispatch
-(defn- emit-as-i32 [ast]
-  "Emit code and check truthiness for conditionals that need i32"
-  (if (comparison-call? ast)
-    (emit-comparison-as-i32 ast)
-    [:call "$truthy" (emit ast)]))
-
-
-(defn- emit-call-node
-  "Handle all :call AST nodes. Extracted from emit to avoid paren hook issues."
-  [{:keys [] :as ast}]
-  (let [fn-ast (:fn ast)
-        fn-ast-op (:op fn-ast)
-        call-args (:args ast)]
-    ;; IIFE elimination: ((fn [x y] body) a b) -> (let [x a, y b] body)
-    (if (and (= fn-ast-op :fn)
-             (not (:is-closure fn-ast))
-             (nil? (:arities fn-ast))
-             (not (:has-recur fn-ast))
-             (= (count (:params fn-ast)) (count call-args)))
-      (emit {:op :let
-             :bindings (mapv (fn [p a] {:name p :init a}) (:params fn-ast) call-args)
-             :body (:body fn-ast)})
-      ;; Normal call dispatch
-      (let [fn-name (when (#{:builtin :global :fn-global} fn-ast-op) (:name fn-ast))
-            tail? *tail-position*
-            call-prefix (if tail? "return_call" "call")]
-        (binding [*tail-position* false]
-          (emit-call-dispatch ast fn-ast fn-ast-op fn-name call-args call-prefix))))))
-
-(defn- emit-call-dispatch
-  "Dispatch a non-IIFE call to the appropriate handler."
-  [ast fn-ast fn-ast-op fn-name call-args call-prefix]
-  (cond
-    ;; Arithmetic: use inline ops when types are known, else call runtime
-    (contains? arithmetic-builtins fn-name)
-    (case (:num-type ast)
-      :i32 (emit-box (emit-i32-raw ast))
-      :f64 (emit-f64-box (emit-f64-raw ast))
-      (case fn-name
-        (+ - * /)
-        (let [op-name (case fn-name + "$add" - "$sub" * "$mul" / "$div")]
-          [:call op-name (emit (first call-args)) (emit (second call-args))])
-        inc [:call "$inc" (emit (first call-args))]
-        dec [:call "$dec" (emit (first call-args))]))
-
-    ;; Comparisons: compare, return $Boolean
-    (contains? comparison-builtins fn-name)
-    (case fn-name
-      (= not=)
-      (let [a (emit (first call-args))
-            b (emit (second call-args))]
-        (case fn-name
-          = (emit-bool [:call "$eq" a b])
-          not= (emit-bool [:i32.eqz [:call "$eq" a b]])))
-      (< > <= >=)
-      (cond
-        (every? #(= :i32 (:num-type %)) call-args)
-        (let [wasm-op (case fn-name < :i32.lt_s > :i32.gt_s <= :i32.le_s >= :i32.ge_s)]
-          (emit-bool [wasm-op (emit-i32-raw (first call-args)) (emit-i32-raw (second call-args))]))
-        (every? #(#{:i32 :f64} (:num-type %)) call-args)
-        (let [wasm-op (case fn-name < :f64.lt > :f64.gt <= :f64.le >= :f64.ge)]
-          (emit-bool [wasm-op (emit-f64-raw (first call-args)) (emit-f64-raw (second call-args))]))
-        :else
-        (let [cmp-fn (str "$cmp_" (case fn-name < "lt" > "gt" <= "le" >= "ge"))]
-          [:call cmp-fn (emit (first call-args)) (emit (second call-args))]))
-      neg?
-      (let [a (first call-args)]
-        (cond
-          (= :i32 (:num-type a)) (emit-bool [:i32.lt_s (emit-i32-raw a) [:i32.const 0]])
-          (= :f64 (:num-type a)) (emit-bool [:f64.lt (emit-f64-raw a) [:f64.const 0.0]])
-          :else [:call "$cmp_lt" (emit a) [:ref.i31 [:i32.const 0]]]))
-      pos?
-      (let [a (first call-args)]
-        (cond
-          (= :i32 (:num-type a)) (emit-bool [:i32.gt_s (emit-i32-raw a) [:i32.const 0]])
-          (= :f64 (:num-type a)) (emit-bool [:f64.gt (emit-f64-raw a) [:f64.const 0.0]])
-          :else [:call "$cmp_gt" (emit a) [:ref.i31 [:i32.const 0]]]))
-      zero?
-      (let [a (first call-args)]
-        (cond
-          (= :i32 (:num-type a)) (emit-bool [:i32.eqz (emit-i32-raw a)])
-          (= :f64 (:num-type a)) (emit-bool [:f64.eq (emit-f64-raw a) [:f64.const 0.0]])
-          :else [:call "$zero_QMARK_" (emit a)]))
-      NaN?
-      [:call "$is_nan" (emit (first call-args))])
-
-    ;; Boolean ops: use $truthy for polymorphic truthiness
-    (contains? boolean-builtins fn-name)
-    (case fn-name
-      not (emit-bool [:i32.eqz [:call "$truthy" (emit (first call-args))]])
-      and
-      (let [a (emit (first call-args))
-            b (emit (second call-args))]
-        [:if [:result :anyref] [:call "$truthy" a]
-         [:then b]
-         [:else a]])
-      or
-      (let [a (emit (first call-args))
-            b (emit (second call-args))]
-        [:if [:result :anyref] [:call "$truthy" a]
-         [:then a]
-         [:else b]]))
-
-    ;; List operations - work directly with anyref
-    (contains? list-builtins fn-name)
-    (into [:call (str "$" (munge-name fn-name))] (map emit call-args))
-
-    ;; Vector operations
-    (contains? vector-builtins fn-name)
-    (let [arg0 (first call-args)
-          narrowed (:narrowed-type arg0)]
-      (case fn-name
-        nth (if (= :vector narrowed)
-              [:call "$vector_nth" (emit arg0) (emit-unbox (emit (second call-args)))]
-              [:call "$nth_polymorphic" (emit arg0) (emit-unbox (emit (second call-args)))])
-        count (case narrowed
-                :vector (emit-box [:call "$vector_count" (emit arg0)])
-                :string (emit-box [:call "$str_codepoint_count" (emit arg0)])
-                :map (emit-box [:struct.get "$HashMap" "$count" [:ref.cast [:ref "$HashMap"] (emit arg0)]])
-                :set (emit-box [:struct.get "$HashSet" "$count" [:ref.cast [:ref "$HashSet"] (emit arg0)]])
-                (emit-box [:call "$count_internal" (emit arg0)]))
-        conj
-        (let [[base elements] (collect-conj-chain ast)]
-          (reduce (fn [acc elem-ast]
-                    [:call "$conj" acc (emit elem-ast)])
-                  (emit base)
-                  elements))
-        vector? [:call "$vector_QMARK_" (emit arg0)]
-        empty-vector [:call "$empty_vector"]))
-
-    ;; Polymorphic operations (work on multiple types)
-    (contains? polymorphic-builtins fn-name)
-    (case fn-name
-      assoc [:call "$assoc" (emit (first call-args)) (emit (second call-args)) (emit (nth call-args 2))])
-
-    ;; Reduce operations
-    (contains? reduce-builtins fn-name)
-    (case fn-name
-      reduce
-      (if (= (count call-args) 2)
-        [:call "$reduce_no_init" (emit (first call-args)) (emit (second call-args))]
-        [:call "$reduce" (emit (first call-args)) (emit (second call-args)) (emit (nth call-args 2))])
-      reduce-kv [:call "$reduce_kv" (emit (first call-args)) (emit (second call-args)) (emit (nth call-args 2))]
-      reduced [:call "$reduced" (emit (first call-args))]
-      reduced? [:call "$bool" [:call "$reduced_QMARK_" (emit (first call-args))]])
-
-    ;; Lazy sequence operations
-    (contains? lazy-seq-builtins fn-name)
-    (case fn-name
-      make-lazy-seq [:call "$make_lazy_seq" (emit (first call-args))]
-      lazy-seq? [:call "$lazy_seq_QMARK_" (emit (first call-args))]
-      lazy-seq-realized? [:call "$lazy_seq_realized_QMARK_" (emit (first call-args))])
-
-    ;; String operations
-    (contains? string-builtins fn-name)
-    (case fn-name
-      str1 [:call "$str1" (emit (first call-args))]
-      str-concat [:call "$str_concat" (emit (first call-args)) (emit (second call-args))]
-      name [:call "$name_fn" (emit (first call-args))]
-      subs [:call "$subs" (emit (first call-args)) (emit-unbox (emit (second call-args))) (emit-unbox (emit (nth call-args 2)))]
-      string->mem! (emit-box [:call "$string__GT_mem_BANG_" (emit (first call-args)) (emit-unbox (emit (second call-args)))])
-      mem->string [:call "$mem__GT_string" (emit-unbox (emit (first call-args))) (emit-unbox (emit (second call-args)))]
-      pr-str1 [:call "$pr_str1" (emit (first call-args))]
-      char [:call "$char_from_code" (emit-unbox (emit (first call-args)))]
-      str-hash (emit-box [:call "$str_hash" (emit (first call-args))]))
-
-    ;; Float operation builtins
-    (contains? float-op-builtins fn-name)
-    (let [v (emit (first call-args))]
-      (case fn-name
-        to-float [:struct.new "$Float" [:i32.const 5] [:call "$to_f64" v]]
-        to-int [:if [:result :anyref] [:ref.test [:ref :i31] v]
-                [:then v]
-                [:else [:ref.i31 [:i32.trunc_sat_f64_s [:f64.trunc [:call "$to_f64" v]]]]]]
-        math-floor [:struct.new "$Float" [:i32.const 5] [:f64.floor [:call "$to_f64" v]]]
-        math-ceil [:struct.new "$Float" [:i32.const 5] [:f64.ceil [:call "$to_f64" v]]]
-        math-sqrt [:struct.new "$Float" [:i32.const 5] [:f64.sqrt [:call "$to_f64" v]]]
-        math-abs [:struct.new "$Float" [:i32.const 5] [:f64.abs [:call "$to_f64" v]]]
-        math-round [:struct.new "$Float" [:i32.const 5] [:f64.nearest [:call "$to_f64" v]]]))
-
-    ;; Exception builtins
-    (contains? exception-builtins fn-name)
-    (case fn-name
-      ex-info [:struct.new "$ExceptionInfo" [:i32.const 100]
-               (emit (first call-args)) (emit (second call-args))
-               (if (>= (count call-args) 3) (emit (nth call-args 2)) [:ref.null :none])]
-      ex-data [:struct.get "$ExceptionInfo" "$data" [:ref.cast [:ref "$ExceptionInfo"] (emit (first call-args))]]
-      ex-message [:struct.get "$ExceptionInfo" "$message" [:ref.cast [:ref "$ExceptionInfo"] (emit (first call-args))]]
-      ex-cause [:struct.get "$ExceptionInfo" "$cause" [:ref.cast [:ref "$ExceptionInfo"] (emit (first call-args))]])
-
-    ;; String primitives
-    (contains? #{'str-index-of 'str-to-lower 'str-to-upper 'str-starts-with 'str-ends-with 'str-trim 'str-replace 'str-split} fn-name)
-    (case fn-name
-      str-index-of [:call "$str_index_of" (emit (first call-args)) (emit (second call-args))]
-      str-to-lower [:call "$str_to_lower" (emit (first call-args))]
-      str-to-upper [:call "$str_to_upper" (emit (first call-args))]
-      str-starts-with [:call "$str_starts_with" (emit (first call-args)) (emit (second call-args))]
-      str-ends-with [:call "$str_ends_with" (emit (first call-args)) (emit (second call-args))]
-      str-trim [:call "$str_trim" (emit (first call-args))]
-      str-replace [:call "$str_replace" (emit (first call-args)) (emit (second call-args)) (emit (nth call-args 2))]
-      str-split [:call "$str_split" (emit (first call-args)) (emit (second call-args))])
-
-    ;; Print operations (WASI fd_write)
-    (contains? #{'print! 'pr! 'print-str!} fn-name)
-    (case fn-name
-      print! [:call "$print_BANG_" (emit (first call-args))]
-      pr! [:call "$pr_BANG_" (emit (first call-args))]
-      print-str! [:call "$print_str_BANG_" (emit (first call-args))])
-
-    ;; Metadata operations
-    (contains? metadata-builtins fn-name)
-    (case fn-name
-      with-meta [:call "$with_meta_" (emit (first call-args)) (emit (second call-args))]
-      meta [:call "$meta_" (emit (first call-args))])
-
-    ;; Atom watch/validator operations
-    (contains? atom-watch-builtins fn-name)
-    (case fn-name
-      add-watch [:call "$add_watch" (emit (first call-args)) (emit (second call-args)) (emit (nth call-args 2))]
-      remove-watch [:call "$remove_watch" (emit (first call-args)) (emit (second call-args))]
-      set-validator! [:call "$set_validator_BANG_" (emit (first call-args)) (emit (second call-args))])
-
-    ;; Regex
-    (= fn-name 're-pattern)
-    [:struct.new "$Regex" [:i32.const 98] (emit (first call-args))]
-
-    ;; Bit operations: native WASM i32 instructions
-    (contains? bit-builtins fn-name)
-    (case fn-name
-      bit-and (emit-box [:i32.and (emit-unbox (emit (first call-args))) (emit-unbox (emit (second call-args)))])
-      bit-or (emit-box [:i32.or (emit-unbox (emit (first call-args))) (emit-unbox (emit (second call-args)))])
-      bit-xor (emit-box [:i32.xor (emit-unbox (emit (first call-args))) (emit-unbox (emit (second call-args)))])
-      bit-not (emit-box [:i32.xor (emit-unbox (emit (first call-args))) [:i32.const -1]])
-      bit-shift-left (emit-box [:i32.shl (emit-unbox (emit (first call-args))) (emit-unbox (emit (second call-args)))])
-      bit-shift-right (emit-box [:i32.shr_s (emit-unbox (emit (first call-args))) (emit-unbox (emit (second call-args)))])
-      unsigned-bit-shift-right (emit-box [:i32.shr_u (emit-unbox (emit (first call-args))) (emit-unbox (emit (second call-args)))])
-      bit-test [:call "$bool" [:i32.and [:i32.shr_u (emit-unbox (emit (first call-args))) (emit-unbox (emit (second call-args)))] [:i32.const 1]]])
-
-    ;; Compare: three-way comparison returning -1/0/1
-    (contains? compare-builtins fn-name)
-    [:call "$__compare" (emit (first call-args)) (emit (second call-args))]
-
-    ;; Array operations: native WasmGC array instructions
-    (contains? array-op-builtins fn-name)
-    (case fn-name
-      make-array [:array.new_default "$AnyArray" (emit-unbox (emit (first call-args)))]
-      aget [:array.get "$AnyArray" [:ref.cast [:ref "$AnyArray"] (emit (first call-args))] (emit-unbox (emit (second call-args)))]
-      aset [:call "$__aset" (emit (first call-args)) (emit-unbox (emit (second call-args))) (emit (nth call-args 2))]
-      alength (emit-box [:array.len [:ref.cast [:ref "$AnyArray"] (emit (first call-args))]])
-      aclone [:call "$__aclone" (emit (first call-args))]
-      acopy [:block [:result :anyref]
-             [:array.copy "$AnyArray" "$AnyArray"
-              [:ref.cast [:ref "$AnyArray"] (emit (nth call-args 2))] (emit-unbox (emit (nth call-args 3)))
-              [:ref.cast [:ref "$AnyArray"] (emit (first call-args))] (emit-unbox (emit (second call-args)))
-              (emit-unbox (emit (nth call-args 4)))]
-             [:ref.null :none]]
-      object-array [:call "$__object_array" (emit (first call-args))]
-      array? [:call "$bool" [:ref.test [:ref "$AnyArray"] (emit (first call-args))]]
-      vector-from-array [:call "$vector_from_array" (emit (first call-args))])
-
-    ;; Transient collection operations
-    (contains? transient-builtins fn-name)
-    (case fn-name
-      transient    [:call "$transient" (emit (first call-args))]
-      persistent!  [:call "$persistent_BANG_" (emit (first call-args))]
-      conj!        [:call "$conj_BANG_" (emit (first call-args)) (emit (second call-args))]
-      assoc!       [:call "$assoc_BANG_" (emit (first call-args)) (emit (second call-args)) (emit (nth call-args 2))]
-      dissoc!      [:call "$dissoc_BANG_" (emit (first call-args)) (emit (second call-args))]
-      disj!        [:call "$disj_BANG_" (emit (first call-args)) (emit (second call-args))]
-      pop!         [:call "$pop_BANG_" (emit (first call-args))])
-
-    ;; Map operations
-    (contains? map-builtins fn-name)
-    (case fn-name
-      get (if (= (count call-args) 3)
-            [:call "$hash_map_get_default" (emit (first call-args)) (emit (second call-args)) (emit (nth call-args 2))]
-            [:call "$hash_map_get" (emit (first call-args)) (emit (second call-args))])
-      contains? [:call "$contains_QMARK_" (emit (first call-args)) (emit (second call-args))]
-      map? [:call "$map_QMARK_" (emit (first call-args))]
-      empty-hash-map [:call "$empty_hash_map"]
-      assoc-map [:call "$hash_map_assoc" (emit (first call-args)) (emit (second call-args)) (emit (nth call-args 2))]
-      make-array-map [:call "$make_array_map" (emit (first call-args)) (emit-unbox (emit (second call-args)))]
-      dissoc [:call "$dissoc" (emit (first call-args)) (emit (second call-args))]
-      keys [:call "$keys" (emit (first call-args))]
-      vals [:call "$vals" (emit (first call-args))])
-
-    ;; Set operations
-    (contains? set-builtins fn-name)
-    (case fn-name
-      set? [:call "$set_QMARK_" (emit (first call-args))]
-      empty-hash-set [:call "$empty_hash_set"]
-      set-conj [:call "$set_conj" (emit (first call-args)) (emit (second call-args))]
-      disj [:call "$disj" (emit (first call-args)) (emit (second call-args))])
-
-    ;; Seq operations
-    (contains? seq-builtins fn-name)
-    (let [arg0 (first call-args)
-          narrowed (:narrowed-type arg0)]
-      (case fn-name
-        seq [:call "$seq" (emit arg0)]
-        seq? [:call "$seq_QMARK_" (emit arg0)]
-        seqable? [:call "$seqable_QMARK_" (emit arg0)]
-        empty? (case narrowed
-                 :vector [:call "$bool" [:i32.eqz [:call "$vector_count" (emit arg0)]]]
-                 :map [:call "$bool" [:i32.eqz [:struct.get "$HashMap" "$count" [:ref.cast [:ref "$HashMap"] (emit arg0)]]]]
-                 :set [:call "$bool" [:i32.eqz [:struct.get "$HashSet" "$count" [:ref.cast [:ref "$HashSet"] (emit arg0)]]]]
-                 [:call "$empty_QMARK_" (emit arg0)])))
-
-    ;; Atom operations
-    (contains? atom-builtins fn-name)
-    (case fn-name
-      atom [:call "$atom" (emit (first call-args))]
-      deref [:call "$deref" (emit (first call-args))]
-      atom? [:call "$atom_QMARK_" (emit (first call-args))]
-      reset! [:call "$reset_BANG_" (emit (first call-args)) (emit (second call-args))]
-      swap!
-      (let [a (emit (first call-args))
-            f (emit (second call-args))
-            extra-args (drop 2 call-args)]
-        (if (empty? extra-args)
-          [:call "$swap_BANG_" a f]
-          (into [:call (str "$swap_BANG_" (inc (count extra-args))) a f]
-                (map emit extra-args)))))
-
-    ;; User-defined function call (callable global - may hold closure)
-    (= fn-ast-op :global)
-    (let [munged (munge-name fn-name)
-          emitted-args (into [] (map emit call-args))
-          arity (count emitted-args)]
-      (cond
-        ;; Host import: unbox args to i32, box i32 result
-        (contains? *host-import-fns* munged)
-        (emit-box (into [:call (str "$" munged)] (map emit-unbox emitted-args)))
-        ;; Callable global (closure) - use invokeN
-        (contains? *callable-globals* fn-name)
-        (into [(keyword call-prefix) (str "$invoke" arity) [:global.get (str "$" munged)]] emitted-args)
-        ;; Direct function - use internal name if available
-        :else
-        (let [call-name (get *internal-fn-names* munged munged)]
-          (into [(keyword call-prefix) (str "$" call-name)] emitted-args))))
-
-    ;; Direct function global - always a direct call
-    (= fn-ast-op :fn-global)
-    (let [munged (munge-name fn-name)
-          emitted-args (into [] (map emit call-args))
-          arg-count (count emitted-args)
-          fn-info (or (get *direct-fn-globals* fn-name) (:fn-info fn-ast))
-          fixed-arities (or (:arities fn-info) #{})
-          variadic? (:variadic? fn-info)
-          min-arity (or (:min-arity fn-info) 0)
-          is-true-multi-arity (> (count fixed-arities) 1)
-          has-variadic-alongside-fixed (and variadic? (seq fixed-arities))
-          is-multi-arity (or is-true-multi-arity has-variadic-alongside-fixed)
-          has-exact-match (contains? fixed-arities arg-count)
-          build-rest-list (fn [rest-args]
-                            (if (empty? rest-args)
-                              [:ref.null :none]
-                              (reduce (fn [acc arg] [:call "$cons" arg acc])
-                                      [:ref.null :none]
-                                      (reverse rest-args))))]
-      (cond
-        ;; Multi-arity with exact match
-        (and is-multi-arity has-exact-match)
-        (into [(keyword call-prefix) (str "$" munged "_arity" arg-count "_internal")] emitted-args)
-
-        ;; Multi-arity with variadic (no exact match)
-        (and is-multi-arity variadic? (not has-exact-match))
-        (let [variadic-min (if (seq fixed-arities)
-                             (apply max (filter #(<= % arg-count) (conj fixed-arities min-arity)))
-                             min-arity)
-              required-args (take variadic-min emitted-args)
-              rest-args (drop variadic-min emitted-args)]
-          (into [(keyword call-prefix) (str "$" munged "_variadic_internal")]
-                (concat required-args [(build-rest-list rest-args)])))
-
-        ;; Single variadic function
-        variadic?
-        (let [required-args (take min-arity emitted-args)
-              rest-args (drop min-arity emitted-args)
-              call-name (get *internal-fn-names* munged munged)]
-          (into [(keyword call-prefix) (str "$" call-name)]
-                (concat required-args [(build-rest-list rest-args)])))
-
-        ;; Regular single-arity function
-        :else
-        (let [call-name (get *internal-fn-names* munged munged)]
-          (into [(keyword call-prefix) (str "$" call-name)] emitted-args))))
-
-    ;; Builtin not in special categories - legacy call
-    (= fn-ast-op :builtin)
-    (let [emitted-args (into [] (map emit call-args))
-          munged (munge-name fn-name)
-          call-name (get *internal-fn-names* munged munged)]
-      (into [(keyword call-prefix) (str "$" call-name)] emitted-args))
-
-    ;; Calling a local variable - must be a closure, use invokeN
-    (= fn-ast-op :local)
-    (let [emitted-args (into [] (map emit call-args))
-          arity (count emitted-args)]
-      (into [(keyword call-prefix) (str "$invoke" arity) [:local.get (str "$" (munge-name (:name fn-ast)))]]
-            emitted-args))
-
-    ;; Calling a captured variable - must be a closure, use invokeN
-    (= fn-ast-op :captured)
-    (let [emitted-args (into [] (map emit call-args))
-          arity (count emitted-args)]
-      (into [(keyword call-prefix) (str "$invoke" arity) (emit fn-ast)]
-            emitted-args))
-
-    ;; Calling the result of another expression (e.g., ((constantly x)))
-    :else
-    (let [emitted-args (into [] (map emit call-args))
-          arity (count emitted-args)]
-      (into [(keyword call-prefix) (str "$invoke" arity) (emit fn-ast)]
-            emitted-args))))
-
-
-(defn emit [{:keys [op] :as ast}]
-  (cond
-    ;; Constants are now boxed (anyref via i31ref)
-    (= op :const)
-    (case (:type ast)
-      :int (let [v (:val ast)]
-             ;; i31ref can only hold 31-bit signed integers (-1073741824 to 1073741823)
-             ;; Larger integers must be stored as Float (f64)
-             (if (and (>= v -1073741824) (<= v 1073741823))
-               (emit-box [:i32.const v])
-               [:struct.new "$Float" [:i32.const 5] [:f64.const (double v)]]))
-      :bool (if (= (:val ast) 1) [:global.get "$__true"] [:global.get "$__false"])
-      :nil [:ref.null :none]
-      :keyword (emit-box [:i32.const (:val ast)])
-      ;; Fallback for old-style consts without type
-      (emit-box [:i32.const (:val ast)]))
-
-    (= op :nil) [:ref.null :none]
-    ;; Keywords are struct references with unique IDs
-    (= op :keyword) [:struct.new "$Keyword" [:i32.const 2] [:i32.const (:id ast)]]
-    ;; Strings are interned globals with unique IDs
-    (= op :string) [:global.get (str "$__str_" (:id ast))]
-    ;; Symbols are globals (like strings) - initialized with name/namespace
-    (= op :symbol) [:global.get (str "$__sym_" (:id ast))]
-    ;; Floats are struct references with f64 value
-    ;; Handle special values: Infinity, -Infinity, NaN
-    (= op :float) (let [v (:val ast)]
-                    [:struct.new "$Float" [:i32.const 5]
-                     [:f64.const (cond
-                                   (Double/isNaN v) ##NaN
-                                   (= v Double/POSITIVE_INFINITY) ##Inf
-                                   (= v Double/NEGATIVE_INFINITY) ##-Inf
-                                   :else v)]])
-    (= op :local) [:local.get (str "$" (munge-name (:name ast)))]
-    (= op :global) [:global.get (str "$" (munge-name (:name ast)))]
-    ;; Direct function used as a value - reference the wrapper closure global
-    (= op :fn-global) (do
-                        (set! *fn-refs* (conj *fn-refs* (:name ast)))
-                        [:global.get (str "$__fn_" (munge-name (:name ast)))])
-    ;; Builtin used as a value - reference the wrapper closure global
-    (= op :builtin-ref) [:global.get (str "$__builtin_" (munge-name (:name ast)))]
-
-    ;; Captured variables - fetch from environment array
-    (= op :captured)
-    [:call "$array_get" [:local.get *closure-env-param*] [:i32.const (:index ast)]]
-
-    (= op :call)
-    (emit-call-node ast)
-
-    ;; if: unbox test for conditional, branches return anyref
-    (= op :if)
-    (let [tail? *tail-position*
-          test-code (binding [*tail-position* false] (emit-as-i32 (:test ast)))
-          then-code (binding [*tail-position* tail?] (emit (:then ast)))
-          else-code (binding [*tail-position* tail?] (emit (:else ast)))]
-      [:if [:result :anyref] test-code
-       [:then then-code]
-       [:else else-code]])
-
-    (= op :let)
-    (let [tail? *tail-position*
-          local-sets (binding [*tail-position* false]
-                       (mapv (fn [b]
-                               [:local.set (str "$" (munge-name (:name b))) (emit (:init b))])
-                             (:bindings ast)))
-          body-code (binding [*tail-position* tail?] (emit (:body ast)))]
-      (into [:block [:result :anyref]] (conj local-sets body-code)))
-
-    (= op :loop)
-    (let [counter *loop-counter*
-          _ (set! *loop-counter* (inc *loop-counter*))
-          loop-label (str "$loop" counter)
-          init-sets (binding [*tail-position* false]
-                      (mapv (fn [b]
-                              [:local.set (str "$" (munge-name (:name b))) (emit (:init b))])
-                            (:bindings ast)))
-          binding-names (mapv :name (:bindings ast))
-          body-code (binding [*loop-context* {:loop-label loop-label
-                                              :loop-bindings binding-names}
-                              *tail-position* false]
-                      (emit (:body ast)))]
-      (into [:block [:result :anyref]]
-            (conj init-sets [:loop loop-label [:result :anyref] body-code])))
-
-    (= op :recur)
-    (let [ctx *loop-context*
-          loop-label (:loop-label ctx)
-          binding-names (:loop-bindings ctx)
-          value-emissions (mapv emit (:args ast))
-          sets-reversed (mapv (fn [name]
-                                [:local.set (str "$" (munge-name name))])
-                              (reverse binding-names))]
-      ;; Emit values then sets as a sibling sequence, ending with br
-      (list* (concat value-emissions sets-reversed [[:br loop-label]])))
-
-    (= op :fn)
-    (let [arities (:arities ast)
-          multi-arity? (and arities (> (count arities) 1))
-          ;; Helper to build env-init IR for captured variables
-                    build-env-init (fn [captures]
-                           (if (empty? captures)
-                             [:call "$array_new" [:i32.const 0]]
-                             (let [env-size (count captures)
-                                   env-sets (map-indexed
-                                             (fn [i sym]
-                                               (let [value-code (if (and *capture-indices* (contains? *capture-indices* sym))
-                                                                  [:call "$array_get" [:local.get *closure-env-param*] [:i32.const (get *capture-indices* sym)]]
-                                                                  [:local.get (str "$" (munge-name sym))])]
-                                               [:call "$array_set" [:local.get "$__tmp_env"] [:i32.const i] value-code]))
-                                             captures)]
-                               (into [:block [:result :anyref]
-                                      [:local.set "$__tmp_env" [:call "$array_new" [:i32.const env-size]]]]
-                                     (conj (vec env-sets) [:local.get "$__tmp_env"])))))]
-      (if multi-arity?
-        ;; Multi-arity anonymous fn: emit as MultiClosure with dispatch function
-        (let [counter *fn-counter*
-              _ (set! *fn-counter* (inc *fn-counter*))
-              base-name (str "anon_multi" (inc counter))
-              captures (or (:captures ast) [])
-              arity-fn-names (mapv (fn [arity-info]
-                                    (let [suffix (if (:variadic? arity-info)
-                                                   "_variadic"
-                                                   (str "_arity" (:arity arity-info)))
-                                          fn-name (str base-name suffix)
-                                          params (if (:variadic? arity-info)
-                                                   (conj (:params arity-info) (:rest-param arity-info))
-                                                   (:params arity-info))]
-                                      {:wasm-name (emit-closure-function fn-name params (:body arity-info) captures
-                                                                         :has-recur (:has-recur arity-info))
-                                       :arity (:arity arity-info)
-                                       :variadic? (:variadic? arity-info)
-                                       :param-count (count params)}))
-                                  arities)
-              ;; Build dispatch function (as string for add-function!)
-              fixed-fns (filter (complement :variadic?) arity-fn-names)
-              variadic-fn (first (filter :variadic? arity-fn-names))
-              dispatch-name (str "$" base-name "_dispatch")
-              gen-destructure (fn [n]
-                                (if (zero? n)
-                                  ["" "" " (local.get $__env)"]
-                                  (let [locals (apply str (for [i (range n)]
-                                                            (str "(local $a" i " anyref) ")))
-                                        destruct (apply str
-                                                        (for [i (range n)]
-                                                          (str "(local.set $a" i " (call $first (local.get $args)))\n      "
-                                                               (when (< i (dec n))
-                                                                 (str "(local.set $args (call $rest (local.get $args)))\n      ")))))
-                                        refs (str " (local.get $__env)" (apply str (for [i (range n)] (str " (local.get $a" i ")"))))]
-                                    [locals destruct refs])))
-              gen-variadic-destructure (fn []
-                                         (let [n-required (:arity variadic-fn)]
-                                           (if (zero? n-required)
-                                             ["" "" " (local.get $__env) (local.get $args)"]
-                                             (let [locals (apply str (for [i (range n-required)]
-                                                                      (str "(local $a" i " anyref) ")))
-                                                   destruct (apply str
-                                                                   (for [i (range n-required)]
-                                                                     (str "(local.set $a" i " (call $first (local.get $args)))\n      "
-                                                                          "(local.set $args (call $rest (local.get $args)))\n      ")))
-                                                   refs (str " (local.get $__env)"
-                                                             (apply str (for [i (range n-required)] (str " (local.get $a" i ")")))
-                                                             " (local.get $args)")]
-                                               [locals destruct refs]))))
-              else-case (if variadic-fn
-                          (let [[_ v-destruct v-refs] (gen-variadic-destructure)]
-                            (str v-destruct "(call " (:wasm-name variadic-fn) v-refs ")"))
-                          "(unreachable)")
-              dispatch-body (reduce
-                             (fn [else-code fn-info]
-                               (let [[_ f-destruct f-refs] (gen-destructure (:arity fn-info))]
-                                 (str "(if (result anyref) (i32.eq (local.get $argc) (i32.const " (:arity fn-info) "))\n      (then\n      "
-                                      f-destruct
-                                      "(call " (:wasm-name fn-info) f-refs "))\n      "
-                                      "(else " else-code "))")))
-                             else-case
-                             (reverse (sort-by :arity fixed-fns)))
-              max-args (max (if (seq fixed-fns) (apply max (map :arity fixed-fns)) 0)
-                            (if variadic-fn (:arity variadic-fn) 0))
-              all-locals (apply str (for [i (range max-args)] (str "(local $a" i " anyref) ")))
-              func-def (str "(func " dispatch-name " (type $MultiClosureDispatch) "
-                            "(param $__env anyref) (param $argc i32) (param $args anyref) (result anyref)\n    "
-                            all-locals "\n    "
-                            dispatch-body ")")
-              _ (add-function! func-def)
-              _ (set! *closure-funcs* (conj *closure-funcs* dispatch-name))]
-          [:struct.new "$MultiClosure" [:i32.const 11] (build-env-init captures) [:ref.func dispatch-name]])
-        ;; Single-arity fn
-        (let [counter *fn-counter*
-              _ (set! *fn-counter* (inc *fn-counter*))
-              is-closure (:is-closure ast)
-              captures (:captures ast)
-              params (:params ast)
-              arity (count params)
-              self-name (:fn-name ast)]
-          (if is-closure
-            (let [fn-name (emit-closure-function (str "closure" (inc counter)) params (:body ast) captures
-                                                 :has-recur (:has-recur ast) :self-name self-name)
-                  closure-type (str "$Closure" arity)]
-              [:struct.new closure-type [:i32.const 11] [:ref.func fn-name] (build-env-init captures)])
-            (let [fn-name (emit-closure-function (str "fn" (inc counter)) params (:body ast) []
-                                                 :has-recur (:has-recur ast) :self-name self-name)
-                  closure-type (str "$Closure" arity)
-                  global-name (str "$__lifted_fn" (inc counter))]
-              ;; Hoist non-capturing fn to a global singleton initialized in $start
-              (set! *globals-emit* (conj *globals-emit*
-                                         (str "(global " global-name " (mut anyref) (ref.null none))")))
-              (set! *lifted-fn-inits*
-                    (conj *lifted-fn-inits*
-                          (str "(global.set " global-name
-                               " (struct.new " closure-type
-                               " (i32.const 11) (ref.func " fn-name
-                               ") (call $array_new (i32.const 0))))")))
-              [:global.get global-name])))))
-
-    (= op :do)
-    (let [tail? *tail-position*
-          exprs (:exprs ast)
-          n (count exprs)
-          emitted (map-indexed (fn [i e]
-                                 (binding [*tail-position* (and tail? (= i (dec n)))]
-                                   (emit e)))
-                               exprs)
-          emitted (remove nil? emitted)
-          side-effects (butlast emitted)
-          result (or (last emitted) [:ref.null :none])
-          ;; Wrap side-effect exprs in (drop ...)
-          drops (mapv (fn [e] [:drop e]) side-effects)]
-      (into [:block [:result :anyref]] (conj drops result)))
-
-    (= op :set!)
-    (let [munged (munge-name (:name ast))]
-      [:block [:result :anyref]
-       [:global.set (str "$" munged) (emit (:val ast))]
-       [:global.get (str "$" munged)]])
-
-    ;; throw: (throw expr) - throws an exception with anyref value
-    (= op :throw)
-    (list [:throw "$exn" (emit (:val ast))] [:unreachable])
-
-    ;; try/catch/finally
-    (= op :try)
-    (let [{:keys [body catch finally]} ast
-          has-catch (some? catch)
-          has-finally (some? finally)
-          body-code (binding [*tail-position* false] (emit body))]
-      (cond
-        has-catch
-        (let [binding-name (munge-name (:binding catch))
-              catch-code (emit (:body catch))
-              finally-code (when has-finally (emit finally))
-              result [:block "$__no_exn" [:result :anyref]
-                      [:block "$__catch_entry" [:result :anyref]
-                       [:try_table [:result :anyref] [:catch "$exn" "$__catch_entry"]
-                        body-code]
-                       [:br "$__no_exn"]]
-                      [:local.set (str "$" binding-name)]
-                      catch-code]]
-          (if has-finally
-            [:block [:result :anyref] result finally-code :drop]
-            result))
-
-        has-finally
-        (let [finally-code (emit finally)]
-          [:block [:result :anyref] body-code finally-code :drop])
-
-        :else body-code))
-
-    (= op :def)
-    (let [munged (munge-name (:name ast))
-          init (:init ast)]
-      (cond
-        ;; Host import: register import, no function body emitted
-        (= (:op init) :host-import)
-        (let [arity (:arity init)
-              func-name (str "$" munged)
-              param-decls (str-join " " (repeat arity "(param i32)"))
-              import-str (str "(import \"" (:module init) "\" \"" (:import-name init)
-                              "\" (func " func-name " " param-decls " (result i32)))")]
-          (set! *host-imports* (conj *host-imports* import-str))
-          (set! *host-import-fns* (conj *host-import-fns* munged))
-          nil)
-
-        (= (:op init) :fn)
-        (do
-          (let [arities (:arities init)]
-            (if (and arities (> (count arities) 1))
-              (doseq [arity-info arities]
-                (let [arity-suffix (if (:variadic? arity-info)
-                                     "_variadic"
-                                     (str "_arity" (:arity arity-info)))
-                      munged-base (munge-name (:name ast))
-                      full-name (str munged-base arity-suffix)
-                      params (if (:variadic? arity-info)
-                               (conj (:params arity-info) (:rest-param arity-info))
-                               (:params arity-info))]
-                  (emit-function full-name params (:body arity-info) full-name
-                                 :has-recur (:has-recur arity-info))))
-              (let [arity-info (first arities)
-                    params (if (and arity-info (:variadic? arity-info))
-                             (conj (:params arity-info) (:rest-param arity-info))
-                             (or (:params init) (:params arity-info)))]
-                (emit-function (:name ast) params
-                               (or (:body init) (:body arity-info))
-                               (name (:name ast))
-                               :has-recur (or (:has-recur init) (:has-recur arity-info))))))
-          nil)
-
-        :else
-        (do
-          (when-not (contains? *globals-declared* munged)
-            (set! *globals-declared* (conj *globals-declared* munged))
-            (set! *globals-emit* (conj *globals-emit* (str "(global $" munged " (mut anyref) (ref.null none))"))))
-          (let [init-fn-name (str "__init_def_" munged)
-                init-body (emit-str init)
-                init-locals (distinct (collect-locals init))]
-            (set! *functions* (conj *functions*
-                               (str "(func $" init-fn-name " (result anyref)"
-                                    (when (seq init-locals) (str "\n    " (str-join "\n    " init-locals)))
-                                    "\n    " init-body ")")))
-            [:block [:result :anyref]
-             [:global.set (str "$" munged) [:call (str "$" init-fn-name)]]
-             [:ref.null :none]]))))
-
-    ;; Protocol definitions
-    (= op :defprotocol)
-    (do
-      (set! *protocols* (assoc *protocols* (:name ast) {:methods (:methods ast)}))
-      (doseq [{:keys [name arity arities]} (:methods ast)]
-        (set! *protocol-methods* (assoc *protocol-methods* name
-                                        {:protocol (:name ast)
-                                         :arity arity
-                                         :arities (when arities
-                                                    (into {} (map (fn [a] [(:arity a) a]) arities)))})))
-      [:ref.null :none])
-
-    ;; extend-type implementations
-    (= op :extend-type)
-    (let [type-tag (:type-tag ast)
-          impls (:impls ast)]
-      (doseq [{:keys [method impl params]} impls]
-        (let [method-info (get *protocol-methods* method)
-              multi-arity? (and method-info (:arities method-info) (> (count (:arities method-info)) 1))
-              arity (count params)
-              fn-name (if multi-arity?
-                        (str "__proto_" (munge-name method) "_arity_" arity "_" type-tag)
-                        (str "__proto_" (munge-name method) "_" type-tag))
-              impl-key (if multi-arity?
-                         [type-tag method arity]
-                         [type-tag method])]
-          (emit-closure-function fn-name params (:body impl) (or (:captures impl) []))
-          (set! *protocol-impls* (assoc *protocol-impls* impl-key fn-name))))
-      [:ref.null :none])
-
-    ;; extend-protocol: emit each extend-type
-    (= op :extend-protocol)
-    (do
-      (doseq [et (:extend-types ast)]
-        (emit et))
-      [:ref.null :none])
-
-    ;; Protocol method calls
-    (= op :protocol-call)
-    (let [method (:method ast)
-          args (:args ast)
-          arity (count args)
-          munged-method (munge-name method)
-          method-info (get *protocol-methods* method)
-          multi-arity? (and method-info (:arities method-info) (> (count (:arities method-info)) 1))
-          dispatch-fn (if multi-arity?
-                        (str "$__dispatch_" munged-method "_arity_" arity)
-                        (str "$__dispatch_" munged-method))
-          call-prefix (if *tail-position* "return_call" "call")]
-      (binding [*tail-position* false]
-        (into [(keyword call-prefix) dispatch-fn] (map emit args))))
-
-    ;; satisfies? check
-    (= op :satisfies?)
-    [:call (str "$__satisfies_" (munge-name (:protocol ast))) (emit (:val ast))]
-
-    ;; deftype — generates struct type, constructor, and protocol impls
-    (= op :deftype)
-    (let [type-name (:name ast)
-          fields (:fields ast)
-          tag (:tag ast)
-          impls (:impls ast)
-          munged (munge-name type-name)]
-      (set! *user-types* (assoc *user-types* type-name {:tag tag :fields fields :kind :deftype}))
-      (let [constructor-sym (or (:constructor-name ast) (symbol (str "->" (name type-name))))
-            constructor-munged (munge-name constructor-sym)
-            param-decls (str-join " " (mapv (fn [f] (str "(param $" (munge-name f) " anyref)")) fields))
-            field-args (str-join " " (mapv (fn [f] (str "(local.get $" (munge-name f) ")")) fields))]
-        (add-function! (str "(func $" constructor-munged "_internal " param-decls " (result anyref)\n"
-                            "    (struct.new $" munged " (i32.const " tag ") " field-args "))"))
-        (set! *internal-fn-names* (assoc *internal-fn-names* constructor-munged (str constructor-munged "_internal")))
-        (add-function! (str "(func $" constructor-munged " " param-decls " (result anyref)\n"
-                            "    (call $" constructor-munged "_internal " field-args "))")))
-      (doseq [{:keys [method impl params]} impls]
-        (let [method-info (get *protocol-methods* method)
-              multi-arity? (and method-info (:arities method-info) (> (count (:arities method-info)) 1))
-              arity (count params)
-              fn-name (if multi-arity?
-                        (str "__proto_" (munge-name method) "_arity_" arity "_" tag)
-                        (str "__proto_" (munge-name method) "_" tag))
-              impl-key (if multi-arity?
-                         [tag method arity]
-                         [tag method])]
-          (emit-closure-function fn-name params (:body impl) (or (:captures impl) []))
-          (set! *protocol-impls* (assoc *protocol-impls* impl-key fn-name))))
-      [:ref.null :none])
-
-    ;; instance? check
-    (= op :instance?)
-    (let [type-sym (:type ast)
-          val-code (emit (:val ast))
-          user-type (get *user-types* type-sym)]
-      (if user-type
-        [:call "$bool" [:i32.eq [:call "$type_tag" val-code] [:i32.const (:tag user-type)]]]
-        (case type-sym
-          (Number Integer) [:call "$bool" [:ref.test [:ref :i31] val-code]]
-          Keyword [:call "$bool" [:i32.eq [:call "$type_tag" val-code] [:i32.const 2]]]
-          String [:call "$bool" [:ref.test [:ref "$String"] val-code]]
-          Symbol [:call "$bool" [:i32.eq [:call "$type_tag" val-code] [:i32.const 4]]]
-          Float [:call "$bool" [:ref.test [:ref "$Float"] val-code]]
-          (Cons List ISeq) [:call "$bool" [:ref.test [:ref "$Cons"] val-code]]
-          (Vector PersistentVector) [:call "$bool" [:ref.test [:ref "$Vector"] val-code]]
-          (HashMap PersistentHashMap) [:call "$bool" [:i32.or [:i32.eq [:call "$type_tag" val-code] [:i32.const 8]] [:i32.eq [:call "$type_tag" val-code] [:i32.const 19]]]]
-          (HashSet PersistentHashSet) [:call "$bool" [:i32.eq [:call "$type_tag" val-code] [:i32.const 9]]]
-          Atom [:call "$bool" [:ref.test [:ref "$Atom"] val-code]]
-          Boolean [:call "$bool" [:i32.eq [:call "$type_tag" val-code] [:i32.const 14]]]
-          [:global.get "$__false"])))
-
-    ;; Field access: (.-field obj)
-    (= op :field-access)
-    (let [field-name (:field ast)
-          target-code (emit (:target ast))
-          matching-types (for [[type-name {:keys [tag fields]}] *user-types*
-                               :let [field-idx (.indexOf (mapv name fields) field-name)]
-                               :when (>= field-idx 0)]
-                           {:type-name type-name :tag tag :field-idx field-idx :fields fields})]
-      (if (= 1 (count matching-types))
-        (let [{:keys [type-name field-idx]} (first matching-types)
-              munged-type (munge-name type-name)]
-          [:struct.get (str "$" munged-type) (inc field-idx)
-           [:ref.cast [:ref (str "$" munged-type)] target-code]])
-        (reduce (fn [else-code {:keys [type-name tag field-idx]}]
-                  (let [munged-type (munge-name type-name)]
-                    [:if [:result :anyref] [:i32.eq [:call "$type_tag" target-code] [:i32.const tag]]
-                     [:then [:struct.get (str "$" munged-type) (inc field-idx)
-                             [:ref.cast [:ref (str "$" munged-type)] target-code]]]
-                     [:else else-code]]))
-                [:unreachable]
-                (reverse matching-types))))
-
-    :else
-    (throw (ex-info (str "Unknown AST op: " op) {:ast ast}))))
-
-(defn emit-str
-  "Emit an AST node to a WAT string. Bridge from IR to string world.
-   Runs optimization passes on the IR before serializing."
-  [ast]
-  (let [ir (emit ast)]
-    (cond
-      (nil? ir) nil
-      (string? ir) ir
-      :else (w/serialize (opt/optimize ir)))))
-
-;; ============================================
-;; Builtin Wrapper Generation
-;; ============================================
-
-(defn emit-builtin-wrapper
-  "Generate a closure wrapper for a builtin used as a value.
-   Returns [global-decl func-def] where:
-   - global-decl is the global variable declaration
-   - func-def is the closure function definition"
-  [builtin-name arity]
-  (let [munged (munge-name builtin-name)
-        global-name (str "$__builtin_" munged)
-        func-name (str "$__builtin_" munged "_fn")
-        closure-type (str "$Closure" arity)
-        func-type (str "$ClosureFunc" arity)
-        ;; Generate param list: $__env plus $arg0, $arg1, etc.
-        param-decls (str "(param $__env anyref)"
-                         (apply str (for [i (range arity)]
-                                      (str " (param $arg" i " anyref)"))))
-        ;; Generate the call to the builtin
-        arg-refs (for [i (range arity)] (str "(local.get $arg" i ")"))
-        ;; Construct the AST for the builtin call and emit it
-        call-ast {:op :call
-                  :fn {:op :builtin :name builtin-name}
-                  :args (vec (for [i (range arity)]
-                               {:op :local :name (symbol (str "arg" i))}))}
-        call-code (emit-str call-ast)
-        ;; Function definition
-        func-def (str "(func " func-name " (type " func-type ") " param-decls " (result anyref)\n    " call-code ")")
-        ;; Global declaration - initialized in $start
-        global-decl (str "(global " global-name " (mut anyref) (ref.null none))")]
-    {:global-decl global-decl
-     :func-def func-def
-     :func-name func-name
-     :global-name global-name
-     :closure-type closure-type
-     :arity arity}))
-
-(defn emit-fn-wrapper
-  "Generate a closure wrapper for a user-defined function used as a value.
-   Similar to emit-builtin-wrapper but calls a user function instead of builtin."
-  [fn-name arity]
-  (let [munged (munge-name fn-name)
-        global-name (str "$__fn_" munged)
-        wrapper-fn-name (str "$__fn_" munged "_wrapper")
-        closure-type (str "$Closure" arity)
-        func-type (str "$ClosureFunc" arity)
-        ;; Generate param list: $__env plus $arg0, $arg1, etc.
-        param-decls (str "(param $__env anyref)"
-                         (apply str (for [i (range arity)]
-                                      (str " (param $arg" i " anyref)"))))
-        ;; Generate the call to the user function (use internal name if exported)
-        arg-refs (apply str (for [i (range arity)] (str " (local.get $arg" i ")")))
-        internal-name (get *internal-fn-names* munged)
-        call-target (if internal-name (str "$" internal-name) (str "$" munged))
-        call-code (str "(call " call-target arg-refs ")")
-        ;; Function definition
-        func-def (str "(func " wrapper-fn-name " (type " func-type ") " param-decls " (result anyref)\n    " call-code ")")
-        ;; Global declaration - initialized in $start
-        global-decl (str "(global " global-name " (mut anyref) (ref.null none))")]
-    {:global-decl global-decl
-     :func-def func-def
-     :func-name wrapper-fn-name
-     :global-name global-name
-     :closure-type closure-type
-     :arity arity}))
-
-(defn emit-multi-arity-fn-wrapper
-  "Generate a MultiClosure wrapper for a multi-arity/variadic user-defined function.
-   The dispatch function takes (env, argc:i32, args:cons_list) and routes to the
-   correct _arityN_internal or _variadic_internal function."
-  [fn-name fn-info]
-  (let [munged (munge-name fn-name)
-        global-name (str "$__fn_" munged)
-        dispatch-fn-name (str "$__fn_" munged "_dispatch")
-        fixed-arities (sort (or (:arities fn-info) #{}))
-        variadic? (:variadic? fn-info)
-        variadic-arity (or (:variadic-arity fn-info) (:min-arity fn-info) 0)
-        ;; Generate destructuring code for N args from cons list
-        ;; Returns [locals-decl destructure-code arg-refs]
-        gen-destructure (fn [n]
-                          (if (zero? n)
-                            ["" "" ""]
-                            (let [locals (apply str (for [i (range n)]
-                                                      (str "(local $a" i " anyref) ")))
-                                  destruct (apply str
-                                                  (for [i (range n)]
-                                                    (str "(local.set $a" i " (call $first (local.get $args)))\n      "
-                                                         (when (< i (dec n))
-                                                           (str "(local.set $args (call $rest (local.get $args)))\n      ")))))
-                                  refs (apply str (for [i (range n)] (str " (local.get $a" i ")")))]
-                              [locals destruct refs])))
-        ;; Generate variadic destructure: pull out variadic-arity required args, rest stays as list
-        gen-variadic-destructure (fn []
-                                   (if (zero? variadic-arity)
-                                     ["" "" " (local.get $args)"]
-                                     (let [locals (apply str (for [i (range variadic-arity)]
-                                                               (str "(local $a" i " anyref) ")))
-                                           destruct (apply str
-                                                           (for [i (range variadic-arity)]
-                                                             (str "(local.set $a" i " (call $first (local.get $args)))\n      "
-                                                                  "(local.set $args (call $rest (local.get $args)))\n      ")))
-                                           refs (str (apply str (for [i (range variadic-arity)] (str " (local.get $a" i ")")))
-                                                     " (local.get $args)")]
-                                       [locals destruct refs])))
-        ;; Build the dispatch body with nested if/else on argc
-        ;; Start from the variadic fallback (or unreachable) and wrap with fixed arity checks
-        ;; Check if this fn was emitted with multi-arity naming or single-arity naming
-        ;; Multi-arity: $name_arity0_internal, $name_variadic_internal
-        ;; Single-arity: $name_internal (even if variadic)
-        is-true-multi (get *internal-fn-names* (str munged "_variadic"))
-        internal-name-fn (fn [arity-n]
-                           (let [suffix (str "_arity" arity-n)
-                                 full (str munged suffix "_internal")]
-                             (str "$" full)))
-        variadic-internal (if is-true-multi
-                            (str "$" munged "_variadic_internal")
-                            (str "$" (get *internal-fn-names* munged (str munged "_internal"))))
-        ;; Build the else case (variadic or unreachable)
-        else-case (if variadic?
-                    (let [[v-locals v-destruct v-refs] (gen-variadic-destructure)]
-                      (str v-destruct
-                           "(call " variadic-internal v-refs ")"))
-                    "(unreachable)")
-        ;; Build nested if/else for fixed arities
-        dispatch-body (reduce
-                       (fn [else-code arity-n]
-                         (let [[f-locals f-destruct f-refs] (gen-destructure arity-n)]
-                           (str "(if (result anyref) (i32.eq (local.get $argc) (i32.const " arity-n "))\n      (then\n      "
-                                f-destruct
-                                "(call " (internal-name-fn arity-n) f-refs "))\n      "
-                                "(else " else-code "))")))
-                       else-case
-                       (reverse fixed-arities))
-        ;; Collect all needed locals (max across all arities)
-        max-args (max (if (seq fixed-arities) (apply max fixed-arities) 0)
-                      (if variadic? variadic-arity 0))
-        all-locals (apply str (for [i (range max-args)] (str "(local $a" i " anyref) ")))
-        ;; Function definition
-        func-def (str "(func " dispatch-fn-name " (type $MultiClosureDispatch) "
-                      "(param $__env anyref) (param $argc i32) (param $args anyref) (result anyref)\n    "
-                      all-locals "\n    "
-                      dispatch-body ")")
-        ;; Global declaration
-        global-decl (str "(global " global-name " (mut anyref) (ref.null none))")]
-    {:global-decl global-decl
-     :func-def func-def
-     :func-name dispatch-fn-name
-     :global-name global-name
-     :closure-type "$MultiClosure"
-     :is-multi true}))
-
-;; ============================================
-;; Protocol Dispatch Generation
-;; ============================================
-
-(defn generate-dispatch-function
-  "Generate a WAT dispatch function for a protocol method using table-based O(1) dispatch.
-   Returns {:func-def :table-global-decl :table-init-code}.
-   For multi-arity, method-name includes arity suffix (e.g., bar_arity_2)."
-  [method-name arity impls]
-  (let [munged (munge-name method-name)
-        fn-name (str "$__dispatch_" munged)
-        table-global (str "$__dispatch_table_" munged)
-        table-size (compute-dispatch-table-size)
-        ;; Generate param list: arg0 is 'this', the rest are other args
-        param-decls (str-join " " (for [i (range arity)]
-                                    (str "(param $arg" i " anyref)")))
-        arg-list (str-join " " (for [i (range arity)]
-                                 (str "(local.get $arg" i ")")))
-        ;; Table init: create array then populate entries with impl closures
-        init-create (str "(global.set " table-global
-                         " (array.new $AnyArray (ref.null none) (i32.const " table-size ")))")
-        init-entries (for [[[type-tag _method] _impl-fn-name] impls]
-                       (str "(array.set $AnyArray"
-                            " (ref.cast (ref $AnyArray) (global.get " table-global "))"
-                            " (i32.const " type-tag ")"
-                            " (global.get $__proto_" munged "_" type-tag "_closure))"))]
-    {:func-def (str "(func " fn-name " " param-decls " (result anyref)\n"
-                    "    (local $tag i32)\n"
-                    "    (local $impl anyref)\n"
-                    "    (local.set $tag (call $type_tag (local.get $arg0)))\n"
-                    "    (if (i32.or (i32.lt_s (local.get $tag) (i32.const 0))\n"
-                    "                (i32.ge_s (local.get $tag) (i32.const " table-size ")))\n"
-                    "      (then (unreachable)))\n"
-                    "    (local.set $impl (array.get $AnyArray\n"
-                    "      (ref.cast (ref $AnyArray) (global.get " table-global "))\n"
-                    "      (local.get $tag)))\n"
-                    "    (if (result anyref) (ref.is_null (local.get $impl))\n"
-                    "      (then (unreachable))\n"
-                    "      (else (call $invoke" arity " (local.get $impl) " arg-list "))))")
-     :table-global-decl (str "(global " table-global " (mut anyref) (ref.null none))")
-     :table-init-code (vec (cons init-create init-entries))}))
-
-(defn generate-satisfies-function
-  "Generate a WAT function to check if a value satisfies a protocol.
-   Returns boxed boolean (i31ref)."
-  [protocol-name impls]
-  (let [munged (munge-name protocol-name)
-        fn-name (str "$__satisfies_" munged)
-        ;; Get all type tags that have impls for this protocol
-        type-tags (vec (set (map first (keys impls))))
-        ;; Build check: is type_tag in the set of impl tags?
-        check-code (cond
-                     (empty? type-tags)
-                     "(i32.const 0)"  ;; No impls -> always false
-
-                     (= 1 (count type-tags))
-                     ;; Single tag - just direct comparison
-                     (str "(i32.eq (call $type_tag (local.get $val)) (i32.const " (first type-tags) "))")
-
-                     :else
-                     ;; Multiple tags - use nested i32.or
-                     (let [comparisons (map (fn [tag]
-                                              (str "(i32.eq (call $type_tag (local.get $val)) (i32.const " tag "))"))
-                                            type-tags)]
-                       (reduce (fn [acc cmp]
-                                 (str "(i32.or " acc " " cmp ")"))
-                               (first comparisons)
-                               (rest comparisons))))]
-    (str "(func " fn-name " (param $val anyref) (result anyref)\n"
-         "    (call $bool " check-code "))")))
-
-(defn generate-protocol-impl-closures
-  "Generate globals to hold closures for each protocol impl.
-   Returns a list of {:global-decl :init-code} maps.
-   Keys can be [type-tag method] or [type-tag method arity] for multi-arity."
-  [impls]
-  (for [[impl-key impl-fn-name] impls]
-    (let [type-tag (nth impl-key 0)
-          method (nth impl-key 1)
-          explicit-arity (when (= 3 (count impl-key)) (nth impl-key 2))
-          method-info (get *protocol-methods* method)
-          multi-arity? (and method-info (:arities method-info) (> (count (:arities method-info)) 1))
-          munged-method (munge-name method)
-          arity (or explicit-arity (:arity method-info) 1)
-          global-name (if multi-arity?
-                        (str "$__proto_" munged-method "_arity_" arity "_" type-tag "_closure")
-                        (str "$__proto_" munged-method "_" type-tag "_closure"))]
-      {:global-decl (str "(global " global-name " (mut anyref) (ref.null none))")
-       :global-name global-name
-       :func-name (str "$" impl-fn-name)
-       :closure-type (str "$Closure" arity)
-       :init-code (str "(global.set " global-name
-                       " (struct.new $Closure" arity
-                       " (i32.const 11) (ref.func $" impl-fn-name ")"
-                       " (call $array_new (i32.const 0))))")})))
-
-(defn emit-prelude-1 []
-  (str "(module"
-       "\n  ;; WASI imports for printing
-  (import \"wasi_snapshot_preview1\" \"fd_write\" (func $fd_write (param i32 i32 i32 i32) (result i32)))"
-       "__HOST_IMPORTS__"
-       "\n  (memory (export \"memory\") 16)"
-       "
+(module
+  ;; WASI imports for I/O
+  (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_close" (func $fd_close (param i32) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_seek" (func $fd_seek (param i32 i64 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "path_open" (func $path_open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_filestat_get" (func $fd_filestat_get (param i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "args_sizes_get" (func $args_sizes_get (param i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "args_get" (func $args_get (param i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "clock_time_get" (func $clock_time_get (param i32 i64 i32) (result i32)))__HOST_IMPORTS__
+  (memory (export "memory") 256)
   ;; ==========================================
   ;; WasmGC Type Definitions
   ;; ==========================================
@@ -1788,6 +160,12 @@
     (field $__type_id i32)
     (field $pattern anyref))))   ;; pattern string
 
+  ;; StringBuffer: mutable growable byte buffer for O(N) string building
+  ;; Not a Tagged struct — internal-only, not exposed as a woj value type
+  (type $StringBuffer (struct
+    (field $data (mut (ref $CharArray)))
+    (field $len (mut i32))))
+
   ;; WithMeta: wrapper for values with metadata
   ;; Tag = 99, structurally unique with two padding fields
   (type $WithMeta (sub $Tagged (struct
@@ -1911,20 +289,13 @@
         (then (return (ref.null none))))
       (return (call $vector_nth (local.get $coll) (i32.const 0))))
     (drop)
-    ;; HashMap (tag=8)
-    (if (i32.eq (call $type_tag (local.get $coll)) (i32.const 8))
-      (then
-        (local.set $count (struct.get $HashMap $count (ref.cast (ref $HashMap) (local.get $coll))))
-        (if (i32.le_s (local.get $count) (i32.const 0))
-          (then (return (ref.null none))))
-        (return (call $first (call $seq (local.get $coll))))))
+    ;; HashMap (tag=8) or ArrayMap (tag=19)
+    (if (i32.or (i32.eq (call $type_tag (local.get $coll)) (i32.const 8))
+                (i32.eq (call $type_tag (local.get $coll)) (i32.const 19)))
+      (then (return (call $first (call $seq (local.get $coll))))))
     ;; HashSet (tag=9)
     (if (i32.eq (call $type_tag (local.get $coll)) (i32.const 9))
-      (then
-        (local.set $count (struct.get $HashSet $count (ref.cast (ref $HashSet) (local.get $coll))))
-        (if (i32.le_s (local.get $count) (i32.const 0))
-          (then (return (ref.null none))))
-        (return (call $first (call $seq (local.get $coll))))))
+      (then (return (call $first (call $seq (local.get $coll))))))
     ;; String - return first char as 1-char string
     (block $not_str (result anyref)
       (br_on_cast_fail $not_str anyref (ref $String) (local.get $coll))
@@ -1983,20 +354,13 @@
         (then (return (ref.null none))))
       (return (struct.new $VectorSeq (i32.const 18) (local.get $coll) (i32.const 1))))
     (drop)
-    ;; HashMap (tag=8)
-    (if (i32.eq (call $type_tag (local.get $coll)) (i32.const 8))
-      (then
-        (local.set $count (struct.get $HashMap $count (ref.cast (ref $HashMap) (local.get $coll))))
-        (if (i32.le_s (local.get $count) (i32.const 1))
-          (then (return (ref.null none))))
-        (return (call $rest (call $seq (local.get $coll))))))
+    ;; HashMap (tag=8) or ArrayMap (tag=19)
+    (if (i32.or (i32.eq (call $type_tag (local.get $coll)) (i32.const 8))
+                (i32.eq (call $type_tag (local.get $coll)) (i32.const 19)))
+      (then (return (call $rest (call $seq (local.get $coll))))))
     ;; HashSet (tag=9)
     (if (i32.eq (call $type_tag (local.get $coll)) (i32.const 9))
-      (then
-        (local.set $count (struct.get $HashSet $count (ref.cast (ref $HashSet) (local.get $coll))))
-        (if (i32.le_s (local.get $count) (i32.const 1))
-          (then (return (ref.null none))))
-        (return (call $rest (call $seq (local.get $coll))))))
+      (then (return (call $rest (call $seq (local.get $coll))))))
     ;; String - return rest as seq of codepoint strings
     (block $not_str (result anyref)
       (br_on_cast_fail $not_str anyref (ref $String) (local.get $coll))
@@ -2036,7 +400,7 @@
   ;; ==========================================
 
   ;; list-length: count elements in a seq (handles cons, lazy-seq tails)
-  (func $list_length (export \"list-length\") (param $lst anyref) (result i32)
+  (func $list_length (export "list-length") (param $lst anyref) (result i32)
     (local $count i32)
     (local $current anyref)
     (local.set $current (local.get $lst))
@@ -2066,7 +430,7 @@
     (local.get $count))
 
   ;; list-sum: sum all integers in a list (assumes i31ref elements, returns i32)
-  (func $list_sum (export \"list-sum\") (param $lst anyref) (result i32)
+  (func $list_sum (export "list-sum") (param $lst anyref) (result i32)
     (local $sum i32)
     (local $current anyref)
     (local.set $current (local.get $lst))
@@ -2723,10 +1087,7 @@
   ;; vector?: check if value is a vector
   (func $vector_QMARK_ (param $val anyref) (result anyref)
     (call $bool (ref.test (ref $Vector) (local.get $val))))
-"))
-
-(defn emit-prelude-2 []
-  "
+__USER_TYPE_DEFS__
   ;; ==========================================
   ;; HAMT (Hash Array Mapped Trie) Implementation
   ;; ==========================================
@@ -3333,10 +1694,7 @@
             (br $loop2)))
         (return (local.get $acc))))
     (local.get $acc))
-")
 
-(defn emit-prelude-2a []
-  "
   ;; ==========================================
   ;; Persistent HashMap Operations (HAMT-backed)
   ;; ==========================================
@@ -3889,10 +2247,22 @@
         (br $loop)))
     (local.get $acc))
 
-")
 
-(defn emit-prelude-transient []
-  "
+  ;; ==========================================
+  ;; PRNG (xorshift32)
+  ;; ==========================================
+  (global $__prng_state (mut i32) (i32.const 2463534242))
+
+  (func $rand_float (result f64)
+    (local $s i32)
+    (local.set $s (global.get $__prng_state))
+    (local.set $s (i32.xor (local.get $s) (i32.shl (local.get $s) (i32.const 13))))
+    (local.set $s (i32.xor (local.get $s) (i32.shr_u (local.get $s) (i32.const 17))))
+    (local.set $s (i32.xor (local.get $s) (i32.shl (local.get $s) (i32.const 5))))
+    (global.set $__prng_state (local.get $s))
+    ;; Convert to [0, 1): unsigned i32 / 4294967296.0
+    (f64.div (f64.convert_i32_u (local.get $s)) (f64.const 4294967296.0)))
+
   ;; ==========================================
   ;; Transient Collections
   ;; ==========================================
@@ -4569,10 +2939,7 @@
     ;; Unsupported type
     (throw $exn (struct.new $ExceptionInfo (i32.const 100) (ref.null none) (ref.null none) (ref.null none)))
     (unreachable))
-")
 
-(defn emit-prelude-2b []
-  "
   ;; make_array_map: create ArrayMap directly from AnyArray of [k,v,k,v,...] pairs.
   ;; No duplicate-key checking — caller guarantees uniqueness. count = number of k/v pairs.
   (func $make_array_map (param $arr anyref) (param $count i32) (result anyref)
@@ -4822,6 +3189,21 @@
     (call $invoke8 (local.get $f) (local.get $a0) (local.get $a1) (local.get $a2) (local.get $a3) (local.get $a4) (local.get $a5) (local.get $a6) (call $first (local.get $s))))
 
   ;; apply: call function with args from collection (supports up to 8 args)
+  ;; apply_multi_fallback: for 9+ args, directly call MultiClosure dispatch with the seq
+  (func $apply_multi_fallback (param $f anyref) (param $s anyref) (param $n i32) (result anyref)
+    (local $mc (ref null $MultiClosure))
+    (local $unwrapped anyref)
+    (local.set $unwrapped (call $unwrap_meta (local.get $f)))
+    (block $not_multi (result anyref)
+      (local.set $mc (br_on_cast_fail $not_multi anyref (ref $MultiClosure) (local.get $unwrapped)))
+      (return (call_ref $MultiClosureDispatch
+        (struct.get $MultiClosure $env (local.get $mc))
+        (local.get $n)
+        (local.get $s)
+        (struct.get $MultiClosure $dispatch (local.get $mc)))))
+    (drop)
+    (unreachable))
+
   (func $apply (param $f anyref) (param $args anyref) (result anyref)
     (local $s anyref)
     (local $n i32)
@@ -4845,7 +3227,7 @@
                     (then (call $apply_7 (local.get $f) (local.get $s)))
                     (else (if (result anyref) (i32.eq (local.get $n) (i32.const 8))
                       (then (call $apply_8 (local.get $f) (local.get $s)))
-                      (else (unreachable))
+                      (else (call $apply_multi_fallback (local.get $f) (local.get $s) (local.get $n)))
                     ))
                   ))
                 ))
@@ -4861,8 +3243,11 @@
   (func $string_QMARK_ (param $val anyref) (result anyref)
     (call $bool (ref.test (ref $String) (local.get $val))))
 
-  ;; symbol?: check if value is a symbol
+  ;; symbol?: check if value is a symbol (sees through WithMeta wrappers)
   (func $symbol_QMARK_ (param $val anyref) (result anyref)
+    ;; Unwrap WithMeta transparently
+    (if (ref.test (ref $WithMeta) (local.get $val))
+      (then (local.set $val (struct.get $WithMeta $inner (ref.cast (ref $WithMeta) (local.get $val))))))
     (call $bool (i32.eq (call $type_tag (local.get $val)) (i32.const 4))))
 
   ;; float?: check if value is a float
@@ -5559,10 +3944,7 @@
         (i32.eq (struct.get $Tagged $__type_id (ref.cast (ref $Tagged) (local.get $val))) (i32.const 99))
         (then (struct.get $WithMeta $meta (ref.cast (ref $WithMeta) (local.get $val))))
         (else (ref.null none))))
-      (else (ref.null none))))")
-
-(defn emit-prelude-3 []
-  "
+      (else (ref.null none))))
   ;; ==========================================
   ;; String Operations
   ;; ==========================================
@@ -5721,7 +4103,7 @@
         (struct.new $String (i32.const 3) (i32.const -1) (local.get $result)))))
 
   ;; str1: convert any single value to string
-  ;; nil -> \"\", int -> decimal, string -> itself, keyword -> \":name\"
+  ;; nil -> "", int -> decimal, string -> itself, keyword -> ":name"
   (func $str1 (param $val anyref) (result anyref)
     ;; Unwrap WithMeta
     (local.set $val (call $unwrap_meta (local.get $val)))
@@ -5764,6 +4146,13 @@
   (func $make_empty_str (result anyref)
     (struct.new $String (i32.const 3) (i32.const -1) (array.new $CharArray (i32.const 0) (i32.const 0))))
 
+  ;; make_str_slash: create a slash string for namespaced keyword construction
+  (func $make_str_slash (result anyref)
+    (local $data (ref $CharArray))
+    (local.set $data (array.new $CharArray (i32.const 0) (i32.const 1)))
+    (array.set $CharArray (local.get $data) (i32.const 0) (i32.const 47))
+    (struct.new $String (i32.const 3) (i32.const -1) (local.get $data)))
+
   ;; str1_true: return the string true
   (func $str1_true (result anyref)
     (local $data (ref $CharArray))
@@ -5785,7 +4174,7 @@
     (array.set $CharArray (local.get $data) (i32.const 4) (i32.const 101))
     (struct.new $String (i32.const 3) (i32.const -1) (local.get $data)))
 
-  ;; keyword_to_str: convert keyword to \":name\" string
+  ;; keyword_to_str: convert keyword to ":name" string
   (func $keyword_to_str (param $kw anyref) (result anyref)
     (local $id i32)
     (local $name anyref)
@@ -5794,7 +4183,7 @@
     (local.set $id (struct.get $Keyword $id (ref.cast (ref $Keyword) (local.get $kw))))
     ;; Look up name (handles both compile-time and runtime keywords)
     (local.set $name (call $kw_name_lookup (local.get $id)))
-    ;; Prepend \":\"
+    ;; Prepend ":"
     (local.set $colon (array.new $CharArray (i32.const 0) (i32.const 1)))
     (array.set $CharArray (local.get $colon) (i32.const 0) (i32.const 58))  ;; ':'
     (local.set $colon_str (struct.new $String (i32.const 3) (i32.const -1) (local.get $colon)))
@@ -5857,6 +4246,10 @@
 
   ;; name_fn: get bare name from keyword (without namespace) or symbol
   (func $name_fn (param $val anyref) (result anyref)
+    ;; Unwrap WithMeta transparently (e.g., ^:const on def symbols)
+    ;; Note: can't use $type_tag here — it already sees through WithMeta and never returns 99
+    (if (ref.test (ref $WithMeta) (local.get $val))
+      (then (local.set $val (struct.get $WithMeta $inner (ref.cast (ref $WithMeta) (local.get $val))))))
     (if (result anyref) (i32.eq (call $type_tag (local.get $val)) (i32.const 2))
       (then
         (call $strip_ns (call $kw_name_lookup (struct.get $Keyword $id (ref.cast (ref $Keyword) (local.get $val))))))
@@ -5896,6 +4289,89 @@
     (array.set $CharArray (local.get $data) (i32.const 0) (local.get $code))
     (struct.new $String (i32.const 3) (i32.const -1) (local.get $data)))
 
+  ;; char_from_codepoint: create a single-character string from a Unicode codepoint (i32)
+  ;; Properly encodes as UTF-8 (1-4 bytes)
+  (func $char_from_codepoint (param $cp i32) (result anyref)
+    (local $data (ref $CharArray))
+    (if (result anyref) (i32.le_u (local.get $cp) (i32.const 0x7F))
+      (then
+        ;; 1-byte ASCII
+        (local.set $data (array.new $CharArray (i32.const 0) (i32.const 1)))
+        (array.set $CharArray (local.get $data) (i32.const 0) (local.get $cp))
+        (struct.new $String (i32.const 3) (i32.const -1) (local.get $data)))
+      (else
+        (if (result anyref) (i32.le_u (local.get $cp) (i32.const 0x7FF))
+          (then
+            ;; 2-byte: 110xxxxx 10xxxxxx
+            (local.set $data (array.new $CharArray (i32.const 0) (i32.const 2)))
+            (array.set $CharArray (local.get $data) (i32.const 0)
+              (i32.or (i32.const 0xC0) (i32.shr_u (local.get $cp) (i32.const 6))))
+            (array.set $CharArray (local.get $data) (i32.const 1)
+              (i32.or (i32.const 0x80) (i32.and (local.get $cp) (i32.const 0x3F))))
+            (struct.new $String (i32.const 3) (i32.const -1) (local.get $data)))
+          (else
+            (if (result anyref) (i32.le_u (local.get $cp) (i32.const 0xFFFF))
+              (then
+                ;; 3-byte: 1110xxxx 10xxxxxx 10xxxxxx
+                (local.set $data (array.new $CharArray (i32.const 0) (i32.const 3)))
+                (array.set $CharArray (local.get $data) (i32.const 0)
+                  (i32.or (i32.const 0xE0) (i32.shr_u (local.get $cp) (i32.const 12))))
+                (array.set $CharArray (local.get $data) (i32.const 1)
+                  (i32.or (i32.const 0x80) (i32.and (i32.shr_u (local.get $cp) (i32.const 6)) (i32.const 0x3F))))
+                (array.set $CharArray (local.get $data) (i32.const 2)
+                  (i32.or (i32.const 0x80) (i32.and (local.get $cp) (i32.const 0x3F))))
+                (struct.new $String (i32.const 3) (i32.const -1) (local.get $data)))
+              (else
+                ;; 4-byte: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+                (local.set $data (array.new $CharArray (i32.const 0) (i32.const 4)))
+                (array.set $CharArray (local.get $data) (i32.const 0)
+                  (i32.or (i32.const 0xF0) (i32.shr_u (local.get $cp) (i32.const 18))))
+                (array.set $CharArray (local.get $data) (i32.const 1)
+                  (i32.or (i32.const 0x80) (i32.and (i32.shr_u (local.get $cp) (i32.const 12)) (i32.const 0x3F))))
+                (array.set $CharArray (local.get $data) (i32.const 2)
+                  (i32.or (i32.const 0x80) (i32.and (i32.shr_u (local.get $cp) (i32.const 6)) (i32.const 0x3F))))
+                (array.set $CharArray (local.get $data) (i32.const 3)
+                  (i32.or (i32.const 0x80) (i32.and (local.get $cp) (i32.const 0x3F))))
+                (struct.new $String (i32.const 3) (i32.const -1) (local.get $data)))))))))
+
+  ;; codepoint_at: extract the Unicode codepoint (as i32) at codepoint index i from a string
+  (func $codepoint_at (param $s anyref) (param $idx i32) (result i32)
+    (local $data (ref $CharArray))
+    (local $offset i32)
+    (local $b0 i32)
+    (local $cp_len i32)
+    (local.set $data (struct.get $String $data (ref.cast (ref $String) (local.get $s))))
+    (local.set $offset (call $utf8_byte_offset (local.get $data) (local.get $idx)))
+    (local.set $b0 (array.get_u $CharArray (local.get $data) (local.get $offset)))
+    (local.set $cp_len (call $utf8_cp_len (local.get $b0)))
+    (if (result i32) (i32.eq (local.get $cp_len) (i32.const 1))
+      (then (local.get $b0))
+      (else
+        (if (result i32) (i32.eq (local.get $cp_len) (i32.const 2))
+          (then
+            ;; 110xxxxx 10xxxxxx
+            (i32.or
+              (i32.shl (i32.and (local.get $b0) (i32.const 0x1F)) (i32.const 6))
+              (i32.and (array.get_u $CharArray (local.get $data) (i32.add (local.get $offset) (i32.const 1))) (i32.const 0x3F))))
+          (else
+            (if (result i32) (i32.eq (local.get $cp_len) (i32.const 3))
+              (then
+                ;; 1110xxxx 10xxxxxx 10xxxxxx
+                (i32.or
+                  (i32.or
+                    (i32.shl (i32.and (local.get $b0) (i32.const 0x0F)) (i32.const 12))
+                    (i32.shl (i32.and (array.get_u $CharArray (local.get $data) (i32.add (local.get $offset) (i32.const 1))) (i32.const 0x3F)) (i32.const 6)))
+                  (i32.and (array.get_u $CharArray (local.get $data) (i32.add (local.get $offset) (i32.const 2))) (i32.const 0x3F))))
+              (else
+                ;; 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+                (i32.or
+                  (i32.or
+                    (i32.shl (i32.and (local.get $b0) (i32.const 0x07)) (i32.const 18))
+                    (i32.shl (i32.and (array.get_u $CharArray (local.get $data) (i32.add (local.get $offset) (i32.const 1))) (i32.const 0x3F)) (i32.const 12)))
+                  (i32.or
+                    (i32.shl (i32.and (array.get_u $CharArray (local.get $data) (i32.add (local.get $offset) (i32.const 2))) (i32.const 0x3F)) (i32.const 6))
+                    (i32.and (array.get_u $CharArray (local.get $data) (i32.add (local.get $offset) (i32.const 3))) (i32.const 0x3F)))))))))))
+
   ;; str_hash: FNV-1a hash of string bytes
   (func $str_hash (param $s anyref) (result i32)
     (local $data (ref $CharArray))
@@ -5914,10 +4390,7 @@
         (local.set $h (i32.mul (local.get $h) (i32.const 0x01000193)))  ;; FNV prime
         (local.set $i (i32.add (local.get $i) (i32.const 1)))
         (br $loop)))
-    (local.get $h))")
-
-(defn emit-prelude-3b []
-  "
+    (local.get $h))
   ;; str_index_of: find first occurrence of substring, return byte offset or -1
   ;; Both params are String refs. Returns i31ref (index or -1)
   (func $str_index_of (param $haystack anyref) (param $needle anyref) (result anyref)
@@ -6487,13 +4960,12 @@
                   (global.get $__kw_runtime_list)))
     (local.get $current))
 
-  ;; keyword2: construct a namespaced keyword from two strings (2-arg)
-  ;; Stub: ignores namespace, creates keyword from name only
+  ;; keyword2: construct a namespaced keyword from ns and name strings
+  ;; Concatenates ns + slash + name, then interns as keyword
   (func $keyword2 (param $ns anyref) (param $name anyref) (result anyref)
-    ;; If ns is nil, just use name
     (if (result anyref) (ref.is_null (local.get $ns))
       (then (call $keyword (local.get $name)))
-      (else (call $keyword (local.get $name)))))
+      (else (call $keyword (call $str_concat (call $str_concat (local.get $ns) (call $make_str_slash)) (local.get $name))))))
 
   ;; Boolean constants (singleton instances)
   (global $__true (ref $Boolean) (struct.new $Boolean (i32.const 14) (i32.const 1)))
@@ -6862,116 +5334,364 @@
   ;; ==========================================
   ;; Float to string (proper decimal conversion)
   ;; ==========================================
+  ;; Helper: return special float strings by index (0=NaN, 1=##Inf, 2=##-Inf)
+  ;; Uses linear memory scratch space to build short strings
+  (func $float_special_str (param $which i32) (result anyref)
+    ;; Write bytes to linear memory at offset 0, then use $mem__GT_string
+    (if (result anyref) (i32.eqz (local.get $which))
+      (then
+        (i32.store8 (i32.const 0) (i32.const 78))
+        (i32.store8 (i32.const 1) (i32.const 97))
+        (i32.store8 (i32.const 2) (i32.const 78))
+        (call $mem__GT_string (i32.const 0) (i32.const 3)))
+      (else (if (result anyref) (i32.eq (local.get $which) (i32.const 1))
+        (then
+          (i32.store8 (i32.const 0) (i32.const 35))
+          (i32.store8 (i32.const 1) (i32.const 35))
+          (i32.store8 (i32.const 2) (i32.const 73))
+          (i32.store8 (i32.const 3) (i32.const 110))
+          (i32.store8 (i32.const 4) (i32.const 102))
+          (call $mem__GT_string (i32.const 0) (i32.const 5)))
+        (else
+          (i32.store8 (i32.const 0) (i32.const 35))
+          (i32.store8 (i32.const 1) (i32.const 35))
+          (i32.store8 (i32.const 2) (i32.const 45))
+          (i32.store8 (i32.const 3) (i32.const 73))
+          (i32.store8 (i32.const 4) (i32.const 110))
+          (i32.store8 (i32.const 5) (i32.const 102))
+          (call $mem__GT_string (i32.const 0) (i32.const 6)))))))
+
   (func $float_to_str (param $f f64) (result anyref)
-    (local $int_part i32)
-    (local $frac f64)
     (local $neg i32)
     (local $abs f64)
+    (local $exp i32)
+    (local $mantissa f64)
+    (local $int_part i32)
+    (local $frac f64)
     (local $int_str anyref)
-    (local $dot_str anyref)
-    (local $frac_str anyref)
     (local $digit i32)
     (local $buf (ref $CharArray))
     (local $pos i32)
     (local $i i32)
+    (local $result (ref $CharArray))
+    ;; Handle special values: NaN, Infinity, -Infinity
+    (if (f64.ne (local.get $f) (local.get $f))
+      (then (return (call $float_special_str (i32.const 0)))))
+    (if (f64.eq (local.get $f) (f64.const inf))
+      (then (return (call $float_special_str (i32.const 1)))))
+    (if (f64.eq (local.get $f) (f64.const -inf))
+      (then (return (call $float_special_str (i32.const 2)))))
+    ;; Handle 0.0 and -0.0
+    (if (f64.eq (local.get $f) (f64.const 0))
+      (then (return (call $make_literal_str_2 (i32.const 48) (i32.const 46) (i32.const 48))))) ;; "0.0"
     ;; Handle negative
     (local.set $neg (f64.lt (local.get $f) (f64.const 0)))
     (local.set $abs (if (result f64) (local.get $neg)
       (then (f64.neg (local.get $f)))
       (else (local.get $f))))
-    ;; Get integer part
-    (local.set $int_part (i32.trunc_f64_s (local.get $abs)))
-    ;; Get fractional part
+    ;; Check if we need scientific notation: abs >= 2^31 (i32 overflow) or abs < 1e-3
+    (if (i32.or (f64.ge (local.get $abs) (f64.const 2147483648.0))
+                (f64.lt (local.get $abs) (f64.const 0.001)))
+      (then (return (call $float_to_str_sci (local.get $f)))))
+    ;; Normal decimal path: abs fits in reasonable range
+    ;; Get integer part using f64.floor (not i32.trunc to avoid overflow)
+    (local.set $frac (local.get $abs))
+    (local.set $int_part (i32.trunc_sat_f64_s (f64.floor (local.get $abs))))
     (local.set $frac (f64.sub (local.get $abs) (f64.convert_i32_s (local.get $int_part))))
     ;; Convert integer part (with sign)
     (local.set $int_str (call $int_to_str (if (result i32) (local.get $neg)
       (then (i32.sub (i32.const 0) (local.get $int_part)))
       (else (local.get $int_part)))))
-    ;; Build decimal digits (up to 6 digits, strip trailing zeros)
-    (local.set $buf (array.new $CharArray (i32.const 0) (i32.const 6)))
-    (local.set $pos (i32.const 0))
+    ;; Format fractional part: up to 6 digits, strip trailing zeros (keep 1)
+    (local.set $buf (array.new $CharArray (i32.const 0) (i32.const 7))) ;; dot + 6 digits
+    (array.set $CharArray (local.get $buf) (i32.const 0) (i32.const 46)) ;; '.'
+    (local.set $pos (i32.const 1))
     (local.set $i (i32.const 0))
     (block $done
       (loop $loop
         (br_if $done (i32.ge_s (local.get $i) (i32.const 6)))
         (local.set $frac (f64.mul (local.get $frac) (f64.const 10)))
-        (local.set $digit (i32.trunc_f64_s (local.get $frac)))
+        (local.set $digit (i32.trunc_sat_f64_s (local.get $frac)))
         (local.set $frac (f64.sub (local.get $frac) (f64.convert_i32_s (local.get $digit))))
-        (array.set $CharArray (local.get $buf) (local.get $i) (i32.add (i32.const 48) (local.get $digit)))
-        (local.set $pos (i32.add (local.get $i) (i32.const 1)))
+        (array.set $CharArray (local.get $buf) (local.get $pos) (i32.add (i32.const 48) (local.get $digit)))
+        (local.set $pos (i32.add (local.get $pos) (i32.const 1)))
         (local.set $i (i32.add (local.get $i) (i32.const 1)))
         (br $loop)))
-    ;; Strip trailing zeros (but keep at least 1 digit)
+    ;; Strip trailing zeros (keep at least dot + 1 digit = pos >= 2)
     (block $strip_done
       (loop $strip
-        (br_if $strip_done (i32.le_s (local.get $pos) (i32.const 1)))
-        (br_if $strip_done (i32.ne (array.get_u $CharArray (local.get $buf) (i32.sub (local.get $pos) (i32.const 1))) (i32.const 48)))
-        (local.set $pos (i32.sub (local.get $pos) (i32.const 1)))
-        (br $strip)))
-    ;; Build dot + frac string
-    (local.set $dot_str (struct.new $String (i32.const 3) (i32.const -1)
-      (block (result (ref $CharArray))
-        (local.set $buf (array.new $CharArray (i32.const 0) (i32.const 1)))
-        (array.set $CharArray (local.get $buf) (i32.const 0) (i32.const 46))
-        (local.get $buf))))
-    (local.set $frac_str (struct.new $String (i32.const 3) (i32.const -1)
-      (block (result (ref $CharArray))
-        (local.set $buf (array.new $CharArray (i32.const 0) (i32.const 6)))
-        (local.set $i (i32.const 0))
-        (block $done2
-          (loop $loop2
-            (br_if $done2 (i32.ge_s (local.get $i) (local.get $pos)))
-            ;; Recalculate the digits
-            (local.set $i (i32.add (local.get $i) (i32.const 1)))
-            (br $loop2)))
-        (local.get $buf))))
-    ;; Simpler approach: just concat int_str + dot + digits
-    (call $str_concat (call $str_concat (local.get $int_str) (local.get $dot_str))
-      (call $int_to_str_frac (local.get $f))))
-
-  ;; Helper: format fractional part of float
-  (func $int_to_str_frac (param $f f64) (result anyref)
-    (local $abs f64)
-    (local $int_part i32)
-    (local $frac f64)
-    (local $buf (ref $CharArray))
-    (local $pos i32)
-    (local $digit i32)
-    (local $result (ref $CharArray))
-    (local $i i32)
-    (local.set $abs (if (result f64) (f64.lt (local.get $f) (f64.const 0))
-      (then (f64.neg (local.get $f)))
-      (else (local.get $f))))
-    (local.set $int_part (i32.trunc_f64_s (local.get $abs)))
-    (local.set $frac (f64.sub (local.get $abs) (f64.convert_i32_s (local.get $int_part))))
-    ;; Generate up to 6 fractional digits
-    (local.set $buf (array.new $CharArray (i32.const 0) (i32.const 6)))
-    (local.set $pos (i32.const 0))
-    (local.set $i (i32.const 0))
-    (block $done
-      (loop $loop
-        (br_if $done (i32.ge_s (local.get $i) (i32.const 6)))
-        (local.set $frac (f64.mul (local.get $frac) (f64.const 10)))
-        (local.set $digit (i32.trunc_f64_s (local.get $frac)))
-        (local.set $frac (f64.sub (local.get $frac) (f64.convert_i32_s (local.get $digit))))
-        (array.set $CharArray (local.get $buf) (local.get $i) (i32.add (i32.const 48) (local.get $digit)))
-        (local.set $pos (i32.add (local.get $i) (i32.const 1)))
-        (local.set $i (i32.add (local.get $i) (i32.const 1)))
-        (br $loop)))
-    ;; Strip trailing zeros (keep at least 1)
-    (block $strip_done
-      (loop $strip
-        (br_if $strip_done (i32.le_s (local.get $pos) (i32.const 1)))
+        (br_if $strip_done (i32.le_s (local.get $pos) (i32.const 2)))
         (br_if $strip_done (i32.ne (array.get_u $CharArray (local.get $buf) (i32.sub (local.get $pos) (i32.const 1))) (i32.const 48)))
         (local.set $pos (i32.sub (local.get $pos) (i32.const 1)))
         (br $strip)))
     ;; Copy to right-sized array
     (local.set $result (array.new $CharArray (i32.const 0) (local.get $pos)))
     (array.copy $CharArray $CharArray (local.get $result) (i32.const 0) (local.get $buf) (i32.const 0) (local.get $pos))
-    (struct.new $String (i32.const 3) (i32.const -1) (local.get $result)))")
+    (call $str_concat (local.get $int_str)
+      (struct.new $String (i32.const 3) (i32.const -1) (local.get $result))))
 
-(defn emit-prelude-3c []
-  "
+  ;; Helper: make a 3-char string from 3 byte values
+  (func $make_literal_str_2 (param $a i32) (param $b i32) (param $c i32) (result anyref)
+    (local $buf (ref $CharArray))
+    (local.set $buf (array.new $CharArray (i32.const 0) (i32.const 3)))
+    (array.set $CharArray (local.get $buf) (i32.const 0) (local.get $a))
+    (array.set $CharArray (local.get $buf) (i32.const 1) (local.get $b))
+    (array.set $CharArray (local.get $buf) (i32.const 2) (local.get $c))
+    (struct.new $String (i32.const 3) (i32.const -1) (local.get $buf)))
+
+  ;; Scientific notation: e.g. 1.7976931348623157E308 or 4.9E-324
+  (func $float_to_str_sci (param $f f64) (result anyref)
+    (local $neg i32)
+    (local $abs f64)
+    (local $exp i32)
+    (local $mantissa f64)
+    (local $digit i32)
+    (local $buf (ref $CharArray))
+    (local $pos i32)
+    (local $i i32)
+    (local $result (ref $CharArray))
+    (local $sign_str anyref)
+    (local $mant_str anyref)
+    (local $exp_str anyref)
+    ;; Handle negative
+    (local.set $neg (f64.lt (local.get $f) (f64.const 0)))
+    (local.set $abs (if (result f64) (local.get $neg)
+      (then (f64.neg (local.get $f)))
+      (else (local.get $f))))
+    ;; Compute exponent: repeatedly divide/multiply by 10 to normalize to [1, 10)
+    (local.set $exp (i32.const 0))
+    (local.set $mantissa (local.get $abs))
+    ;; If >= 10, divide by 10 and increment exp
+    (if (f64.ge (local.get $mantissa) (f64.const 10))
+      (then
+        (block $big_done
+          (loop $big_loop
+            (br_if $big_done (f64.lt (local.get $mantissa) (f64.const 10)))
+            (local.set $mantissa (f64.div (local.get $mantissa) (f64.const 10)))
+            (local.set $exp (i32.add (local.get $exp) (i32.const 1)))
+            (br $big_loop)))))
+    ;; If < 1, multiply by 10 and decrement exp
+    (if (f64.lt (local.get $mantissa) (f64.const 1))
+      (then
+        (block $small_done
+          (loop $small_loop
+            (br_if $small_done (f64.ge (local.get $mantissa) (f64.const 1)))
+            (local.set $mantissa (f64.mul (local.get $mantissa) (f64.const 10)))
+            (local.set $exp (i32.sub (local.get $exp) (i32.const 1)))
+            (br $small_loop)))))
+    ;; Now mantissa is in [1, 10), exp is the exponent
+    ;; Format mantissa with up to 16 significant digits
+    (local.set $digit (i32.trunc_sat_f64_s (local.get $mantissa)))
+    (local.set $mantissa (f64.sub (local.get $mantissa) (f64.convert_i32_s (local.get $digit))))
+    ;; Build: digit . fraction
+    (local.set $buf (array.new $CharArray (i32.const 0) (i32.const 18))) ;; digit + dot + 16 frac digits
+    (array.set $CharArray (local.get $buf) (i32.const 0) (i32.add (i32.const 48) (local.get $digit)))
+    (array.set $CharArray (local.get $buf) (i32.const 1) (i32.const 46)) ;; '.'
+    (local.set $pos (i32.const 2))
+    (local.set $i (i32.const 0))
+    (block $frac_done
+      (loop $frac_loop
+        (br_if $frac_done (i32.ge_s (local.get $i) (i32.const 16)))
+        (local.set $mantissa (f64.mul (local.get $mantissa) (f64.const 10)))
+        (local.set $digit (i32.trunc_sat_f64_s (local.get $mantissa)))
+        ;; Clamp digit to 0-9
+        (if (i32.gt_s (local.get $digit) (i32.const 9))
+          (then (local.set $digit (i32.const 9))))
+        (if (i32.lt_s (local.get $digit) (i32.const 0))
+          (then (local.set $digit (i32.const 0))))
+        (local.set $mantissa (f64.sub (local.get $mantissa) (f64.convert_i32_s (local.get $digit))))
+        (array.set $CharArray (local.get $buf) (local.get $pos) (i32.add (i32.const 48) (local.get $digit)))
+        (local.set $pos (i32.add (local.get $pos) (i32.const 1)))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $frac_loop)))
+    ;; Strip trailing zeros (keep at least 1 after dot)
+    (block $strip_done
+      (loop $strip
+        (br_if $strip_done (i32.le_s (local.get $pos) (i32.const 3)))
+        (br_if $strip_done (i32.ne (array.get_u $CharArray (local.get $buf) (i32.sub (local.get $pos) (i32.const 1))) (i32.const 48)))
+        (local.set $pos (i32.sub (local.get $pos) (i32.const 1)))
+        (br $strip)))
+    ;; Build mantissa string
+    (local.set $result (array.new $CharArray (i32.const 0) (local.get $pos)))
+    (array.copy $CharArray $CharArray (local.get $result) (i32.const 0) (local.get $buf) (i32.const 0) (local.get $pos))
+    (local.set $mant_str (struct.new $String (i32.const 3) (i32.const -1) (local.get $result)))
+    ;; Build sign prefix
+    (local.set $sign_str (if (result anyref) (local.get $neg)
+      (then (call $make_literal_str_1 (i32.const 45))) ;; "-"
+      (else (call $make_empty_str))))
+    ;; Build exponent string: "E" + exp
+    (local.set $exp_str (call $str_concat
+      (call $make_literal_str_1 (i32.const 69)) ;; "E"
+      (call $int_to_str (local.get $exp))))
+    ;; Concat: sign + mantissa + "E" + exp
+    (call $str_concat (call $str_concat (local.get $sign_str) (local.get $mant_str))
+      (local.get $exp_str)))
+
+  ;; Helper: make a 1-char string
+  (func $make_literal_str_1 (param $ch i32) (result anyref)
+    (local $buf (ref $CharArray))
+    (local.set $buf (array.new $CharArray (i32.const 0) (i32.const 1)))
+    (array.set $CharArray (local.get $buf) (i32.const 0) (local.get $ch))
+    (struct.new $String (i32.const 3) (i32.const -1) (local.get $buf)))
+  ;; ==========================================
+  ;; Linear Memory Helpers (big-endian I/O, FNV-1a hash)
+  ;; ==========================================
+
+  ;; mem_write_i32_be: write 32-bit integer in big-endian byte order
+  (func $mem_write_i32_be (param $offset i32) (param $val i32)
+    (i32.store8 (local.get $offset)
+      (i32.shr_u (local.get $val) (i32.const 24)))
+    (i32.store8 (i32.add (local.get $offset) (i32.const 1))
+      (i32.and (i32.shr_u (local.get $val) (i32.const 16)) (i32.const 0xFF)))
+    (i32.store8 (i32.add (local.get $offset) (i32.const 2))
+      (i32.and (i32.shr_u (local.get $val) (i32.const 8)) (i32.const 0xFF)))
+    (i32.store8 (i32.add (local.get $offset) (i32.const 3))
+      (i32.and (local.get $val) (i32.const 0xFF))))
+
+  ;; mem_read_i32_be: read 32-bit integer in big-endian byte order
+  (func $mem_read_i32_be (param $offset i32) (result i32)
+    (i32.or
+      (i32.or
+        (i32.shl (i32.load8_u (local.get $offset)) (i32.const 24))
+        (i32.shl (i32.load8_u (i32.add (local.get $offset) (i32.const 1))) (i32.const 16)))
+      (i32.or
+        (i32.shl (i32.load8_u (i32.add (local.get $offset) (i32.const 2))) (i32.const 8))
+        (i32.load8_u (i32.add (local.get $offset) (i32.const 3))))))
+
+  ;; mem_write_f64_be: write f64 in big-endian byte order
+  ;; Uses scratch space at offset 16 for byte-swap
+  (func $mem_write_f64_be (param $offset i32) (param $val f64)
+    (local $i i32)
+    ;; Store f64 natively (little-endian on most platforms) at scratch offset 16
+    (f64.store (i32.const 16) (local.get $val))
+    ;; Copy 8 bytes in reverse order to target offset
+    (local.set $i (i32.const 0))
+    (block $done
+      (loop $loop
+        (br_if $done (i32.ge_s (local.get $i) (i32.const 8)))
+        (i32.store8 (i32.add (local.get $offset) (local.get $i))
+          (i32.load8_u (i32.add (i32.const 16) (i32.sub (i32.const 7) (local.get $i)))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $loop))))
+
+  ;; mem_read_f64_be: read f64 from big-endian byte order
+  ;; Uses scratch space at offset 16 for byte-swap
+  (func $mem_read_f64_be (param $offset i32) (result f64)
+    (local $i i32)
+    ;; Copy 8 bytes in reverse order from source to scratch offset 16
+    (local.set $i (i32.const 0))
+    (block $done
+      (loop $loop
+        (br_if $done (i32.ge_s (local.get $i) (i32.const 8)))
+        (i32.store8 (i32.add (i32.const 16) (local.get $i))
+          (i32.load8_u (i32.add (local.get $offset) (i32.sub (i32.const 7) (local.get $i)))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $loop)))
+    ;; Load f64 from scratch (now in native byte order)
+    (f64.load (i32.const 16)))
+
+  ;; mem_hash: FNV-1a hash over linear memory range [offset, offset+length)
+  (func $mem_hash (param $offset i32) (param $length i32) (result i32)
+    (local $h i32)
+    (local $i i32)
+    (local $end i32)
+    (local.set $h (i32.const 0x811c9dc5))
+    (local.set $end (i32.add (local.get $offset) (local.get $length)))
+    (local.set $i (local.get $offset))
+    (block $done
+      (loop $loop
+        (br_if $done (i32.ge_s (local.get $i) (local.get $end)))
+        (local.set $h (i32.xor (local.get $h) (i32.load8_u (local.get $i))))
+        (local.set $h (i32.mul (local.get $h) (i32.const 0x01000193)))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $loop)))
+    (local.get $h))
+  ;; ==========================================
+  ;; StringBuffer: mutable growable byte buffer
+  ;; ==========================================
+
+  ;; string_buffer: create a new StringBuffer with initial capacity
+  (func $string_buffer (result anyref)
+    (struct.new $StringBuffer
+      (array.new $CharArray (i32.const 0) (i32.const 256))
+      (i32.const 0)))
+
+  ;; sb_ensure_capacity: grow buffer if needed (internal helper)
+  (func $sb_ensure_capacity (param $sb (ref $StringBuffer)) (param $needed i32)
+    (local $data (ref $CharArray))
+    (local $cap i32)
+    (local $new_cap i32)
+    (local $new_data (ref $CharArray))
+    (local.set $data (struct.get $StringBuffer $data (local.get $sb)))
+    (local.set $cap (array.len (local.get $data)))
+    (if (i32.le_s (local.get $needed) (local.get $cap)) (then (return)))
+    ;; Double until big enough
+    (local.set $new_cap (local.get $cap))
+    (block $done
+      (loop $grow
+        (local.set $new_cap (i32.shl (local.get $new_cap) (i32.const 1)))
+        (br_if $done (i32.ge_s (local.get $new_cap) (local.get $needed)))
+        (br $grow)))
+    ;; Allocate and bulk copy with array.copy
+    (local.set $new_data (array.new $CharArray (i32.const 0) (local.get $new_cap)))
+    (array.copy $CharArray $CharArray
+      (local.get $new_data) (i32.const 0)
+      (local.get $data) (i32.const 0)
+      (struct.get $StringBuffer $len (local.get $sb)))
+    (struct.set $StringBuffer $data (local.get $sb) (local.get $new_data)))
+
+  ;; sb_append!: append a String's bytes to the buffer
+  (func $sb_append_BANG_ (param $sb anyref) (param $s anyref) (result anyref)
+    (local $sb_ref (ref $StringBuffer))
+    (local $src (ref $CharArray))
+    (local $src_len i32)
+    (local $len i32)
+    (local $new_len i32)
+    (if (ref.is_null (local.get $s)) (then (return (local.get $sb))))
+    (if (i32.eqz (ref.test (ref $String) (local.get $s))) (then (return (local.get $sb))))
+    (local.set $sb_ref (ref.cast (ref $StringBuffer) (local.get $sb)))
+    (local.set $src (struct.get $String $data (ref.cast (ref $String) (local.get $s))))
+    (local.set $src_len (array.len (local.get $src)))
+    (if (i32.eqz (local.get $src_len)) (then (return (local.get $sb))))
+    (local.set $len (struct.get $StringBuffer $len (local.get $sb_ref)))
+    (local.set $new_len (i32.add (local.get $len) (local.get $src_len)))
+    (call $sb_ensure_capacity (local.get $sb_ref) (local.get $new_len))
+    ;; Bulk copy with array.copy
+    (array.copy $CharArray $CharArray
+      (struct.get $StringBuffer $data (local.get $sb_ref)) (local.get $len)
+      (local.get $src) (i32.const 0)
+      (local.get $src_len))
+    (struct.set $StringBuffer $len (local.get $sb_ref) (local.get $new_len))
+    (local.get $sb))
+
+  ;; sb_append_char!: append a single byte to the buffer
+  (func $sb_append_char_BANG_ (param $sb anyref) (param $ch i32) (result anyref)
+    (local $sb_ref (ref $StringBuffer))
+    (local $len i32)
+    (local.set $sb_ref (ref.cast (ref $StringBuffer) (local.get $sb)))
+    (local.set $len (struct.get $StringBuffer $len (local.get $sb_ref)))
+    (call $sb_ensure_capacity (local.get $sb_ref) (i32.add (local.get $len) (i32.const 1)))
+    (array.set $CharArray (struct.get $StringBuffer $data (local.get $sb_ref))
+      (local.get $len) (local.get $ch))
+    (struct.set $StringBuffer $len (local.get $sb_ref) (i32.add (local.get $len) (i32.const 1)))
+    (local.get $sb))
+
+  ;; sb->string: convert buffer contents to a String
+  (func $sb__GT_string (param $sb anyref) (result anyref)
+    (local $sb_ref (ref $StringBuffer))
+    (local $len i32)
+    (local $result (ref $CharArray))
+    (local.set $sb_ref (ref.cast (ref $StringBuffer) (local.get $sb)))
+    (local.set $len (struct.get $StringBuffer $len (local.get $sb_ref)))
+    (if (result anyref) (i32.eqz (local.get $len))
+      (then (struct.new $String (i32.const 3) (i32.const -1) (array.new $CharArray (i32.const 0) (i32.const 0))))
+      (else
+        (local.set $result (array.new $CharArray (i32.const 0) (local.get $len)))
+        (array.copy $CharArray $CharArray
+          (local.get $result) (i32.const 0)
+          (struct.get $StringBuffer $data (local.get $sb_ref)) (i32.const 0)
+          (local.get $len))
+        (struct.new $String (i32.const 3) (i32.const -1) (local.get $result)))))
   ;; ==========================================
   ;; pr-str1: EDN-safe printing of a single value
   ;; Unlike str1, this quotes strings, prints nil as the word nil,
@@ -7274,515 +5994,3 @@
     (array.set $CharArray (local.get $data) (i32.const 0) (local.get $c1))
     (array.set $CharArray (local.get $data) (i32.const 1) (local.get $c2))
     (struct.new $String (i32.const 3) (i32.const -1) (local.get $data)))
-")
-
-(defn- emit-user-type-defs []
-  "Generate WasmGC struct type definitions for user-defined types.
-   All user types extend $Tagged with $__type_id as first field."
-  (if (empty? *user-types*)
-    ""
-    (str "\n\n  ;; User-defined types\n"
-         (str-join "\n"
-                   (for [[type-name {:keys [fields]}] *user-types*]
-                     (let [munged (munge-name type-name)
-                           field-decls (str-join " " (mapv (fn [f] (str "(field $" (munge-name f) " anyref)")) fields))]
-                       (str "  (type $" munged " (sub $Tagged (struct (field $__type_id i32) " field-decls ")))")))))))
-
-(defn- emit-user-type-tag-branches []
-  "Generate type_tag branches for user-defined types.
-   Since all types (built-in and user) now extend $Tagged, this is handled
-   by the $Tagged cast in type_tag itself. No separate user-type branches needed."
-  ;; All types extend $Tagged, so the main type_tag function handles everything
-  ;; via (struct.get $Tagged $__type_id (ref.cast (ref $Tagged) val))
-  "(i32.const -1)")
-
-(defn- emit-user-type-eq-code []
-  "Generate WAT equality-checking code for user-defined types.
-   Produces nested if/else checking type tags, then structurally comparing all fields."
-  (if (empty? *user-types*)
-    "(i32.const 0)"
-    (let [type-entries (seq *user-types*)
-          gen-eq (fn [[type-name {:keys [tag fields]}]]
-                   (let [munged (munge-name type-name)
-                         field-eqs (map (fn [f]
-                                          (let [mf (munge-name f)]
-                                            (str "(call $eq "
-                                                 "(struct.get $" munged " $" mf " (ref.cast (ref $" munged ") (local.get $a))) "
-                                                 "(struct.get $" munged " $" mf " (ref.cast (ref $" munged ") (local.get $b))))")))
-                                        fields)
-                         combined (cond
-                                    (empty? field-eqs) "(i32.const 1)"
-                                    (= 1 (count field-eqs)) (first field-eqs)
-                                    :else (reduce (fn [acc eq]
-                                                    (str "(i32.and " acc " " eq ")"))
-                                                  (first field-eqs)
-                                                  (rest field-eqs)))]
-                     {:tag tag :eq-expr combined}))]
-      (reduce (fn [fallback {:keys [tag eq-expr]}]
-                (str "(if (result i32) (i32.and "
-                     "(i32.eq (call $type_tag (local.get $a)) (i32.const " tag ")) "
-                     "(i32.eq (call $type_tag (local.get $b)) (i32.const " tag "))) "
-                     "(then " eq-expr ") "
-                     "(else " fallback "))"))
-              "(i32.const 0)"
-              (reverse (map gen-eq type-entries))))))
-
-(defn- emit-user-type-hash-code []
-  "Generate WAT hashing code for user-defined types.
-   For each type, combines tag and field hashes: hash = ((tag*31 + hash(f1))*31 + hash(f2))..."
-  (if (empty? *user-types*)
-    "(i32.const 31)"
-    (let [type-entries (seq *user-types*)
-          gen-hash (fn [[type-name {:keys [tag fields]}]]
-                     (let [munged (munge-name type-name)
-                           hash-expr (reduce
-                                      (fn [acc f]
-                                        (let [mf (munge-name f)]
-                                          (str "(i32.add (i32.mul (i32.const 31) " acc ") "
-                                               "(call $hash (struct.get $" munged " $" mf
-                                               " (ref.cast (ref $" munged ") (local.get $val)))))")))
-                                      (str "(i32.const " tag ")")
-                                      fields)]
-                       {:tag tag :hash-expr hash-expr}))]
-      (reduce (fn [fallback {:keys [tag hash-expr]}]
-                (str "(if (result i32) (i32.eq (call $type_tag (local.get $val)) (i32.const " tag ")) "
-                     "(then " hash-expr ") "
-                     "(else " fallback "))"))
-              "(i32.const 31)"
-              (reverse (map gen-hash type-entries))))))
-
-(defn- emit-user-predicate-checks
-  "Generate i32 check expression for user types that extend a given protocol method.
-   Returns an i32 expression, or (i32.const 0) if no user types match.
-   Only includes user-defined type tags (>= 20) to avoid false positives with builtins."
-  [method-name]
-  (let [;; Find user type tags (>= 20) that implement the given method
-        user-tags (->> (keys *protocol-impls*)
-                       (filter (fn [k] (= (nth k 1) method-name)))
-                       (map first)
-                       (filter #(>= % 20))
-                       distinct
-                       vec)]
-    (if (empty? user-tags)
-      "(i32.const 0)"
-      (reduce (fn [acc tag]
-                (str "(i32.or " acc " (i32.eq (call $type_tag (local.get $val)) (i32.const " tag ")))"))
-              (str "(i32.eq (call $type_tag (local.get $val)) (i32.const " (first user-tags) "))")
-              (rest user-tags)))))
-
-(defn emit-prelude []
-  (let [host-import-section (if (seq *host-imports*)
-                              (str "\n  ;; Host imports\n  " (str-join "\n  " *host-imports*))
-                              "")
-        base (str (emit-prelude-1) (emit-user-type-defs) (emit-prelude-2) (emit-prelude-2a) (emit-prelude-transient) (emit-prelude-2b) (emit-prelude-3) (emit-prelude-3b) (emit-prelude-3c))]
-    ;; Replace all placeholders
-    (-> base
-        (string/replace "__HOST_IMPORTS__" host-import-section)
-        (string/replace "__USER_TYPE_TAGS__"
-                        (if (empty? *user-types*) "(i32.const -1)" (emit-user-type-tag-branches)))
-        (string/replace "__USER_TYPE_EQ__"
-                        (emit-user-type-eq-code))
-        (string/replace "__USER_TYPE_HASH__"
-                        (emit-user-type-hash-code))
-        (string/replace "__USER_COUNTED__"
-                        (emit-user-predicate-checks (symbol "-count")))
-        (string/replace "__USER_MAP__"
-                        (emit-user-predicate-checks (symbol "-assoc"))))))
-
-(defn emit-module [ast-forms]
-  (binding [*functions* []
-            *globals-emit* []
-            *globals-declared* #{}
-            *fn-counter* 0
-            *loop-counter* 0
-            *closure-funcs* []
-            *emitted-fn-names* #{"$float_QMARK_"}
-            *host-imports* []
-            *host-import-fns* #{}
-            *protocols* {}
-            *protocol-methods* {}
-            *protocol-impls* {}
-            *lifted-fn-inits* []]
-  ;; Pre-scan: populate *internal-fn-names* for all exported functions
-  ;; so cross-namespace calls can resolve to _internal names regardless of emit order
-    (doseq [form ast-forms]
-      (when (= (:op form) :def)
-        (let [init-op (:op (:init form))]
-          (cond
-            ;; Host import: pre-register in *host-import-fns*
-            (= init-op :host-import)
-            (let [munged (munge-name (:name form))]
-              (set! *host-import-fns* (conj *host-import-fns* munged)))
-
-            ;; Normal function
-            (= init-op :fn)
-            (let [arities (get-in form [:init :arities])
-                  fname (:name form)
-                  munged (munge-name fname)]
-              (if (and arities (> (count arities) 1))
-                ;; Multi-arity: register each arity's internal name
-                (doseq [arity-info arities]
-                  (let [arity-suffix (if (:variadic? arity-info)
-                                       "_variadic"
-                                       (str "_arity" (:arity arity-info)))
-                        full-munged (str munged arity-suffix)]
-                    (set! *internal-fn-names* (assoc *internal-fn-names* full-munged (str full-munged "_internal")))))
-                ;; Single arity: register standard internal name
-                (set! *internal-fn-names* (assoc *internal-fn-names* munged (str munged "_internal")))))))))
-    (let [init-code (into [] (filter some? (map emit-str ast-forms)))
-        ;; Generate builtin wrappers for any builtins used as values
-          builtin-wrappers (when (seq *builtin-refs*)
-                             (let [;; Map builtin-arities locally
-                                   arities {'inc 1, 'dec 1, 'not 1, 'neg? 1, 'pos? 1, 'zero? 1, 'NaN? 1,
-                                            'first 1, 'rest 1, 'nil? 1, 'cons? 1, 'count 1, 'vector? 1, 'map? 1,
-                                            'list? 1, 'keyword? 1, 'number? 1, 'integer? 1, 'fn? 1,
-                                            'coll? 1, 'sequential? 1, 'associative? 1, 'counted? 1, 'indexed? 1,
-                                            'true? 1, 'false? 1, 'some? 1,
-                                            'string? 1, 'symbol? 1, 'float? 1, 'symbol 1, 'symbol2 2, 'namespace 1,
-                                            'seq 1, 'seq? 1, 'seqable? 1, 'empty? 1,
-                                            'set? 1, 'empty-hash-set 0,
-                                            'keys 1, 'vals 1,
-                                            'atom 1, 'deref 1, 'atom? 1,
-                                            'num 1, 'type 1,
-                                            '+ 2, '- 2, '* 2, '/ 2, '= 2, 'not= 2, '< 2, '> 2, '<= 2, '>= 2,
-                                            'and 2, 'or 2, 'cons 2, 'nth 2, 'conj 2, 'get 2, 'contains? 2,
-                                            'reset! 2, 'swap! 2, 'apply 2,
-                                            'dissoc 2, 'disj 2, 'set-conj 2,
-                                            'assoc 3, 'assoc-map 3,
-                                            'reduce 3, 'reduce-kv 3, 'reduced 1, 'reduced? 1,
-                                            'make-lazy-seq 1, 'lazy-seq? 1, 'lazy-seq-realized? 1,
-                                            'str1 1, 'str-concat 2, 'name 1, 'subs 3, 'string->mem! 2, 'mem->string 2, 'pr-str1 1, 'char 1,
-                                            'keyword 1, 'keyword2 2,
-                                         ;; Float operations
-                                            'to-float 1, 'to-int 1, 'math-floor 1, 'math-ceil 1, 'math-sqrt 1,
-                                            'math-abs 1, 'math-round 1,
-                                            'empty-vector 0, 'empty-hash-map 0, 'make-array-map 2,
-                                         ;; Bit operations
-                                            'bit-and 2, 'bit-or 2, 'bit-xor 2, 'bit-not 1,
-                                            'bit-shift-left 2, 'bit-shift-right 2,
-                                            'unsigned-bit-shift-right 2, 'bit-test 2,
-                                         ;; Compare
-                                            'compare 2,
-                                         ;; Array operations
-                                            'make-array 1, 'aget 2, 'aset 3, 'alength 1,
-                                            'aclone 1, 'acopy 5, 'object-array 1, 'array? 1,
-                                            'vector-from-array 1,
-                                         ;; Regex operations
-                                            're-pattern 1, 'regex-pattern 1, 'regex? 1,
-                                         ;; Hash
-                                            'str-hash 1,
-                                         ;; Transient operations
-                                            'transient 1, 'persistent! 1,
-                                            'conj! 2, 'assoc! 3, 'dissoc! 2, 'disj! 2, 'pop! 1}]
-                               (for [builtin *builtin-refs*]
-                                 (emit-builtin-wrapper builtin (get arities builtin)))))
-        ;; Generate wrappers for user-defined functions used as values
-          fn-wrappers (when (seq *fn-refs*)
-                        (for [fn-name *fn-refs*]
-                          (let [fn-info (get *direct-fn-globals* fn-name)
-                                is-multi (and (map? fn-info)
-                                              (or (> (count (:arities fn-info)) 1)
-                                                  (:variadic? fn-info)))]
-                            (if is-multi
-                              (emit-multi-arity-fn-wrapper fn-name fn-info)
-                              (let [arity (if (map? fn-info)
-                                            (or (first (:arities fn-info)) (:min-arity fn-info) 0)
-                                            (or fn-info 0))]
-                                (emit-fn-wrapper fn-name arity))))))
-        ;; Generate protocol impl closures
-          proto-impl-closures (when (seq *protocol-impls*)
-                                (generate-protocol-impl-closures *protocol-impls*))
-        ;; Generate dispatch functions for each protocol method
-        ;; For multi-arity methods, generate one dispatch per arity
-          proto-dispatch-funcs (when (seq *protocol-methods*)
-                                 (mapcat
-                                  (fn [[method-name {:keys [arity arities]}]]
-                                    (if (and arities (> (count arities) 1))
-                                      ;; Multi-arity: generate dispatch per arity
-                                      (for [[a _] arities
-                                            :let [;; Multi-arity impls use [type-tag method arity] key
-                                                  method-impls (filter (fn [[[_ m ar] _]]
-                                                                        (and (= m method-name) (= ar a)))
-                                                                       *protocol-impls*)
-                                                  ;; Rekey to [type-tag method] for generate-dispatch-function
-                                                  rekeyed (map (fn [[[tt m _a] v]] [[tt m] v]) method-impls)]]
-                                        (when (seq rekeyed)
-                                          (generate-dispatch-function
-                                           (symbol (str (name method-name) "_arity_" a)) a rekeyed)))
-                                      ;; Single-arity: original behavior
-                                      (let [method-impls (filter (fn [[[_ m & _] _]] (= m method-name)) *protocol-impls*)]
-                                        (when (seq method-impls)
-                                          [(generate-dispatch-function method-name arity method-impls)]))))
-                                  *protocol-methods*))
-        ;; Generate satisfies? predicates for each protocol
-          proto-satisfies-funcs (when (seq *protocols*)
-                                  (for [[proto-name _] *protocols*
-                                        :let [;; Get all impls for methods of this protocol
-                                              proto-methods (set (map :name (:methods (get *protocols* proto-name))))
-                                              proto-impls (filter (fn [entry] (contains? proto-methods (nth (first entry) 1))) *protocol-impls*)]]
-                                    (generate-satisfies-function proto-name proto-impls)))
-        ;; Generate stubs for core protocol methods/satisfies if not already defined
-        ;; These are needed because the WAT prelude references them unconditionally
-          core-proto-stubs
-          (let [core-methods [[(symbol "-seq") 1 (symbol "ISeqable")]
-                              [(symbol "-count") 1 (symbol "ICounted")]
-                              [(symbol "-conj") 2 (symbol "ICollection")]
-                              [(symbol "-lookup") 2 (symbol "ILookup")]
-                              [(symbol "-assoc") 3 (symbol "IAssociative")]
-                              [(symbol "-reduce-init") 3 (symbol "IReduce")]]
-                dispatch-stubs (for [[method-name arity _] core-methods
-                                     :when (not (contains? *protocol-methods* method-name))]
-                                 (let [munged (munge-name method-name)
-                                       fn-name (str "$__dispatch_" munged)
-                                       param-decls (str-join " " (for [i (range arity)]
-                                                                   (str "(param $arg" i " anyref)")))]
-                                   (str "(func " fn-name " " param-decls " (result anyref)\n"
-                                        "    (unreachable))")))
-                satisfies-stubs (for [[_ _ proto-name] core-methods
-                                      :when (not (contains? *protocols* proto-name))]
-                                  (let [munged (munge-name proto-name)
-                                        fn-name (str "$__satisfies_" munged)]
-                                    (str "(func " fn-name " (param $val anyref) (result anyref)\n"
-                                         "    (global.get $__false))")))]
-            (concat (distinct dispatch-stubs) (distinct satisfies-stubs)))
-          prelude (emit-prelude)
-        ;; Add builtin and fn wrapper globals
-          builtin-globals (when (seq builtin-wrappers)
-                            (map :global-decl builtin-wrappers))
-          fn-globals (when (seq fn-wrappers)
-                       (map :global-decl fn-wrappers))
-          proto-globals (when (seq proto-impl-closures)
-                          (map :global-decl proto-impl-closures))
-        ;; Generate string constant globals and init code
-          string-entries (sort-by val *strings*)  ;; sorted by id
-          string-globals (for [[s id] string-entries]
-                           (str "(global $__str_" id " (mut anyref) (ref.null none))"))
-        ;; Build a single data segment with all string bytes concatenated
-          string-data-info (if (seq string-entries)
-                             (reduce (fn [acc [s id]]
-                                       (let [bytes (.getBytes ^String s "UTF-8")
-                                             offset (:offset acc)]
-                                         (-> acc
-                                             (update :bytes (fn [b] (into (or b []) bytes)))
-                                             (assoc-in [:entries id] {:offset offset :length (count bytes)})
-                                             (assoc :offset (+ offset (count bytes))))))
-                                     {:bytes [] :entries {} :offset 0}
-                                     string-entries)
-                             {:bytes [] :entries {} :offset 0})
-          string-data-segment (when (seq string-entries)
-                                (let [all-bytes (:bytes string-data-info)]
-                                  (str "(data $__str_data \""
-                                       (apply str (map (fn [b] (format "\\%02x" (bit-and b 0xff))) all-bytes))
-                                       "\")")))
-          string-init-fns (for [[s id] string-entries]
-                            (let [{:keys [offset length]} (get-in string-data-info [:entries id])]
-                              (str "(func $__init_str_" id " (result anyref)\n"
-                                   "    (struct.new $String (i32.const 3) (i32.const " id ")\n"
-                                   "      (array.new_data $CharArray $__str_data (i32.const " offset ") (i32.const " length "))))")))
-          string-init-code (for [[_ id] string-entries]
-                             (str "(global.set $__str_" id " (call $__init_str_" id "))"))
-        ;; Generate keyword name table init
-        ;; We need the keywords from the analyzer to build name strings
-          kw-entries (sort-by val *keywords*)
-          kw-count (count kw-entries)
-          kw-data-info (if (pos? kw-count)
-                         (reduce (fn [acc [kw id]]
-                                   (let [kw-name (if (namespace kw)
-                                                   (str (namespace kw) "/" (name kw))
-                                                   (name kw))
-                                         bytes (.getBytes ^String kw-name "UTF-8")
-                                         offset (:offset acc)]
-                                     (-> acc
-                                         (update :bytes (fn [b] (into (or b []) bytes)))
-                                         (assoc-in [:entries id] {:offset offset :length (count bytes)})
-                                         (assoc :offset (+ offset (count bytes))))))
-                                 {:bytes [] :entries {} :offset 0}
-                                 kw-entries)
-                         {:bytes [] :entries {} :offset 0})
-          kw-data-segment (when (pos? kw-count)
-                            (let [all-bytes (:bytes kw-data-info)]
-                              (str "(data $__kw_data \""
-                                   (apply str (map (fn [b] (format "\\%02x" (bit-and b 0xff))) all-bytes))
-                                   "\")")))
-          kw-name-init-code (when (pos? kw-count)
-                              (let [kw-init-lines
-                                    (for [[kw id] kw-entries]
-                                      (let [{:keys [offset length]} (get-in kw-data-info [:entries id])]
-                                        (str "(func $__init_kw_name_" id " (result anyref)\n"
-                                             "    (struct.new $String (i32.const 3) (i32.const " -1 ")\n"
-                                             "      (array.new_data $CharArray $__kw_data (i32.const " offset ") (i32.const " length "))))")))]
-                                {:funcs kw-init-lines
-                                 :init-code (concat
-                                             [(str "(global.set $__kw_names (call $array_new (i32.const " kw-count ")))")
-                                              (str "(global.set $__kw_next_id (i32.const " kw-count "))")]
-                                             (for [[_ id] kw-entries]
-                                               (str "(call $array_set (global.get $__kw_names) (i32.const " id ") (call $__init_kw_name_" id "))")))}))
-        ;; Generate symbol globals and init (like strings)
-          sym-entries (sort-by val *symbols*)
-          sym-count (count sym-entries)
-          sym-globals (for [[_ id] sym-entries]
-                        (str "(global $__sym_" id " (mut anyref) (ref.null none))"))
-        ;; Build data segment for symbol name/ns strings
-          sym-data-info (reduce (fn [acc [sym id]]
-                                  (let [sym-name (name sym)
-                                        sym-ns (namespace sym)
-                                        ;; Store name bytes
-                                        name-bytes (.getBytes ^String sym-name "UTF-8")
-                                        name-offset (:offset acc)
-                                        acc (-> acc
-                                                (update :bytes (fn [b] (into (or b []) name-bytes)))
-                                                (assoc-in [:entries id :name-offset] name-offset)
-                                                (assoc-in [:entries id :name-length] (count name-bytes))
-                                                (assoc :offset (+ name-offset (count name-bytes))))]
-                                    (if sym-ns
-                                      (let [ns-bytes (.getBytes ^String sym-ns "UTF-8")
-                                            ns-offset (:offset acc)]
-                                        (-> acc
-                                            (update :bytes (fn [b] (into (or b []) ns-bytes)))
-                                            (assoc-in [:entries id :ns-offset] ns-offset)
-                                            (assoc-in [:entries id :ns-length] (count ns-bytes))
-                                            (assoc :offset (+ ns-offset (count ns-bytes)))))
-                                      acc)))
-                                {:bytes [] :entries {} :offset 0}
-                                sym-entries)
-          sym-data-segment (when (pos? sym-count)
-                             (let [all-bytes (:bytes sym-data-info)]
-                               (str "(data $__sym_data \""
-                                    (apply str (map (fn [b] (format "\\%02x" (bit-and b 0xff))) all-bytes))
-                                    "\")")))
-          sym-init-code (when (pos? sym-count)
-                          (let [sym-init-fns
-                                (for [[sym id] sym-entries]
-                                  (let [{:keys [name-offset name-length ns-offset ns-length]} (get-in sym-data-info [:entries id])
-                                        has-ns (some? ns-offset)]
-                                    (str "(func $__init_sym_" id " (result anyref)\n"
-                                         "    (struct.new $Symbol (i32.const 4) (i32.const " id ")\n"
-                                         "      (struct.new $String (i32.const 3) (i32.const -1)\n"
-                                         "        (array.new_data $CharArray $__sym_data (i32.const " name-offset ") (i32.const " name-length ")))\n"
-                                         "      " (if has-ns
-                                                    (str "(struct.new $String (i32.const 3) (i32.const -1)\n"
-                                                         "        (array.new_data $CharArray $__sym_data (i32.const " ns-offset ") (i32.const " ns-length ")))")
-                                                    "(ref.null none)")
-                                         "))")))]
-                            {:funcs sym-init-fns
-                             :init-code (for [[_ id] sym-entries]
-                                          (str "(global.set $__sym_" id " (call $__init_sym_" id "))"))}))
-        ;; Extract dispatch table info from protocol dispatch maps
-          proto-dispatch-infos (filter some? proto-dispatch-funcs)
-          dispatch-table-globals (when (seq proto-dispatch-infos)
-                                   (map :table-global-decl proto-dispatch-infos))
-          all-globals (concat *globals-emit* builtin-globals fn-globals proto-globals
-                              dispatch-table-globals string-globals sym-globals)
-          globals-section (str-join "\n  " all-globals)
-        ;; Add builtin and fn wrapper functions
-          builtin-funcs (when (seq builtin-wrappers)
-                          (map :func-def builtin-wrappers))
-          fn-funcs (when (seq fn-wrappers)
-                     (map :func-def fn-wrappers))
-        ;; Print helper (WASI-based) - always available
-          print-fns [(str
-                       ";; Print a woj String to stdout via WASI fd_write
-  ;; Memory layout: [0..3]=nwritten [4..7]=iov_base [8..11]=iov_len [12..]=data
-  (func $__repl_print_str (param $str anyref)
-    (local $chars (ref null $CharArray))
-    (local $len i32)
-    (local $i i32)
-    (if (ref.is_null (local.get $str)) (then (return)))
-    (if (i32.eqz (ref.test (ref $String) (local.get $str))) (then (return)))
-    (local.set $chars (struct.get $String $data (ref.cast (ref $String) (local.get $str))))
-    (local.set $len (array.len (local.get $chars)))
-    (if (i32.eqz (local.get $len)) (then (return)))
-    (local.set $i (i32.const 0))
-    (block $done
-      (loop $loop
-        (br_if $done (i32.ge_s (local.get $i) (local.get $len)))
-        (i32.store8 (i32.add (i32.const 12) (local.get $i))
-                    (array.get_u $CharArray (local.get $chars) (local.get $i)))
-        (local.set $i (i32.add (local.get $i) (i32.const 1)))
-        (br $loop)))
-    (i32.store (i32.const 4) (i32.const 12))
-    (i32.store (i32.const 8) (local.get $len))
-    (drop (call $fd_write (i32.const 1) (i32.const 4) (i32.const 1) (i32.const 0))))")
-                     ";; print!: convert any value to string via str1, write to stdout, return nil
-  (func $print_BANG_ (param $val anyref) (result anyref)
-    (call $__repl_print_str (call $str1 (local.get $val)))
-    (ref.null none))
-  ;; pr!: convert any value to string via pr-str1 (EDN), write to stdout, return nil
-  (func $pr_BANG_ (param $val anyref) (result anyref)
-    (call $__repl_print_str (call $pr_str1 (local.get $val)))
-    (ref.null none))
-  ;; print-str!: write a pre-built String to stdout, return nil
-  (func $print_str_BANG_ (param $str anyref) (result anyref)
-    (call $__repl_print_str (local.get $str))
-    (ref.null none))"]
-          all-functions (concat *functions* builtin-funcs fn-funcs
-                                (map :func-def proto-dispatch-infos)
-                                (filter some? proto-satisfies-funcs)
-                                (filter some? core-proto-stubs)
-                                string-init-fns
-                                (:funcs kw-name-init-code)
-                                (:funcs sym-init-code)
-                                print-fns)
-          functions-section (str-join "\n\n  " all-functions)
-        ;; Elem declarations for closure functions (needed for ref.func)
-        ;; Include builtin and fn wrapper functions, and protocol impl functions
-          builtin-func-names (when (seq builtin-wrappers)
-                               (map :func-name builtin-wrappers))
-          fn-func-names (when (seq fn-wrappers)
-                          (map :func-name fn-wrappers))
-          proto-impl-func-names (when (seq proto-impl-closures)
-                                  (map :func-name proto-impl-closures))
-          all-closure-funcs (concat *closure-funcs* builtin-func-names fn-func-names proto-impl-func-names)
-          elem-section (if (seq all-closure-funcs)
-                         (str "\n\n  ;; Closure function declarations\n  (elem declare func "
-                              (str-join " " all-closure-funcs) ")")
-                         "")
-        ;; Generate initialization code for builtin wrappers
-          builtin-init-code (when (seq builtin-wrappers)
-                              (for [{:keys [global-name func-name closure-type]} builtin-wrappers]
-                                (str "(global.set " global-name " (struct.new " closure-type " (i32.const 11) (ref.func " func-name ") (call $array_new (i32.const 0))))")))
-        ;; Generate initialization code for fn wrappers
-          fn-init-code (when (seq fn-wrappers)
-                         (for [{:keys [global-name func-name closure-type is-multi]} fn-wrappers]
-                           (if is-multi
-                           ;; MultiClosure: env first, dispatch second
-                             (str "(global.set " global-name " (struct.new " closure-type " (i32.const 11) (call $array_new (i32.const 0)) (ref.func " func-name ")))")
-                           ;; Regular ClosureN: func first, env second
-                             (str "(global.set " global-name " (struct.new " closure-type " (i32.const 11) (ref.func " func-name ") (call $array_new (i32.const 0))))"))))
-        ;; Generate initialization code for protocol impl closures
-          proto-init-code (when (seq proto-impl-closures)
-                            (map :init-code proto-impl-closures))
-        ;; Generate dispatch table init code (must come after proto-init-code since tables reference closures)
-          dispatch-table-init-code (when (seq proto-dispatch-infos)
-                                     (mapcat :table-init-code proto-dispatch-infos))
-        ;; Add drop after each init expression since they return values but $start doesn't
-          init-with-drops (map (fn [code] (str code "\n    drop")) init-code)
-        ;; Combine builtin init, fn init, proto init, dispatch table init, string init, kw name init (no drops needed) with user init
-          all-init (concat
-                    builtin-init-code fn-init-code proto-init-code
-                    dispatch-table-init-code
-                    *lifted-fn-inits*
-                    string-init-code
-                    (:init-code kw-name-init-code)
-                    (:init-code sym-init-code)
-                    init-with-drops)
-          ;; Collect locals from top-level user code (let bindings, loops, etc.)
-          start-locals (distinct (mapcat collect-locals ast-forms))
-          start-fn (if (seq all-init)
-                     (str "\n\n  ;; Initialization\n  (func $start"
-                          (if (seq start-locals) (str "\n    " (str-join "\n    " start-locals)) "")
-                          "\n    " (str-join "\n    " all-init) ")\n  (start $start)")
-                     "")
-        ;; Data segments for string/keyword/symbol byte arrays
-          data-segments (let [segs (filter some? [string-data-segment kw-data-segment sym-data-segment])]
-                          (when (seq segs)
-                            (str "\n\n  ;; Data segments for constant byte arrays\n  "
-                                 (str-join "\n  " segs))))]
-          
-      (str prelude
-           (if (seq all-globals) (str "\n\n  ;; Globals\n  " globals-section) "")
-           (or data-segments "")
-           elem-section
-           (if (seq all-functions) (str "\n\n  ;; User functions\n  " functions-section) "")
-           start-fn
-           "\n)"))))

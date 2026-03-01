@@ -4,7 +4,26 @@
 ;; clojure.set - Set operations library
 ;; ============================================
 
-;; union and intersection are already in core, re-export via wrappers
+;; union, intersection, difference are in core — re-export them
+;; so (clojure.set/union ...) works
+
+(defn union
+  ([] (hash-set))
+  ([s1] s1)
+  ([s1 s2] (into (or s1 (hash-set)) s2))
+  ([s1 s2 & sets] (reduce union (union s1 s2) sets)))
+
+(defn intersection
+  ([s1] s1)
+  ([s1 s2] (reduce (fn [result item]
+                     (if (contains? s2 item) result (disj result item)))
+                   s1 s1))
+  ([s1 s2 & sets] (reduce intersection (intersection s1 s2) sets)))
+
+(defn difference
+  ([s1] s1)
+  ([s1 s2] (reduce disj s1 s2))
+  ([s1 s2 & sets] (reduce difference (difference s1 s2) sets)))
 
 (defn select [pred xset]
   (reduce (fn [s x]

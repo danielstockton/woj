@@ -9,4 +9,6 @@
           :main-opts ["-m" "woj.nrepl"]}
   :bench {:extra-deps {criterium/criterium {:mvn/version "0.4.6"}}
           :extra-paths ["benchmarks/clj"]
-          :main-opts ["-m" "bench"]}}}
+          :main-opts ["-m" "bench"]}
+  :snapshot {:extra-paths ["."]
+             :main-opts ["-m" "bootstrap.build-snapshot"]}}}

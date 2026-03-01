@@ -279,7 +279,9 @@
 
 (defn map
   ([f] (fn [rf] (fn [result input] (rf result (f input)))))
-  ([f coll] (map-seq f coll)))
+  ([f coll] (map-seq f coll))
+  ([f c1 c2] (lazy-seq (let [s1 (seq c1) s2 (seq c2)] (when (and s1 s2) (cons (f (first s1) (first s2)) (map f (rest s1) (rest s2)))))))
+  ([f c1 c2 c3] (lazy-seq (let [s1 (seq c1) s2 (seq c2) s3 (seq c3)] (when (and s1 s2 s3) (cons (f (first s1) (first s2) (first s3)) (map f (rest s1) (rest s2) (rest s3))))))))
 
 (defn filter-seq [pred coll]
   (lazy-seq
@@ -332,14 +334,14 @@
     (nth-list (rest coll) (dec n))))
 
 (defn length [coll]
-  (if (nil? coll)
-    0
-    (inc (length (rest coll)))))
+  (if (seq coll)
+    (inc (length (rest coll)))
+    0))
 
 (defn concat-list [a b]
-  (if (nil? a)
-    b
-    (cons (first a) (concat-list (rest a) b))))
+  (if (seq a)
+    (cons (first a) (concat-list (rest a) b))
+    b))
 
 (defn last [coll]
   (if (seq (rest coll))
@@ -404,11 +406,12 @@
 
 ;; take-while: take elements while predicate is true
 (defn take-while-seq [pred coll]
-  (if (nil? coll)
-    nil
-    (if (pred (first coll))
-      (cons (first coll) (take-while-seq pred (rest coll)))
-      nil)))
+  (let [s (seq coll)]
+    (if (nil? s)
+      nil
+      (if (pred (first s))
+        (cons (first s) (take-while-seq pred (rest s)))
+        nil))))
 
 (defn take-while
   ([pred] (fn [rf]
@@ -420,11 +423,12 @@
 
 ;; drop-while: drop elements while predicate is true
 (defn drop-while-seq [pred coll]
-  (if (nil? coll)
-    nil
-    (if (pred (first coll))
-      (drop-while-seq pred (rest coll))
-      coll)))
+  (let [s (seq coll)]
+    (if (nil? s)
+      nil
+      (if (pred (first s))
+        (drop-while-seq pred (rest s))
+        s))))
 
 (defn drop-while
   ([pred] (fn [rf]
@@ -446,11 +450,12 @@
 
 ;; interpose: insert separator between elements
 (defn interpose-seq [sep coll]
-  (if (nil? coll)
-    nil
-    (if (seq (rest coll))
-      (cons (first coll) (cons sep (interpose-seq sep (rest coll))))
-      (list (first coll)))))
+  (let [s (seq coll)]
+    (if (nil? s)
+      nil
+      (if (seq (rest s))
+        (cons (first s) (cons sep (interpose-seq sep (rest s))))
+        (list (first s))))))
 
 (defn interpose
   ([sep] (fn [rf]
@@ -464,26 +469,29 @@
 
 ;; interleave: interleave two sequences
 (defn interleave [c1 c2]
-  (if (or (nil? c1) (nil? c2))
-    nil
-    (cons (first c1) (cons (first c2) (interleave (rest c1) (rest c2))))))
+  (let [s1 (seq c1) s2 (seq c2)]
+    (if (or (nil? s1) (nil? s2))
+      nil
+      (cons (first s1) (cons (first s2) (interleave (rest s1) (rest s2)))))))
 
 ;; some: returns first truthy value of (pred x) for x in coll
 (defn some [pred coll]
-  (if (nil? coll)
-    nil
-    (let [result (pred (first coll))]
-      (if result
-        result
-        (some pred (seq (rest coll)))))))
+  (let [s (seq coll)]
+    (if (nil? s)
+      nil
+      (let [result (pred (first s))]
+        (if result
+          result
+          (some pred (rest s)))))))
 
 ;; every?: returns true if (pred x) is truthy for all x in coll
 (defn every? [pred coll]
-  (if (nil? coll)
-    true
-    (if (pred (first coll))
-      (every? pred (seq (rest coll)))
-      false)))
+  (let [s (seq coll)]
+    (if (nil? s)
+      true
+      (if (pred (first s))
+        (every? pred (rest s))
+        false))))
 
 ;; not-every?: returns true if (pred x) is falsy for some x in coll
 (defn not-every? [pred coll]
@@ -501,30 +509,31 @@
              (if (nil? v) result (rf result v))))))
   ([f coll]
    (let [keep-seq (fn keep-seq [f coll]
-                    (if (nil? coll)
-                      nil
-                      (let [result (f (first coll))]
-                        (if (nil? result)
-                          (keep-seq f (rest coll))
-                          (cons result (keep-seq f (rest coll)))))))]
+                    (let [s (seq coll)]
+                      (if (nil? s)
+                        nil
+                        (let [result (f (first s))]
+                          (if (nil? result)
+                            (keep-seq f (rest s))
+                            (cons result (keep-seq f (rest s))))))))]
      (keep-seq f coll))))
 
 ;; map-indexed: like map but f takes index and element
 (defn map-indexed [f coll]
-  (loop [idx 0 curr coll acc nil]
+  (loop [idx 0 curr (seq coll) acc nil]
     (if (nil? curr)
       (reverse acc)
-      (recur (inc idx) (rest curr) (cons (f idx (first curr)) acc)))))
+      (recur (inc idx) (next curr) (cons (f idx (first curr)) acc)))))
 
 ;; keep-indexed: like keep but f takes index and element
 (defn keep-indexed [f coll]
-  (loop [idx 0 curr coll acc nil]
+  (loop [idx 0 curr (seq coll) acc nil]
     (if (nil? curr)
       (reverse acc)
       (let [result (f idx (first curr))]
         (if (nil? result)
-          (recur (inc idx) (rest curr) acc)
-          (recur (inc idx) (rest curr) (cons result acc)))))))
+          (recur (inc idx) (next curr) acc)
+          (recur (inc idx) (next curr) (cons result acc)))))))
 
 ;; distinct: remove duplicates (O(n^2) simple version)
 (defn distinct
@@ -540,8 +549,8 @@
      (if curr
        (let [x (first curr)]
          (if (some (fn [y] (= x y)) seen)
-          (recur seen (seq (rest curr)) acc)
-          (recur (cons x seen) (seq (rest curr)) (cons x acc))))
+          (recur seen (next curr) acc)
+          (recur (cons x seen) (next curr) (cons x acc))))
        (reverse acc)))))
 
 ;; partition: partition collection into groups of n
@@ -595,24 +604,27 @@
 
 ;; flatten: flatten nested lists (simple version for one level)
 (defn flatten-one [coll]
-  (if (nil? coll)
-    nil
-    (let [x (first coll)]
-      (if (cons? x)
-        (concat x (flatten-one (rest coll)))
-        (cons x (flatten-one (rest coll)))))))
+  (let [s (seq coll)]
+    (if (nil? s)
+      nil
+      (let [x (first s)]
+        (if (cons? x)
+          (concat x (flatten-one (rest s)))
+          (cons x (flatten-one (rest s))))))))
 
 ;; mapcat: map then concat results
 (defn mapcat-seq [f coll]
-  (if (nil? coll)
-    nil
-    (concat (f (first coll)) (mapcat-seq f (rest coll)))))
+  (let [s (seq coll)]
+    (if (nil? s)
+      nil
+      (concat (f (first s)) (mapcat-seq f (rest s))))))
 
 (defn mapcat
   ([f] (fn [rf]
          (fn [result input]
            (reduce rf result (f input)))))
-  ([f coll] (mapcat-seq f coll)))
+  ([f coll] (mapcat-seq f coll))
+  ([f c1 c2] (mapcat-seq (fn [[a b]] (f a b)) (map (fn [a b] [a b]) c1 c2))))
 
 ;; cat: transducer that concatenates nested collections into the reduction
 (defn cat [rf]
@@ -1006,7 +1018,7 @@
            (if (neg? (cmp x (first left)))
              (concat (reverse (cons x acc)) left)
              (recur (cons (first left) acc) (rest left) x))))
-       (rest remaining)))))
+       (next remaining)))))
 
 (defn sort
   ([coll] (sort-with-cmp compare coll))
@@ -1159,26 +1171,26 @@
 
 (defn mm-find-isa [methods dv h prefer]
   (let [ks (keys methods)]
-    (loop [remaining ks best nil best-key nil]
+    (loop [remaining (seq ks) best nil best-key nil]
       (if (nil? remaining)
         best
         (let [k (first remaining)]
           (if (and (not (= k :default)) (isa? h dv k))
             (if (nil? best)
-              (recur (rest remaining) (get methods k) k)
+              (recur (next remaining) (get methods k) k)
               ;; Ambiguity: check preferences
               (if (mm-is-preferred prefer k best-key)
-                (recur (rest remaining) (get methods k) k)
+                (recur (next remaining) (get methods k) k)
                 (if (mm-is-preferred prefer best-key k)
-                  (recur (rest remaining) best best-key)
+                  (recur (next remaining) best best-key)
                   ;; Check if one is more specific (k isa? best-key or vice versa)
                   (if (isa? h k best-key)
-                    (recur (rest remaining) (get methods k) k)
+                    (recur (next remaining) (get methods k) k)
                     (if (isa? h best-key k)
-                      (recur (rest remaining) best best-key)
+                      (recur (next remaining) best best-key)
                       ;; True ambiguity - just pick one (could throw)
-                      (recur (rest remaining) best best-key))))))
-            (recur (rest remaining) best best-key)))))))
+                      (recur (next remaining) best best-key))))))
+            (recur (next remaining) best best-key)))))))
 
 ;; take-last: take last n items
 (defn take-last [n coll]
@@ -1190,8 +1202,16 @@
   ([coll] (drop-last 1 coll))
   ([n coll] (take (max 0 (- (count (seq coll)) n)) coll)))
 
-;; shuffle: stub (just returns the input - no randomness)
-(defn shuffle [coll] (vec coll))
+;; shuffle: Fisher-Yates shuffle
+(defn shuffle [coll]
+  (let [n (count coll)]
+    (loop [i (dec n) v (vec coll)]
+      (if (<= i 0)
+        v
+        (let [j (to-int (* (Math/random) (to-float (inc i))))
+              vi (nth v i)
+              vj (nth v j)]
+          (recur (dec i) (assoc (assoc v i vj) j vi)))))))
 
 ;; flatten: recursively flatten nested sequences
 (defn flatten [coll]
@@ -1217,8 +1237,8 @@
        (reverse result)
        (let [x (first s)]
          (if (= x prev)
-           (recur result prev (rest s))
-           (recur (cons x result) x (rest s))))))))
+           (recur result prev (next s))
+           (recur (cons x result) x (next s))))))))
 
 ;; memoize: cache function results using an atom map
 ;; Caches single-argument function results
@@ -1251,8 +1271,10 @@
     (into [] coll)))
 
 ;; mapv: eager map returning a vector
-(defn mapv [f coll]
-  (into [] (map f coll)))
+(defn mapv
+  ([f coll] (into [] (map f coll)))
+  ([f c1 c2] (into [] (map f c1 c2)))
+  ([f c1 c2 c3] (into [] (map f c1 c2 c3))))
 
 ;; filterv: eager filter returning a vector
 (defn filterv [pred coll]
@@ -1307,7 +1329,14 @@
 (defn str
   ([] "")
   ([x] (str1-or-pr x))
-  ([x & more] (reduce (fn [acc v] (str-concat acc (str1-or-pr v))) (str1-or-pr x) more)))
+  ([x & more]
+   (let [buf (string-buffer)]
+     (sb-append! buf (str1-or-pr x))
+     (loop [s (seq more)]
+       (if (nil? s)
+         (sb->string buf)
+         (do (sb-append! buf (str1-or-pr (first s)))
+             (recur (next s))))))))
 
 ;; symbol: create symbol from string/keyword/symbol (builtin)
 ;; symbol and symbol2 are builtins - no need for function definitions
@@ -1816,8 +1845,7 @@
 (defn parse-long [s] 0)
 (defn parse-uuid [s] nil)
 
-;; rand-int: stub (returns 0 - no randomness in wasm)
-(defn rand-int [n] 0)
+(defn rand-int [n] (to-int (* (Math/random) (to-float n))))
 
 ;; pos-int?/neg-int?/nat-int?: integer predicates
 (defn pos-int? [x] (and (integer? x) (pos? x)))
@@ -1831,10 +1859,12 @@
     (xf-complete xf result)))
 
 ;; sequence: eagerly apply transducer, return seq
-(defn sequence [xform coll]
-  (let [xf (xform conj)
-        result (reduce xf [] coll)]
-    (seq (xf-complete xf result))))
+(defn sequence
+  ([coll] (seq coll))
+  ([xform coll]
+   (let [xf (xform conj)
+         result (reduce xf [] coll)]
+     (seq (xf-complete xf result)))))
 
 ;; eduction: like sequence but re-evaluates each time (returns reducible)
 (defn eduction [xform coll]
@@ -1931,11 +1961,13 @@
      ([x y z w] (f (if (nil? x) d1 x) (if (nil? y) d2 y) (if (nil? z) d3 z) w)))))
 
 
-;; random-sample/rand-nth: randomness stubs
+;; random-sample/rand-nth
 (defn random-sample
-  ([prob] (filter (fn [_] (pos? prob))))
-  ([prob coll] (filter (fn [_] (pos? prob)) coll)))
-(defn rand-nth [coll] (first coll))
+  ([prob] (filter (fn [_] (< (Math/random) prob))))
+  ([prob coll] (filter (fn [_] (< (Math/random) prob)) coll)))
+(defn rand-nth [coll]
+  (let [v (vec coll)]
+    (nth v (rand-int (count v)))))
 
 ;; full-width-checker-neg: test helper
 (def full-width-checker-neg nil)
@@ -2047,10 +2079,9 @@
 ;; agent-error: stub
 (defn agent-error [a] nil)
 
-;; rand/rand-int: basic stubs
 (defn rand
-  ([] 0.5)
-  ([n] (* 0.5 (to-float n))))
+  ([] (Math/random))
+  ([n] (* (Math/random) (to-float n))))
 
 ;; random-uuid: stub
 (defn random-uuid [] nil)
@@ -2273,21 +2304,21 @@
 ;; Constructors
 (defn sorted-map-by [cmp & keyvals]
   (loop [sm (->SortedMap cmp [])
-         kvs keyvals]
+         kvs (seq keyvals)]
     (if (nil? kvs)
       sm
       (let [k (first kvs)
-            v (first (rest kvs))]
-        (recur (sorted-map-assoc sm k v) (rest (rest kvs)))))))
+            v (second kvs)]
+        (recur (sorted-map-assoc sm k v) (next (next kvs)))))))
 
 (defn sorted-map [& keyvals]
   (loop [sm (->SortedMap compare [])
-         kvs keyvals]
+         kvs (seq keyvals)]
     (if (nil? kvs)
       sm
       (let [k (first kvs)
-            v (first (rest kvs))]
-        (recur (sorted-map-assoc sm k v) (rest (rest kvs)))))))
+            v (second kvs)]
+        (recur (sorted-map-assoc sm k v) (next (next kvs)))))))
 
 (defn sorted-set-by [cmp & vals]
   (reduce sorted-set-conj (->SortedSet cmp []) vals))
@@ -2320,3 +2351,117 @@
    (reverse (subseq sc test key)))
   ([sc start-test start-key end-test end-key]
    (reverse (subseq sc start-test start-key end-test end-key))))
+
+(defn vec-index-of
+  "Returns the index of item in coll, or -1 if not found."
+  [coll item]
+  (let [n (count coll)]
+    (loop [i 0]
+      (if (< i n)
+        (if (= (nth coll i) item)
+          i
+          (recur (+ i 1)))
+        -1))))
+
+(defn- digit-value
+  "Returns the numeric value of a character string for the given radix, or -1 if invalid."
+  [c radix]
+  (let [cp (codepoint-at c 0)
+        v (cond
+            (and (>= cp 48) (<= cp 57)) (- cp 48)   ;; 0-9
+            (and (>= cp 65) (<= cp 90)) (+ 10 (- cp 65)) ;; A-Z
+            (and (>= cp 97) (<= cp 122)) (+ 10 (- cp 97)) ;; a-z
+            :else -1)]
+    (if (and (>= v 0) (< v radix)) v -1)))
+
+(defn parse-int
+  "Parse a string to an integer. With radix, supports any base 2-36.
+   Returns nil if the string is not a valid integer."
+  ([s] (parse-int s 10))
+  ([s radix]
+   (let [len (count s)]
+     (when (> len 0)
+       (let [neg (= (nth s 0) "-")
+             start (if neg 1 0)
+             start (if (and (< start len) (= (nth s start) "+")) (+ start 1) start)
+             ;; Handle 0x, 0X prefix for hex
+             has-hex-prefix (if (and (= radix 16) (>= (- len start) 2))
+                              (if (= (nth s start) "0")
+                                (let [c1 (nth s (+ start 1))]
+                                  (or (= c1 "x") (= c1 "X")))
+                                false)
+                              false)
+             start (if has-hex-prefix (+ start 2) start)]
+         (when (< start len)
+           (loop [i start acc 0]
+             (if (< i len)
+               (let [d (digit-value (nth s i) radix)]
+                 (when (>= d 0)
+                   (if (> (* (to-float acc) (to-float radix)) 1073741823.0) nil (recur (+ i 1) (+ (* acc radix) d)))))
+               (if neg (- 0 acc) acc)))))))))
+
+(defn- parse-exponent
+  "Parse an exponent suffix starting at position j in string s of length len.
+   Returns the exponent multiplied into base, or base if no exponent."
+  [s len j base neg]
+  (if (< j len)
+    (let [c (nth s j)]
+      (if (or (= c "e") (= c "E"))
+        (let [j2 (+ j 1)
+              e-neg (if (< j2 len) (= (nth s j2) "-") false)
+              e-plus (if (< j2 len) (= (nth s j2) "+") false)
+              j3 (if (or e-neg e-plus) (+ j2 1) j2)]
+          (loop [k j3 exp 0]
+            (if (< k len)
+              (let [d (digit-value (nth s k) 10)]
+                (when (>= d 0)
+                  (recur (+ k 1) (+ (* exp 10) d))))
+              (let [exp-val (if e-neg (- 0 exp) exp)
+                    abs-exp (if (< exp-val 0) (- 0 exp-val) exp-val)
+                    ;; Apply exponent by repeated multiply/divide to avoid overflow
+                    ;; (e.g. 10^324 overflows f64, but 4.9 * 10^-324 = 5e-324 is valid)
+                    result (loop [p 0 r base]
+                             (if (< p abs-exp)
+                               (recur (+ p 1) (if (< exp-val 0) (/ r 10.0) (* r 10.0)))
+                               r))]
+                (if neg (- 0.0 result) result)))))
+        (if neg (- 0.0 base) base)))
+    (if neg (- 0.0 base) base)))
+
+(defn parse-float
+  "Parse a string to a float. Returns nil if the string is not a valid number."
+  [s]
+  (let [len (count s)]
+    (when (> len 0)
+      (let [neg (= (nth s 0) "-")
+            start (if neg 1 0)
+            start (if (and (< start len) (= (nth s start) "+")) (+ start 1) start)]
+        (when (< start len)
+          ;; Parse integer part
+          (loop [i start int-acc 0 has-digit false]
+            (if (< i len)
+              (let [c (nth s i)]
+                (if (or (= c ".") (or (= c "e") (= c "E")))
+                  ;; Done with integer part
+                  (if (= c ".")
+                    ;; Parse fractional part
+                    (loop [j (+ i 1) frac 0.0 scale 0.1]
+                      (if (< j len)
+                        (let [fc (nth s j)]
+                          (if (or (= fc "e") (= fc "E"))
+                            (parse-exponent s len j (+ (double int-acc) frac) neg)
+                            (let [d (digit-value fc 10)]
+                              (when (>= d 0)
+                                (recur (+ j 1) (+ frac (* (double d) scale)) (* scale 0.1))))))
+                        (let [result (+ (double int-acc) frac)]
+                          (if neg (- 0.0 result) result))))
+                    ;; Exponent on integer
+                    (parse-exponent s len i (double int-acc) neg))
+                  ;; Still parsing integer digits
+                  (let [d (digit-value c 10)]
+                    (when (>= d 0)
+                      (if (> (* (to-float int-acc) 10.0) 1073741823.0) (recur (+ i 1) (+ (* (to-float int-acc) 10.0) (to-float d)) true) (recur (+ i 1) (+ (* int-acc 10) d) true))))))
+              ;; End of string, no dot or exponent — return as float
+              (when has-digit
+                (if neg (- 0.0 (double int-acc)) (double int-acc))))))))))
+

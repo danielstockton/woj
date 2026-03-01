@@ -1,0 +1,4 @@
+
+
+  ;; Initialization
+  (func $start
