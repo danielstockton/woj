@@ -1,6 +1,7 @@
 (ns woj.main
   (:require [woj.analyzer :as analyzer]
             [woj.emitter :as emitter]
+            [woj.wat :as wat]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.set :as set]
@@ -345,8 +346,8 @@
       (= (first args) "--emit")
       (if (next args)
         (let [format (second args)]
-          (when-not (#{"wat" "wasm"} format)
-            (throw (ex-info (str "--emit must be 'wat' or 'wasm', got: " format) {})))
+          (when-not (#{"wat" "wasm" "binary"} format)
+            (throw (ex-info (str "--emit must be 'wat', 'wasm', or 'binary', got: " format) {})))
           (recur (drop 2 args) paths input format))
         (throw (ex-info "--emit requires an argument (wat or wasm)" {})))
 
@@ -408,12 +409,16 @@
       (println "")
       (println "Options:")
       (println "  --path <dir>      Add directory to namespace search path (repeatable)")
-      (println "  --emit wat|wasm   Output format (default: wat)"))
+      (println "  --emit wat|wasm|binary  Output format (default: wat)")
+      (println "                         binary: direct WASM encoding (no wasm-tools needed)"))
     (let [{:keys [paths input-file emit]} (parse-args args)]
       (if input-file
         (let [wat (compile-file input-file paths)]
           (case emit
             "wat" (println wat)
-            "wasm" (wat->wasm wat)))
+            "wasm" (wat->wasm wat)
+            "binary" (let [wasm-bytes (wat/wat->wasm-bytes wat)]
+                       (.write System/out ^bytes wasm-bytes)
+                       (.flush System/out))))
         (binding [*out* *err*]
           (println "Error: no input file specified"))))))

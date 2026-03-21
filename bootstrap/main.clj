@@ -724,31 +724,35 @@
 
 (defn- parse-args
   "Parse CLI arguments using index-based access to avoid VectorSeq bug in WASM.
-   Returns {:paths [...] :input-files [...] :batch? bool}."
+   Returns {:paths [...] :input-files [...] :batch? bool :repl? bool}."
   [args]
   (let [argc (count args)]
     (loop [i 0
            paths []
            batch? false
+           repl? false
            files []]
       (if (>= i argc)
-        {:paths paths :input-files files :batch? batch?
+        {:paths paths :input-files files :batch? batch? :repl? repl?
          :input-file (first files)}
         (let [arg (nth args i)]
           (cond
             (= arg "--path")
             (if (< (inc i) argc)
-              (recur (+ i 2) (conj paths (nth args (inc i))) batch? files)
+              (recur (+ i 2) (conj paths (nth args (inc i))) batch? repl? files)
               (throw (ex-info "--path requires an argument" {})))
 
             (= arg "--batch")
-            (recur (inc i) paths true files)
+            (recur (inc i) paths true repl? files)
+
+            (= arg "--repl")
+            (recur (inc i) paths batch? true files)
 
             (= arg "--")
-            (recur (inc i) paths batch? files)
+            (recur (inc i) paths batch? repl? files)
 
             :else
-            (recur (inc i) paths batch? (conj files arg))))))))
+            (recur (inc i) paths batch? repl? (conj files arg))))))))
 
 (defn- parse-wasi-args
   "Parse WASI command-line arguments. First arg is the program name."
@@ -763,12 +767,41 @@
                         (if (>= i argc) acc (recur (inc i) (conj acc (nth args i)))))]
         (parse-args remaining)))))
 
+;; ============================================
+;; REPL mode — persistent instance for browser
+;; ============================================
+
+(def *repl-core-state* nil)
+(def *repl-search-paths* nil)
+
+(defn compile-repl-input
+  "Compile input.clj using pre-initialized core state.
+   Called from JS after _start has prepared the core.
+   Reads source from VFS, outputs WAT to stdout."
+  []
+  (when *repl-core-state*
+    (let [source (io/slurp "input.clj")]
+      (when source
+        (compile-one-batch-fast source "input.clj" *repl-search-paths* *repl-core-state*)))))
+
 ;; Top-level entry point — runs during $start
 (try
   (when-let [parsed (parse-wasi-args)]
     (let [paths (:paths parsed)]
-      (if (:batch? parsed)
+      (cond
+        (:repl? parsed)
+        (let [all-paths (distinct (remove nil? (concat ["lib" "."] paths)))
+              fast-core (prepare-core-fast)]
+          (if fast-core
+            (do (set! *repl-core-state* fast-core)
+                (set! *repl-search-paths* all-paths)
+                (io/eprintln "[repl] Core initialized, ready for compile-repl-input calls"))
+            (io/eprintln "[repl] ERROR: fast path not available")))
+
+        (:batch? parsed)
         (compile-batch (:input-files parsed) paths)
+
+        :else
         (when-let [filename (:input-file parsed)]
           (compile-file filename paths)))))
   (catch e

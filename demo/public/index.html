@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>woj — Clojure to WebAssembly</title>
+  <style>
+    :root {
+      --font-body: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+      --font-mono: 'SF Mono', 'Cascadia Code', Menlo, monospace;
+      --bg: #fff;
+      --text: #2c3038;
+      --text-muted: #6b7280;
+      --accent: #4f6df5;
+      --accent-hover: #3b57d9;
+      --keyword: #7c3aed;
+      --variable: #0891b2;
+      --bracket: #94a3b8;
+      --string: #16a34a;
+      --number: #ea580c;
+      --error-text: #dc2626;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0a0a0a;
+        --text: #e5e5e5;
+        --text-muted: #737373;
+        --accent: #6eaaff;
+        --accent-hover: #9dc4ff;
+        --keyword: #a78bfa;
+        --variable: #22d3ee;
+        --bracket: #64748b;
+        --string: #4ade80;
+        --number: #fb923c;
+        --error-text: #f87171;
+      }
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font-body);
+      font-size: 16px;
+      line-height: 1.6;
+    }
+    .container {
+      max-width: 640px;
+      margin: 0 auto;
+      padding: 3rem 2rem;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+    }
+    @media (max-width: 480px) {
+      .container { padding: 2rem 1.25rem; }
+    }
+    header { margin-bottom: 1.5rem; flex-shrink: 0; }
+    header h1 {
+      font-size: 1.5rem;
+      font-weight: 700;
+      color: var(--text);
+    }
+    header p {
+      color: var(--text-muted);
+      font-size: 0.9rem;
+    }
+
+    /* Output history — scrollable, grows to fill space */
+    #output {
+      flex: 1;
+      overflow-y: auto;
+      font-family: var(--font-mono);
+      font-size: 14px;
+      line-height: 1.6;
+      min-height: 0;
+      padding-bottom: 0.5rem;
+    }
+    #output .input-echo {
+      color: var(--text-muted);
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    #output .result {
+      color: var(--string);
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    #output .error {
+      color: var(--error-text);
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    #output .info {
+      color: var(--text-muted);
+    }
+    #output .timing {
+      color: var(--bracket);
+      font-size: 0.7rem;
+      opacity: 0.6;
+    }
+
+    /* Editor at bottom */
+    #input-area {
+      flex-shrink: 0;
+      border-top: 1px solid var(--bracket);
+      padding-top: 0.5rem;
+    }
+    #prompt-label {
+      color: var(--accent);
+      font-family: var(--font-mono);
+      font-size: 14px;
+      font-weight: 600;
+      margin-bottom: 0.25rem;
+      user-select: none;
+    }
+    #editor-wrap {
+      border: 1px solid var(--bracket);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+
+    /* CodeMirror overrides */
+    .cm-editor {
+      font-family: var(--font-mono) !important;
+      font-size: 14px !important;
+      background: transparent !important;
+    }
+    .cm-editor .cm-content {
+      padding: 0.5rem 0.75rem !important;
+      caret-color: var(--accent);
+    }
+    .cm-editor .cm-line { line-height: 1.6; }
+    .cm-editor.cm-focused { outline: none !important; }
+    .cm-editor .cm-selectionBackground,
+    .cm-editor.cm-focused .cm-selectionBackground {
+      background: color-mix(in srgb, var(--accent) 20%, transparent) !important;
+    }
+    .cm-editor .cm-cursor {
+      border-left-color: var(--accent) !important;
+    }
+    .cm-editor .cm-activeLine { background: transparent !important; }
+    .cm-editor .cm-gutters { display: none !important; }
+    /* Vim cursor */
+    .cm-editor .cm-fat-cursor .cm-cursor,
+    .cm-editor .cm-vimMode .cm-cursorLayer .cm-cursor {
+      background: color-mix(in srgb, var(--accent) 50%, transparent) !important;
+      border: none !important;
+    }
+    /* Syntax highlighting */
+    .cm-editor .ͼb { color: var(--keyword) !important; }
+    .cm-editor .ͼd { color: var(--string) !important; }
+    .cm-editor .ͼe { color: var(--number) !important; }
+    .cm-editor .ͼc { color: var(--variable) !important; }
+    .cm-editor .ͼm { color: var(--bracket) !important; }
+    .cm-editor .ͼ7 { color: var(--text-muted) !important; }
+
+    #status {
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+      margin-top: 0.25rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>woj</h1>
+      <p>Clojure to WebAssembly</p>
+    </header>
+    <div id="output"></div>
+    <div id="input-area">
+      <div id="prompt-label">woj=></div>
+      <div id="editor-wrap"></div>
+      <div id="status">Loading compiler...</div>
+    </div>
+  </div>
+  <script src="/vfs-bundle.js"></script>
+  <script type="module" src="/repl.js"></script>
+</body>
+</html>
