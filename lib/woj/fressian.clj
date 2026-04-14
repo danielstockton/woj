@@ -58,43 +58,44 @@
 (def BUFFER-OFFSET 65536)
 
 ;; ---- Writer ----
+;; Uses deftype for direct field access — same optimization as Reader.
+
+(deftype Writer [pos cache cache-idx])
 
 (defn writer
   "Create a writer positioned at BUFFER-OFFSET."
   []
-  {:pos (atom BUFFER-OFFSET)
-   :cache (atom {})
-   :cache-idx (atom 0)})
+  (->Writer (atom BUFFER-OFFSET) (atom {}) (atom 0)))
 
-(defn- w-pos [w] @(:pos w))
+(defn- w-pos [w] @(.-pos w))
 
 (defn- w-write-byte! [w b]
-  (let [p @(:pos w)]
+  (let [p @(.-pos w)]
     (mem-write-byte! p (bit-and b 0xFF))
-    (reset! (:pos w) (+ p 1))))
+    (reset! (.-pos w) (+ p 1))))
 
 (defn- w-write-raw-i16! [w val]
-  (let [p @(:pos w)]
+  (let [p @(.-pos w)]
     (mem-write-byte! p (bit-and (bit-shift-right val 8) 0xFF))
     (mem-write-byte! (+ p 1) (bit-and val 0xFF))
-    (reset! (:pos w) (+ p 2))))
+    (reset! (.-pos w) (+ p 2))))
 
 (defn- w-write-raw-i24! [w val]
-  (let [p @(:pos w)]
+  (let [p @(.-pos w)]
     (mem-write-byte! p (bit-and (bit-shift-right val 16) 0xFF))
     (mem-write-byte! (+ p 1) (bit-and (bit-shift-right val 8) 0xFF))
     (mem-write-byte! (+ p 2) (bit-and val 0xFF))
-    (reset! (:pos w) (+ p 3))))
+    (reset! (.-pos w) (+ p 3))))
 
 (defn- w-write-raw-i32! [w val]
-  (let [p @(:pos w)]
+  (let [p @(.-pos w)]
     (mem-write-i32-be! p val)
-    (reset! (:pos w) (+ p 4))))
+    (reset! (.-pos w) (+ p 4))))
 
 (defn- w-write-raw-f64! [w val]
-  (let [p @(:pos w)]
+  (let [p @(.-pos w)]
     (mem-write-f64-be! p val)
-    (reset! (:pos w) (+ p 8))))
+    (reset! (.-pos w) (+ p 8))))
 
 ;; ---- Write packed integer ----
 ;; Fressian packs integers using variable-length encoding:
@@ -157,22 +158,22 @@
       ;; Packed length string (0-7 bytes): 1-byte header
       (do
         (w-write-byte! w (+ STRING_PACKED_LENGTH_START byte-len))
-        (let [dst @(:pos w)]
+        (let [dst @(.-pos w)]
           (loop [i 0]
             (when (< i byte-len)
               (mem-write-byte! (+ dst i) (mem-read-byte (+ scratch i)))
               (recur (+ i 1))))
-          (reset! (:pos w) (+ dst byte-len))))
+          (reset! (.-pos w) (+ dst byte-len))))
       ;; Full STRING code + count + bytes
       (do
         (w-write-byte! w STRING)
         (write-count! w byte-len)
-        (let [dst @(:pos w)]
+        (let [dst @(.-pos w)]
           (loop [i 0]
             (when (< i byte-len)
               (mem-write-byte! (+ dst i) (mem-read-byte (+ scratch i)))
               (recur (+ i 1))))
-          (reset! (:pos w) (+ dst byte-len)))))))
+          (reset! (.-pos w) (+ dst byte-len)))))))
 
 ;; ---- Write keyword ----
 
@@ -205,12 +206,12 @@
 ;; ---- Priority cache ----
 
 (defn- cache-lookup [w val]
-  (get @(:cache w) val))
+  (get @(.-cache w) val))
 
 (defn- cache-put! [w val]
-  (let [idx @(:cache-idx w)]
-    (swap! (:cache w) assoc val idx)
-    (swap! (:cache-idx w) inc)
+  (let [idx @(.-cache-idx w)]
+    (swap! (.-cache w) assoc val idx)
+    (swap! (.-cache-idx w) inc)
     idx))
 
 (defn- write-cached! [w val write-fn]
@@ -319,64 +320,66 @@
 (defn buffer-range
   "Returns [offset length] of the data written by writer w."
   [w]
-  [BUFFER-OFFSET (- @(:pos w) BUFFER-OFFSET)])
+  [BUFFER-OFFSET (- @(.-pos w) BUFFER-OFFSET)])
 
 ;; ---- Reader ----
+;; Uses deftype for direct field access — avoids hash_map_get overhead
+;; that causes stack overflow on constrained runtimes (CF Workers).
+
+(deftype Reader [pos end cache])
 
 (defn reader
   "Create a reader over a linear memory region."
   [offset len]
-  {:pos (atom offset)
-   :end (+ offset len)
-   :cache (atom [])})
+  (->Reader (atom offset) (+ offset len) (atom [])))
 
-(defn- r-pos [r] @(:pos r))
+(defn- r-pos [r] @(.-pos r))
 
-(defn- r-read-byte! [r]
-  (let [p @(:pos r)
+(defn r-read-byte! [r]
+  (let [p @(.-pos r)
         b (mem-read-byte p)]
-    (reset! (:pos r) (+ p 1))
+    (reset! (.-pos r) (+ p 1))
     b))
 
 (defn- r-read-raw-i16! [r]
-  (let [p @(:pos r)
+  (let [p @(.-pos r)
         hi (mem-read-byte p)
         lo (mem-read-byte (+ p 1))]
-    (reset! (:pos r) (+ p 2))
+    (reset! (.-pos r) (+ p 2))
     (bit-or (bit-shift-left hi 8) lo)))
 
 (defn- r-read-raw-i24! [r]
-  (let [p @(:pos r)
+  (let [p @(.-pos r)
         b0 (mem-read-byte p)
         b1 (mem-read-byte (+ p 1))
         b2 (mem-read-byte (+ p 2))]
-    (reset! (:pos r) (+ p 3))
+    (reset! (.-pos r) (+ p 3))
     (bit-or (bit-or (bit-shift-left b0 16) (bit-shift-left b1 8)) b2)))
 
 (defn- r-read-raw-i32! [r]
-  (let [p @(:pos r)
+  (let [p @(.-pos r)
         val (mem-read-i32-be p)]
-    (reset! (:pos r) (+ p 4))
+    (reset! (.-pos r) (+ p 4))
     val))
 
 (defn- r-read-raw-f64! [r]
-  (let [p @(:pos r)
+  (let [p @(.-pos r)
         val (mem-read-f64-be p)]
-    (reset! (:pos r) (+ p 8))
+    (reset! (.-pos r) (+ p 8))
     val))
 
 ;; ---- Read string bytes from linear memory ----
 
 (defn- r-read-string-bytes! [r len]
-  (let [p @(:pos r)
+  (let [p @(.-pos r)
         s (mem->string p len)]
-    (reset! (:pos r) (+ p len))
+    (reset! (.-pos r) (+ p len))
     s))
 
 ;; ---- Read integer from code ----
 ;; Decode packed integer given the first byte (code).
 
-(defn- read-int-by-code [r code]
+(defn read-int-by-code [r code]
   (cond
     ;; 1-byte packed: 0x00-0x3F = values 0-63
     (<= code 0x3F)
@@ -411,7 +414,7 @@
 (declare read-object!)
 
 (defn- cache-add! [r val]
-  (swap! (:cache r) conj val)
+  (swap! (.-cache r) conj val)
   val)
 
 (defn read-object! [r]
@@ -448,7 +451,7 @@
       (and (>= code PRIORITY_CACHE_PACKED_START)
            (< code PRIORITY_CACHE_PACKED_END))
       (let [idx (- code PRIORITY_CACHE_PACKED_START)]
-        (nth @(:cache r) idx))
+        (nth @(.-cache r) idx))
 
       ;; NULL
       (= code NULL)
@@ -554,7 +557,7 @@
       ;; GET_PRIORITY_CACHE (for indices >= 32)
       (= code GET_PRIORITY_CACHE)
       (let [idx (read-int-by-code r (r-read-byte! r))]
-        (nth @(:cache r) idx))
+        (nth @(.-cache r) idx))
 
       ;; RESET_CACHES
       (= code RESET_CACHES)
