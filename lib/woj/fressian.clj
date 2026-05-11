@@ -230,7 +230,7 @@
 
 ;; ---- Write vector/list ----
 
-(defn- write-list-header! [w cnt]
+(defn write-list-header! [w cnt]
   (if (<= cnt 7)
     (w-write-byte! w (+ LIST_PACKED_LENGTH_START cnt))
     (do
