@@ -333,11 +333,6 @@
     (first coll)
     (nth-list (rest coll) (dec n))))
 
-(defn length [coll]
-  (if (seq coll)
-    (inc (length (rest coll)))
-    0))
-
 (defn concat-list [a b]
   (if (seq a)
     (cons (first a) (concat-list (rest a) b))
